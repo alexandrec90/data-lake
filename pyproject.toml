@@ -1,0 +1,68 @@
+[project]
+name = "data-lake"
+version = "0.1.0"
+description = "Shared ingestion + cold-storage layer: provider connectors that upsert into a caller-owned Postgres, and a Parquet/R2 archive with a self-describing catalog."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "SQLAlchemy>=2.0",
+    "pandas>=2.2",
+    "httpx>=0.27",
+    # Connector clients. Imported lazily inside the connectors that need them (so importing
+    # the package never pulls a provider SDK), but a working install needs them present.
+    "praw>=7.7",
+    "pytrends>=4.9",
+    "yfinance>=0.2.50",
+]
+
+[project.optional-dependencies]
+# Parquet cold storage. Guarded-import pattern: archive/ imports without these, and raises a
+# clear install hint when a command actually needs to read or write Parquet.
+archive = [
+    "pyarrow>=17",
+    "boto3>=1.34",
+]
+# Read-only DuckDB research lens over the archived Parquet.
+research = [
+    "duckdb>=1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=6",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/data_lake"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+# Matches ibkr_trader's floor: numpy's bundled stubs use 3.12+ syntax, so a 3.11 analysis
+# target makes mypy choke parsing them. requires-python = ">=3.11" still holds at runtime.
+python_version = "3.12"
+mypy_path = "src"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.report]
+fail_under = 0
+show_missing = true
+skip_covered = true
+
+[tool.coverage.run]
+branch = true

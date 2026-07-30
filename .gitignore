@@ -1,0 +1,40 @@
+# Secrets & local config
+.env
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Data & runtime artifacts
+data/
+artifacts/
+.local/
+models/
+mlruns/
+reports/
+*.parquet
+*.csv
+!tests/fixtures/*.csv
+logs/
+*.log
+
+# IB Gateway / IBC local state
+ibc/
+tws_settings/
+
+# OS / editor
+.DS_Store
+Thumbs.db
