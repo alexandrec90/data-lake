@@ -59,8 +59,10 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+# Same ratchet rule as the consumer repo: raise it as coverage grows, never lower it to make a
+# change pass. Set to 91 on 2026-07-30 against a measured 92% at extraction.
 [tool.coverage.report]
-fail_under = 0
+fail_under = 91
 show_missing = true
 skip_covered = true
 
