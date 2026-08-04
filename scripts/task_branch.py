@@ -1,9 +1,20 @@
 """Shared helpers for starting a task on a fresh `claude/<slug>` branch.
 
-Used by `scripts/hooks/branch-per-task.py`, the automatic UserPromptSubmit hook,
-and by `scripts/ship.py` for the per-worktree shipped-marker contract.
+Used by `scripts/hooks/branch-per-task.py` (UserPromptSubmit: records the task's
+intended name), `scripts/hooks/branch-on-write.py` (PreToolUse: cuts the branch
+when work actually begins), and `scripts/ship.py` for the per-worktree
+shipped-marker contract.
 
-Pure and stdlib-only so the hook can import it before the venv is active. Tested
+**The cut happens at the first edit, not at the prompt.** UserPromptSubmit is the
+one moment with the prompt text and *no* evidence of intent: a read-only question
+asked from the default branch would cut a branch named after the question, and
+"fix PR #42, it has conflicts" would cut one the PR will never see, because the
+agent has to check that PR's branch out before it can do anything. Deferring the
+decision to the first mutating tool call fixes both for free -- by then, an agent
+that checked another branch out is no longer on the default branch, so
+`auto_branch_decision` correctly declines.
+
+Pure and stdlib-only so the hooks can import it before the venv is active. Tested
 in `scripts/hooks/tests/test_task_branch.py`.
 """
 
@@ -12,11 +23,9 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import re
+import subprocess
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    import subprocess
+from pathlib import Path
 
 # Fallback default branch. The real default is resolved per-repo by
 # `detect_default_branch()` (callers pass it in), so this is only the value the
@@ -59,11 +68,44 @@ TOPIC_WORDS_MAX = 6
 _SENTENCE_SPLIT_RE = re.compile(r"[.?!\n]")
 
 # Per-worktree marker file (under the worktree's git dir) recording the branch
-# `/ship` last shipped. The branch-per-task hook uses it to auto-cut a fresh
-# branch on the next prompt: once a branch is shipped it is "spent", so starting
-# new work should leave it. Resolve its path with `git rev-parse --git-path`.
-# Project-agnostic name so the harness vendors unchanged.
+# `/ship` last shipped. Once a branch is shipped it is "spent", so starting new work
+# should leave it -- but only the *prompt* knows whether the next task is new work or
+# a follow-up on that same PR, so this marker now drives an advisory note rather than
+# an automatic checkout (see `spent_branch_notice`). Resolve the path with
+# `worktree_file`. Project-agnostic name so the harness vendors unchanged.
 SHIPPED_MARKER_NAME = "agent-shipped"
+
+# Per-worktree marker recording the slug the *next* branch cut should use. Written by
+# the UserPromptSubmit hook (which has the prompt text) and consumed by the PreToolUse
+# hook that does the cutting (which does not). Overwritten on every prompt, so a cut
+# is always named after the most recent statement of intent.
+TASK_INTENT_MARKER_NAME = "agent-task-intent"
+
+# Per-worktree counter of consecutive blocked stops, so pre-stop verification can
+# re-check a fix instead of blocking exactly once. Read by `stop.py`; named here
+# because this is the module that owns per-worktree marker names.
+STOP_ROUNDS_MARKER_NAME = "agent-stop-rounds"
+
+
+def worktree_file(git: Callable[..., subprocess.CompletedProcess[str]], name: str) -> Path | None:
+    """Path of the per-worktree marker `name`, or None when git cannot resolve it.
+
+    Markers live under the worktree's own git dir so parallel worktrees never share
+    one, and `git rev-parse --git-path` is the only correct way to find that: for a
+    linked worktree it returns that worktree's private dir, where a hand-built
+    `<repo>/.git/<name>` would collide with every sibling checkout.
+
+    `git(*args)` is injected (same contract as `detect_default_branch`) so this is
+    unit-testable without spawning git.
+    """
+    try:
+        result = git("rev-parse", "--git-path", name)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    raw = (result.stdout or "").strip()
+    return Path(raw) if raw else None
 
 
 def detect_default_branch(
@@ -192,28 +234,62 @@ def checkout_argv(name: str, base: str | None) -> list[str]:
 
 def auto_branch_decision(
     current_branch: str,
-    shipped_branch: str,
     tree_dirty: bool,
     default_branch: str = DEFAULT_BRANCH,
 ) -> tuple[bool, str | None]:
     """Should the hook auto-branch now, and on which base?
 
     Returns (should_branch, base_ref). base_ref None means "branch from the
-    current HEAD carrying uncommitted changes" (only for the dirty-master case).
+    current HEAD carrying uncommitted changes" (only for the dirty-default case).
 
-    Two triggers, both safe against branching mid-task:
-      - On the default branch (primary checkout): always start fresh work here.
-        Carry a dirty tree rather than clobber it.
-      - On the branch `/ship` just shipped, with a clean tree (worktree case):
-        the branch is spent, so cut the next task off origin/master. The clean-
-        tree guard means unshipped edits are never yanked; the caller clears the
-        marker after, so an empty fresh branch never re-triggers (no loop).
+    One trigger: sitting on the default branch. Carry a dirty tree rather than
+    clobber it. Anything else -- a feature branch, a detached HEAD -- declines,
+    which is what makes this safe to call before *every* edit rather than once per
+    prompt: the second edit of a task is already on the branch the first one cut.
+
+    The shipped-branch trigger this used to carry is gone. It fired whenever a
+    prompt arrived on the branch `/ship` had just shipped with a clean tree, which
+    is exactly the state a "the PR gate went red, fix it" prompt arrives in -- so it
+    yanked the session onto a fresh branch off the default and the fix landed
+    somewhere the PR would never see it. Deferring the cut to the first edit does
+    not help there (the first edit is still on the spent branch), so that case is
+    now an advisory note instead: see `spent_branch_notice`.
     """
     if should_branch(current_branch, default_branch):
         return True, checkout_base(tree_dirty, default_branch)
-    if shipped_branch and current_branch == shipped_branch and not tree_dirty:
-        return True, f"origin/{default_branch}"
     return False, None
+
+
+def spent_branch_notice(
+    current_branch: str,
+    shipped_branch: str,
+    tree_dirty: bool,
+    suggested_branch: str,
+    default_branch: str = DEFAULT_BRANCH,
+) -> str:
+    """Advice for a prompt arriving on an already-shipped branch, or '' when N/A.
+
+    Replaces the automatic checkout described in `auto_branch_decision`. "This branch
+    is spent" and "this prompt continues that PR" are both true in the same state, and
+    only the prompt distinguishes them -- so the one component that can read the prompt
+    gets to decide, and the hook confines itself to stating the situation and the exact
+    command.
+
+    Returns '' unless we are sitting on the shipped branch with a clean tree. The
+    clean-tree guard means the note stops the moment any work exists, which also bounds
+    how often it can repeat: while it keeps firing, nothing has happened yet.
+    """
+    if not current_branch or current_branch != shipped_branch or tree_dirty:
+        return ""
+    return (
+        f"Branch '{current_branch}' has already been shipped (`/ship` opened a PR from "
+        f"it), and the tree is clean.\n"
+        f"- If this prompt starts NEW work, leave it -- the branch is spent:\n"
+        f"    git fetch origin {default_branch} && git checkout --no-track -b "
+        f"{suggested_branch} origin/{default_branch}\n"
+        f"- If this prompt continues that PR (a review comment, a red gate, a merge "
+        f"conflict), stay on '{current_branch}' and push there."
+    )
 
 
 def platform_manages_branch(env: Mapping[str, str]) -> bool:

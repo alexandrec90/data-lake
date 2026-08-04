@@ -9,17 +9,15 @@ paths:
 
 # Rule: Rules & Skills Authoring
 
-## Source of truth: `.claude/` over `.agents/`
+## Source of truth
 
-`CLAUDE.md` and everything under `.claude/` are the **single source of truth**. The
-`AGENTS.md` files and the `.agents/` tree are **generated mirrors** — a sync step copies
-`CLAUDE.md` → `AGENTS.md` and `.claude/` → `.agents/` for harnesses that read those paths.
+`CLAUDE.md` and `.claude/rules/` are the project-instruction source of truth. Codex reads
+the same `CLAUDE.md` files through its configured project-document fallback, so do not
+create a second instruction tree.
 
-- **Only ever edit `.claude/` and `CLAUDE.md`.** Never hand-edit `.agents/**` or any
-  `AGENTS.md` — those changes are overwritten on the next sync.
-- **Treat the duplication as expected, not a defect.** Audits, reviews, and dedup passes
-  should ignore `.agents/**` and `AGENTS.md` as mirror copies of `.claude/**` and `CLAUDE.md` —
-  don't flag them as redundant or try to reconcile the two trees.
+Repository skills are the one compatibility exception: author them under
+`.claude/skills/`, then run `scripts/sync-codex-context.py` to refresh the generated
+`.agents/skills/` copy that Codex discovers. Never hand-edit that generated skill copy.
 
 ## Instruction files ship with a test, like code
 

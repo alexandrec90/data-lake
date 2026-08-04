@@ -18,11 +18,30 @@ into the session so it is fixed here instead of after a CI round-trip:
     runs,
   - Tier 3: `check-lock-markers.py` when a requirements file changed, and vitest
     when frontend/src changed.
-It is loop-guarded (`stop_hook_active`), opt-out-able (`*_SKIP_STOP_VERIFY=1`, prefixed
-per project — see `[project] env_prefix`),
-gated on relevant files changing, and skips cleanly when tooling/infra is absent.
 
-`skin_changed` and the verification helpers (`stop_hook_active`, `verify_enabled`, `changed_paths`,
+**The diff is the branch, not just the working tree.** Gating on `git status` alone
+made the gate inert the moment anything was committed — and `/ship` commits — so the
+strongest verification happened before a commit and none happened after, which is
+backwards: the committed branch is exactly what CI will see. `changed_paths` is now
+unioned with `git diff --name-only origin/<default>...HEAD`.
+
+**It runs up to `MAX_VERIFY_ROUNDS` rounds, blocking on all but the last.**
+`stop_hook_active` is a boolean, so honouring it alone meant verification ran on the
+first stop only: the agent was told what was broken, "fixed" it, stopped again, and the
+second stop skipped the checks entirely — a wrong fix ended the session looking green. A
+per-worktree round counter lets each fix be re-checked, and the final round reports
+without blocking so the cycle always terminates.
+
+Failures are written to `logs/stop-verify.log` (and the tier-owned artifacts
+`logs/lint-errors.log` / `logs/test-failures.log`); the terminal gets a status line and
+the paths, per the failure-artifact rule in `.claude/rules/engineering.md`.
+
+It is opt-out-able (`*_SKIP_STOP_VERIFY=1`, prefixed per project — see `[project]
+env_prefix`), gated on relevant files changing, and skips cleanly when tooling/infra is
+absent.
+
+`skin_changed` and the verification helpers (`stop_hook_active`, `verify_enabled`,
+`changed_paths`, `committed_paths`, `all_changed`, `blocked_rounds`, `should_block`,
 `select_checks`, `run_checks`) are pure and unit-tested
 (`scripts/hooks/tests/test_stop.py`); each external step is its own importable,
 independently tested script.
@@ -36,13 +55,15 @@ import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
-# scripts/hooks/ on path so the sibling, stdlib-only config helper imports before
-# the venv (same pattern as branch-per-task.py's task_branch import).
+# scripts/hooks/ and scripts/ on path so the sibling, stdlib-only helpers import
+# before the venv (same pattern as branch-per-task.py's task_branch import).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import harness_config
+import task_branch
 
 REPO_ROOT = (Path(__file__).parent / "../..").resolve()
 # Everything project-specific below (env prefix, DB creds/ports, frontend layout,
@@ -57,6 +78,24 @@ CFG = harness_config.load(REPO_ROOT)
 # reachable; all skip cleanly when their tooling/infra is absent.
 LINT_ALL = REPO_ROOT / "scripts/lint-all.py"
 CHECK_LOCK_MARKERS = REPO_ROOT / "scripts/check-lock-markers.py"
+# The project's own test runner. Preferred over a bare `-m pytest` for the application
+# tier because it writes `logs/test-failures.log` — the parseable artifact the agent is
+# supposed to fix from, with third-party frames stripped and each failure block capped.
+# Project-owned (its scope is that project's testpaths), so absence falls back to pytest.
+RUN_TESTS = REPO_ROOT / "scripts/run-tests.py"
+
+# Artifact for the tiers that have no runner of their own to write one (script-tests,
+# lock-markers, vitest). Written on success too — as an empty file — so a stale artifact
+# can never send the next agent chasing a failure that is already fixed.
+VERIFY_ARTIFACT = "logs/stop-verify.log"
+TEST_ARTIFACT = "logs/test-failures.log"
+
+# How many verification rounds one stop-chain gets. The last round reports without
+# blocking, so three means: block, re-check and block again, then re-check and stand down
+# -- two chances to fix, both of them actually verified. The ceiling is what guarantees
+# the fix -> stop -> block cycle terminates. Not a manifest field: this is a property of
+# the interaction, not of any project's shape.
+MAX_VERIFY_ROUNDS = 3
 
 # Interpreter candidates for the verification checks, relative to the repo root.
 VENV_PYTHONS = (".venv/Scripts/python.exe", ".venv/bin/python")
@@ -225,6 +264,48 @@ def changed_paths(porcelain: str) -> list[str]:
     return paths
 
 
+def committed_paths(diff_output: str) -> list[str]:
+    """Repo-relative paths from `git diff --name-only` output."""
+    return [line.strip() for line in diff_output.splitlines() if line.strip()]
+
+
+def all_changed(porcelain: str, diff_output: str) -> list[str]:
+    """Everything this stop should verify: the working tree plus the branch's commits.
+
+    The working tree alone is not the diff CI will run. Once the agent commits — and
+    `/ship` commits — `git status` is empty, `select_checks` returns nothing, and the
+    gate passes having run nothing at the exact point where the branch is finally in the
+    state the PR gate will see. Ordering is working-tree-first and de-duplicated so a
+    file that is both committed and further modified is verified once.
+    """
+    merged = dict.fromkeys(changed_paths(porcelain))
+    merged.update(dict.fromkeys(committed_paths(diff_output)))
+    return list(merged)
+
+
+def blocked_rounds(previous: int, chain_active: bool) -> int:
+    """Block count for this stop, counting the block currently being considered.
+
+    `chain_active` is `stop_hook_active`: false means this is a fresh stop rather than a
+    continuation, so the count restarts regardless of what the marker says -- a counter
+    left behind by an abandoned chain must not spend this one's budget.
+
+    Returns 1 on the first failing stop of a chain, so `should_block` can be a plain
+    `< max_rounds` with no off-by-one at the call site.
+    """
+    return (previous if chain_active else 0) + 1
+
+
+def should_block(rounds_used: int, max_rounds: int = MAX_VERIFY_ROUNDS) -> bool:
+    """True while the gate may still block; False once its budget is spent.
+
+    `rounds_used` is the count *including* the block being considered, so with
+    max_rounds=3 the third failing stop reports and stands down instead of blocking a
+    fourth time.
+    """
+    return rounds_used < max_rounds
+
+
 def _is_py(path: str) -> bool:
     return path.endswith((".py", ".pyi"))
 
@@ -280,17 +361,71 @@ def select_checks(paths: list[str]) -> list[str]:
     return checks
 
 
-def _git_status_porcelain(repo_root: Path) -> str:
+def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run git in `repo_root`, never raising -- a failed CompletedProcess stands in.
+
+    Shaped to satisfy `task_branch`'s injected-git contract (via `_git_at`) so the
+    marker-path and default-branch helpers are shared rather than reimplemented here.
+    """
     try:
-        result = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
+        return subprocess.run(
+            ["git", *args], cwd=repo_root, capture_output=True, text=True, check=False
         )
-    except OSError:
-        return ""
+    except (OSError, subprocess.SubprocessError):
+        return subprocess.CompletedProcess(list(args), 1, "", "")
+
+
+def _git_at(repo_root: Path) -> Callable[..., subprocess.CompletedProcess[str]]:
+    return lambda *args: _git(repo_root, *args)
+
+
+def _git_status_porcelain(repo_root: Path) -> str:
+    result = _git(repo_root, "status", "--porcelain")
     return result.stdout if result.returncode == 0 else ""
+
+
+def _git_branch_diff(repo_root: Path) -> str:
+    """`git diff --name-only origin/<default>...HEAD`, or '' when it cannot be taken.
+
+    Three dots: the diff from the merge base, i.e. exactly what this branch changed and
+    nothing origin moved underneath it. Returns '' on the default branch (no divergence),
+    in a fresh repo, and when origin/<default> is missing -- all of which correctly
+    degrade to verifying the working tree alone.
+    """
+    default_branch = task_branch.detect_default_branch(_git_at(repo_root))
+    upstream = f"origin/{default_branch}"
+    if _git(repo_root, "rev-parse", "--verify", "--quiet", f"refs/remotes/{upstream}").returncode:
+        return ""
+    result = _git(repo_root, "diff", "--name-only", f"{upstream}...HEAD")
+    return result.stdout if result.returncode == 0 else ""
+
+
+def _rounds_path(repo_root: Path) -> Path | None:
+    return task_branch.worktree_file(_git_at(repo_root), task_branch.STOP_ROUNDS_MARKER_NAME)
+
+
+def read_rounds(repo_root: Path = REPO_ROOT) -> int:
+    """Blocked-stop count for this worktree; 0 when absent or unparseable."""
+    path = _rounds_path(repo_root)
+    if path is None or not path.exists():
+        return 0
+    try:
+        return max(0, int(path.read_text(encoding="utf-8").strip()))
+    except (OSError, ValueError):
+        return 0
+
+
+def write_rounds(value: int, repo_root: Path = REPO_ROOT) -> None:
+    """Persist the blocked-stop count, or clear it when `value` is 0. Best-effort."""
+    path = _rounds_path(repo_root)
+    if path is None:
+        return
+    with contextlib.suppress(OSError):
+        if value <= 0:
+            path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(value), encoding="utf-8")
 
 
 def autostart_enabled(env: Mapping[str, str]) -> bool:
@@ -396,17 +531,34 @@ def host_db_env(repo_root: Path = REPO_ROOT) -> dict[str, str] | None:
     return env
 
 
+def test_runner_argv(targets: list[str]) -> tuple[list[str], str | None]:
+    """(argv, artifact) for the application test tier.
+
+    Prefers the project's own `run-tests.py`: it writes `logs/test-failures.log` with
+    third-party frames stripped and each failure block capped, which is the artifact the
+    agent is meant to fix from. A bare `-m pytest` is the fallback for a project that
+    does not ship one, and reports through `logs/stop-verify.log` instead.
+
+    NB `run-tests.py` is invoked under `verify_python()`, and re-invokes pytest as
+    `sys.executable -m pytest` -- which is that same interpreter, so the venv is
+    preserved through the extra hop.
+    """
+    if RUN_TESTS.exists():
+        return [verify_python(), str(RUN_TESTS), *targets], TEST_ARTIFACT
+    return [verify_python(), "-m", "pytest", *targets, "-q"], None
+
+
 def _pytest_failures(
     targets: list[str], repo_root: Path, extra_env: dict[str, str] | None = None
 ) -> list[tuple[str, str | None, str]]:
-    """Run host pytest over `targets`; [] on pass, one CHECK_TESTS failure otherwise.
+    """Run the host test tier over `targets`; [] on pass, one CHECK_TESTS failure else.
 
     Shared by both shapes of Tier 2b (with and without a DB), so the two differ only
     in the infra they arrange and the env they inject -- not in how a failure is
     captured and reported. An OS error is a skip: verification never blocks the agent
     over a local tooling gap.
     """
-    argv = [verify_python(), "-m", "pytest", *targets, "-q"]
+    argv, artifact = test_runner_argv(targets)
     try:
         result = subprocess.run(
             argv,
@@ -425,7 +577,7 @@ def _pytest_failures(
     if result.returncode in (0, PYTEST_NO_TESTS_COLLECTED):
         return []
     tail = (result.stdout + result.stderr).strip().splitlines()[-20:]
-    return [(CHECK_TESTS, None, "\n".join(tail))]
+    return [(CHECK_TESTS, artifact, "\n".join(tail))]
 
 
 def run_host_tests(
@@ -557,15 +709,61 @@ def run_checks(names: list[str]) -> list[tuple[str, str | None, str]]:
     return failures
 
 
-def _print_verify_failures(failures: list[tuple[str, str | None, str]]) -> None:
-    lines = ["Pre-stop verification found issues that would fail CI -- fix before finishing:"]
+def artifact_body(failures: list[tuple[str, str | None, str]]) -> str:
+    """The full text of `logs/stop-verify.log` for this run.
+
+    Everything needed to diagnose goes in the file, including the tails of tiers that
+    also wrote their own artifact -- one file the agent can open beats a decision about
+    which of three to read. Empty string when nothing failed, which is written verbatim
+    so a stale artifact cannot outlive the failure it describes.
+    """
+    if not failures:
+        return ""
+    lines = [
+        "# source: scripts/hooks/stop.py (pre-stop verification)",
+        "# fix: python scripts/lint-all.py --changed | python scripts/run-tests.py --changed",
+    ]
     for name, artifact, tail in failures:
-        if artifact and (REPO_ROOT / artifact).exists():
-            lines.append(f"  - {name}: see {artifact}")
-        else:
-            lines.append(f"  - {name}:")
-            if tail:
-                lines.extend(f"      {ln}" for ln in tail.splitlines())
+        lines.append("")
+        lines.append(f"=== {name} ===" + (f" (see also {artifact})" if artifact else ""))
+        lines.append(tail.strip() or "(no output captured)")
+    return "\n".join(lines) + "\n"
+
+
+def write_verify_artifact(
+    failures: list[tuple[str, str | None, str]], repo_root: Path = REPO_ROOT
+) -> None:
+    """Persist the failure detail. Best-effort: an unwritable logs/ never blocks."""
+    target = repo_root / VERIFY_ARTIFACT
+    with contextlib.suppress(OSError):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(artifact_body(failures), encoding="utf-8")
+
+
+def _print_verify_failures(
+    failures: list[tuple[str, str | None, str]], blocking: bool = True
+) -> None:
+    """Status line plus artifact paths -- never the failure text itself.
+
+    The detail lives in the artifacts (see the failure-artifact rule in
+    `.claude/rules/engineering.md`): streamed output scrolls away, and a 20-line tail
+    inlined here is both too little to diagnose from and too much to skim.
+    """
+    verdict = (
+        "Pre-stop verification found issues that would fail CI -- fix before finishing:"
+        if blocking
+        else (
+            f"Pre-stop verification still failing after {MAX_VERIFY_ROUNDS} attempts. "
+            "Not blocking again -- but the branch is red and CI will say so:"
+        )
+    )
+    lines = [verdict]
+    tiers = ", ".join(name for name, _artifact, _tail in failures)
+    lines.append(f"  failed: {tiers}")
+    for path in dict.fromkeys(
+        [VERIFY_ARTIFACT] + [a for _n, a, _t in failures if a and (REPO_ROOT / a).exists()]
+    ):
+        lines.append(f"  details: {path}")
     lines.append(
         "Re-run locally: python scripts/lint-all.py --changed | python scripts/run-tests.py --changed"
     )
@@ -574,19 +772,34 @@ def _print_verify_failures(failures: list[tuple[str, str | None, str]]) -> None:
 
 
 def verify(raw_stdin: str, env: Mapping[str, str]) -> int:
-    """Run pre-stop verification. Returns 2 (block, relay) on failure, else 0."""
-    if stop_hook_active(raw_stdin) or not verify_enabled(env):
+    """Run pre-stop verification. Returns 2 (block, relay) on failure, else 0.
+
+    Unlike the original, `stop_hook_active` does not skip the run -- it only says that
+    this stop is a continuation, which is what decides whether the round counter
+    restarts. Skipping on it meant the gate could report a failure but never confirm
+    the fix, so a wrong fix ended the session looking green.
+    """
+    if not verify_enabled(env):
         return 0
-    paths = changed_paths(_git_status_porcelain(REPO_ROOT))
+    paths = all_changed(_git_status_porcelain(REPO_ROOT), _git_branch_diff(REPO_ROOT))
     # Infra-light tiers (lint, script-tests, locks, frontend) plus the application
     # test tier, which arranges its own db+redis reachability/autostart/teardown when
     # this project has a DB and just runs pytest when it does not.
     failures = run_checks(select_checks(paths))
     failures += run_host_tests(paths, env)
-    if failures:
-        _print_verify_failures(failures)
-        return 2
-    return 0
+    write_verify_artifact(failures)
+    if not failures:
+        write_rounds(0)  # green: the next failure starts from a full budget.
+        return 0
+
+    rounds_used = blocked_rounds(read_rounds(), stop_hook_active(raw_stdin))
+    if not should_block(rounds_used):
+        write_rounds(0)
+        _print_verify_failures(failures, blocking=False)
+        return 0
+    write_rounds(rounds_used)
+    _print_verify_failures(failures, blocking=True)
+    return 2
 
 
 def main() -> int:

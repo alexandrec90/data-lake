@@ -38,9 +38,9 @@ import harness_config
 REPO_ROOT = (Path(__file__).parent / "../..").resolve()
 CFG = harness_config.load(REPO_ROOT)
 
-# Below this a cap costs more than it saves: the truncation marker alone is ~30
-# bytes, and a window too small to hold one error line defeats the purpose.
-MIN_MAX_BYTES = 512
+# Re-exported so `hook.MIN_MAX_BYTES` still resolves; defined in harness_config so the
+# block message in `enforce-capped-bash.py` quotes this exact number.
+MIN_MAX_BYTES = harness_config.MIN_MAX_BYTES
 
 
 def cap_output(data: bytes, max_bytes: int, head_bytes: int) -> bytes:

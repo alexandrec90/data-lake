@@ -64,6 +64,17 @@ class FrontendConfig:
     typecheck_cmd: tuple[str, ...] = ("run", "typecheck")
 
 
+# Floor for `invoke-capped.py --max-bytes`, enforced there and quoted by
+# `enforce-capped-bash.py`'s block message. Below this a cap costs more than it saves:
+# the truncation marker alone is ~30 bytes, and a window too small to hold one error
+# line defeats the purpose. It lives here rather than in either hook because both need
+# it and a second literal is how the message and the wrapper drift apart -- the same
+# failure `test_block_message_quotes_the_configured_cap` already pins for the cap.
+# Not a `BashConfig` field on purpose: it is a property of the wrapper, not a knob a
+# project should turn down.
+MIN_MAX_BYTES = 512
+
+
 @dataclass(frozen=True)
 class BashConfig:
     """The PreToolUse Bash output cap (`enforce-capped-bash.py`).

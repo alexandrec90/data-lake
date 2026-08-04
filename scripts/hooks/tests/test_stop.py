@@ -101,6 +101,102 @@ def test_changed_paths_empty():
     assert hook.changed_paths("") == []
 
 
+# --- the diff is the branch, not just the working tree ------------------------
+# Gating on `git status` alone made the gate inert the moment anything was committed,
+# and `/ship` commits: the strongest verification ran before a commit and none after,
+# which is backwards -- the committed branch is exactly what CI will see.
+
+
+def test_committed_paths_parses_diff_names():
+    assert hook.committed_paths("app/a.py\nscripts/b.py\n\n") == ["app/a.py", "scripts/b.py"]
+    assert hook.committed_paths("") == []
+
+
+def test_all_changed_unions_working_tree_and_commits():
+    porcelain = " M app/dirty.py\n"
+    diff = "app/committed.py\nscripts/also.py\n"
+    assert hook.all_changed(porcelain, diff) == [
+        "app/dirty.py",
+        "app/committed.py",
+        "scripts/also.py",
+    ]
+
+
+def test_all_changed_deduplicates_a_committed_then_modified_file():
+    assert hook.all_changed(" M app/x.py\n", "app/x.py\n") == ["app/x.py"]
+
+
+def test_all_changed_sees_a_clean_tree_with_commits():
+    """The regression: a clean tree after a commit must still select checks.
+
+    Before this, `changed_paths("")` was `[]`, `select_checks([])` was `[]`, and the
+    stop passed having run nothing.
+    """
+    paths = hook.all_changed("", f"{CFG.app_dir}main.py\n")
+    assert paths, "a committed change must be verified even with a clean working tree"
+    # `in`, not equality: `app_dir` is `scripts/` in some projects (devkit's own), which
+    # legitimately adds the script-tests tier. This file is vendored -- it may not assume
+    # one repo's shape.
+    assert hook.CHECK_LINT in hook.select_checks(paths)
+
+
+def test_all_changed_empty_when_nothing_changed_anywhere():
+    assert hook.all_changed("", "") == []
+
+
+# --- bounded retry rounds ----------------------------------------------------
+# `stop_hook_active` is a boolean, so honouring it alone meant verification ran on the
+# first stop only: the gate could report a failure but never confirm the fix.
+
+
+def test_blocked_rounds_starts_at_one_on_a_fresh_stop():
+    assert hook.blocked_rounds(0, chain_active=False) == 1
+    # A counter left behind by an abandoned chain must not spend this one's budget.
+    assert hook.blocked_rounds(7, chain_active=False) == 1
+
+
+def test_blocked_rounds_accumulates_within_a_chain():
+    assert hook.blocked_rounds(1, chain_active=True) == 2
+    assert hook.blocked_rounds(2, chain_active=True) == 3
+
+
+def test_should_block_until_the_budget_is_spent():
+    assert hook.should_block(1, max_rounds=3) is True
+    assert hook.should_block(2, max_rounds=3) is True
+    assert hook.should_block(3, max_rounds=3) is False
+    assert hook.should_block(4, max_rounds=3) is False
+
+
+def test_max_verify_rounds_allows_at_least_one_recheck():
+    """A ceiling of 1 would restore the original one-shot behaviour."""
+    assert hook.MAX_VERIFY_ROUNDS >= 2
+
+
+def test_rounds_marker_round_trips(tmp_path, monkeypatch):
+    marker = tmp_path / "agent-stop-rounds"
+    monkeypatch.setattr(hook.task_branch, "worktree_file", lambda git, name: marker)
+    assert hook.read_rounds(tmp_path) == 0
+    hook.write_rounds(2, tmp_path)
+    assert hook.read_rounds(tmp_path) == 2
+    # Zero clears rather than writing "0", so nothing lingers after a green stop.
+    hook.write_rounds(0, tmp_path)
+    assert not marker.exists()
+    assert hook.read_rounds(tmp_path) == 0
+
+
+def test_read_rounds_survives_a_corrupt_marker(tmp_path, monkeypatch):
+    marker = tmp_path / "agent-stop-rounds"
+    marker.write_text("not a number", encoding="utf-8")
+    monkeypatch.setattr(hook.task_branch, "worktree_file", lambda git, name: marker)
+    assert hook.read_rounds(tmp_path) == 0
+
+
+def test_rounds_helpers_no_op_without_a_git_path(monkeypatch):
+    monkeypatch.setattr(hook.task_branch, "worktree_file", lambda git, name: None)
+    assert hook.read_rounds() == 0
+    hook.write_rounds(3)  # must not raise
+
+
 def test_path_predicates():
     assert hook._is_py("app/x.py") and hook._is_py("app/y.pyi")
     assert not hook._is_py("README.md")
@@ -260,9 +356,22 @@ def test_command_for_returns_none_when_a_repo_script_is_absent(tmp_path, monkeyp
     assert hook._command_for(hook.CHECK_SCRIPT_TESTS) is not None
 
 
-def test_verify_skips_when_loop_active(monkeypatch):
-    monkeypatch.setattr(hook, "run_checks", lambda names: [("lint", None, "x")])
-    assert hook.verify('{"stop_hook_active": true}', {}) == 0
+@pytest.fixture
+def sandboxed_verify(monkeypatch, tmp_path):
+    """`verify` with git, the artifact and the round marker all confined to tmp_path.
+
+    Returns the mutable round-counter store so a test can set the starting round and
+    read back what `verify` persisted, without touching the real repo.
+    """
+    rounds = {"value": 0}
+    monkeypatch.setattr(hook, "_git_status_porcelain", lambda root: " M app/main.py\n")
+    monkeypatch.setattr(hook, "_git_branch_diff", lambda root: "")
+    monkeypatch.setattr(hook, "write_verify_artifact", lambda failures, repo_root=None: None)
+    monkeypatch.setattr(hook, "read_rounds", lambda *a, **k: rounds["value"])
+    monkeypatch.setattr(
+        hook, "write_rounds", lambda value, *a, **k: rounds.__setitem__("value", value)
+    )
+    return rounds
 
 
 def test_verify_skips_when_opted_out(monkeypatch):
@@ -270,25 +379,169 @@ def test_verify_skips_when_opted_out(monkeypatch):
     assert hook.verify("{}", {hook.SKIP_VERIFY_ENV: "1"}) == 0
 
 
-def test_verify_returns_two_on_failure(monkeypatch):
-    monkeypatch.setattr(hook, "_git_status_porcelain", lambda root: " M app/main.py\n")
+def test_verify_returns_two_on_failure(monkeypatch, sandboxed_verify):
     monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [])
     monkeypatch.setattr(hook, "run_checks", lambda names: [("lint", "logs/lint-errors.log", "")])
     assert hook.verify("{}", {}) == 2
 
 
-def test_verify_returns_two_when_db_tests_fail(monkeypatch):
-    monkeypatch.setattr(hook, "_git_status_porcelain", lambda root: " M app/main.py\n")
+def test_verify_returns_two_when_db_tests_fail(monkeypatch, sandboxed_verify):
     monkeypatch.setattr(hook, "run_checks", lambda names: [])
     monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [("tests", None, "F app/x")])
     assert hook.verify("{}", {}) == 2
 
 
-def test_verify_returns_zero_when_clean(monkeypatch):
-    monkeypatch.setattr(hook, "_git_status_porcelain", lambda root: " M app/main.py\n")
+def test_verify_returns_zero_when_clean(monkeypatch, sandboxed_verify):
     monkeypatch.setattr(hook, "run_checks", lambda names: [])
     monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [])
     assert hook.verify("{}", {}) == 0
+
+
+def test_verify_still_runs_the_checks_on_a_continuation_stop(monkeypatch, sandboxed_verify):
+    """The regression this replaced `test_verify_skips_when_loop_active` with.
+
+    Skipping on `stop_hook_active` meant the agent was told what was broken, "fixed" it,
+    stopped again, and the second stop ran nothing -- so a wrong fix ended the session
+    looking green. The flag now only decides whether the round counter restarts.
+    """
+    ran = []
+    monkeypatch.setattr(hook, "run_checks", lambda names: ran.append(names) or [])
+    monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [])
+    assert hook.verify('{"stop_hook_active": true}', {}) == 0
+    assert ran, "a continuation stop must still verify -- otherwise a fix is never checked"
+
+
+def test_verify_blocks_repeatedly_then_stands_down(monkeypatch, sandboxed_verify):
+    monkeypatch.setattr(hook, "run_checks", lambda names: [("lint", None, "still broken")])
+    monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [])
+
+    # First failing stop of a chain blocks and records round 1.
+    codes = [hook.verify("{}", {})]
+    assert codes == [2]
+    assert sandboxed_verify["value"] == 1
+
+    # Continuations keep verifying, and keep blocking while the budget lasts. Bounded
+    # well above MAX_VERIFY_ROUNDS so a gate that never terminated fails the test rather
+    # than hanging the suite.
+    while codes[-1] == 2 and len(codes) <= hook.MAX_VERIFY_ROUNDS + 3:
+        codes.append(hook.verify('{"stop_hook_active": true}', {}))
+
+    assert codes[-1] == 0, f"the gate must terminate on its own, got {codes}"
+    # The last round reports without blocking, so blocks are one fewer than rounds --
+    # and there is at least one re-check, which is the whole point of the change.
+    assert codes.count(2) == hook.MAX_VERIFY_ROUNDS - 1, codes
+    assert sandboxed_verify["value"] == 0, "standing down must clear the counter"
+
+
+def test_verify_clears_the_counter_once_green(monkeypatch, sandboxed_verify):
+    sandboxed_verify["value"] = 2
+    monkeypatch.setattr(hook, "run_checks", lambda names: [])
+    monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [])
+    assert hook.verify("{}", {}) == 0
+    assert sandboxed_verify["value"] == 0, "the next failure must start from a full budget"
+
+
+def test_verify_verifies_committed_work(monkeypatch, tmp_path):
+    """End-to-end on the union: a clean tree with commits must still select checks."""
+    seen: list[list[str]] = []
+    monkeypatch.setattr(hook, "_git_status_porcelain", lambda root: "")
+    monkeypatch.setattr(hook, "_git_branch_diff", lambda root: f"{CFG.app_dir}main.py\n")
+    monkeypatch.setattr(hook, "write_verify_artifact", lambda failures, repo_root=None: None)
+    monkeypatch.setattr(hook, "read_rounds", lambda *a, **k: 0)
+    monkeypatch.setattr(hook, "write_rounds", lambda *a, **k: None)
+    monkeypatch.setattr(hook, "run_checks", lambda names: seen.append(names) or [])
+    monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [])
+    assert hook.verify("{}", {}) == 0
+    assert seen and hook.CHECK_LINT in seen[0], (
+        "a committed-only diff must still select checks; before the union it selected none"
+    )
+
+
+# --- the failure artifact -----------------------------------------------------
+# `.claude/rules/engineering.md`: failures an agent acts on go in a parseable file, not
+# streamed to a terminal that scrolls away. Only the lint tier used to have one.
+
+
+def test_artifact_body_holds_every_tier_and_its_output():
+    body = hook.artifact_body(
+        [
+            (hook.CHECK_SCRIPT_TESTS, None, "E   assert 1 == 2"),
+            (hook.CHECK_TESTS, hook.TEST_ARTIFACT, "F tests/test_x.py"),
+        ]
+    )
+    assert hook.CHECK_SCRIPT_TESTS in body and "assert 1 == 2" in body
+    assert hook.CHECK_TESTS in body and "F tests/test_x.py" in body
+    assert hook.TEST_ARTIFACT in body, "a tier with its own artifact should still be named"
+    assert "scripts/hooks/stop.py" in body, "the artifact must say what wrote it"
+
+
+def test_artifact_body_is_empty_when_nothing_failed():
+    assert hook.artifact_body([]) == ""
+
+
+def test_write_verify_artifact_clears_on_success(tmp_path):
+    hook.write_verify_artifact([(hook.CHECK_LINT, None, "boom")], tmp_path)
+    target = tmp_path / hook.VERIFY_ARTIFACT
+    assert "boom" in target.read_text(encoding="utf-8")
+    # A stale artifact must never outlive the failure it describes.
+    hook.write_verify_artifact([], tmp_path)
+    assert target.read_text(encoding="utf-8") == ""
+
+
+def test_write_verify_artifact_survives_an_unwritable_target(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise OSError("read-only")
+
+    monkeypatch.setattr(hook.Path, "write_text", boom)
+    hook.write_verify_artifact([(hook.CHECK_LINT, None, "x")], tmp_path)  # must not raise
+
+
+def test_failure_report_names_the_artifact_not_the_output(capsys):
+    hook._print_verify_failures([(hook.CHECK_SCRIPT_TESTS, None, "E   assert 1 == 2")])
+    err = capsys.readouterr().err
+    assert hook.VERIFY_ARTIFACT in err
+    assert hook.CHECK_SCRIPT_TESTS in err
+    assert "assert 1 == 2" not in err, "detail belongs in the artifact, not the terminal"
+
+
+def test_failure_report_says_when_it_has_stopped_blocking(capsys):
+    hook._print_verify_failures([(hook.CHECK_LINT, None, "x")], blocking=False)
+    err = capsys.readouterr().err
+    assert str(hook.MAX_VERIFY_ROUNDS) in err
+    assert "Not blocking again" in err
+
+
+# --- the application tier runs through the project's own runner ---------------
+
+
+def test_test_runner_argv_prefers_run_tests_and_its_artifact(tmp_path, monkeypatch):
+    runner = tmp_path / "run-tests.py"
+    runner.write_text("", encoding="utf-8")
+    monkeypatch.setattr(hook, "RUN_TESTS", runner)
+    argv, artifact = hook.test_runner_argv(["tests/test_x.py"])
+    assert str(runner) in argv
+    assert argv[-1] == "tests/test_x.py"
+    assert artifact == hook.TEST_ARTIFACT
+
+
+def test_test_runner_argv_falls_back_to_pytest_without_a_runner(tmp_path, monkeypatch):
+    monkeypatch.setattr(hook, "RUN_TESTS", tmp_path / "absent.py")
+    argv, artifact = hook.test_runner_argv(["tests/test_x.py"])
+    assert argv[1:3] == ["-m", "pytest"]
+    assert artifact is None
+
+
+def test_test_runner_runs_under_the_verify_interpreter(tmp_path, monkeypatch):
+    py = tmp_path / ".venv/Scripts/python.exe"
+    py.parent.mkdir(parents=True)
+    py.write_text("")
+    monkeypatch.setattr(hook, "REPO_ROOT", tmp_path)
+    hook._can_verify.cache_clear()
+    try:
+        argv, _artifact = hook.test_runner_argv(["tests/test_x.py"])
+    finally:
+        hook._can_verify.cache_clear()
+    assert argv[0] == str(py), "the app tier must not run under the python3 shim"
 
 
 # --- Tier 2b: host pytest against db+redis (+ opt-in autostart) -------------

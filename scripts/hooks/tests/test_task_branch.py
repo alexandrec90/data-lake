@@ -198,38 +198,95 @@ class TestCheckoutArgv:
 
 class TestAutoBranchDecision:
     def test_on_master_clean_bases_on_origin(self):
-        assert tb.auto_branch_decision("master", "", tree_dirty=False) == (True, "origin/master")
+        assert tb.auto_branch_decision("master", tree_dirty=False) == (True, "origin/master")
 
     def test_on_master_dirty_carries_changes(self):
-        assert tb.auto_branch_decision("master", "", tree_dirty=True) == (True, None)
+        assert tb.auto_branch_decision("master", tree_dirty=True) == (True, None)
 
-    def test_on_shipped_branch_clean_bases_on_origin(self):
-        # The worktree case: sitting on the branch /ship just shipped, tree clean.
-        decision = tb.auto_branch_decision("claude/x-0722", "claude/x-0722", tree_dirty=False)
-        assert decision == (True, "origin/master")
-
-    def test_on_shipped_branch_dirty_does_not_fire(self):
-        # Unshipped edits on top of a shipped branch -- never yank them.
-        decision = tb.auto_branch_decision("claude/x-0722", "claude/x-0722", tree_dirty=True)
-        assert decision == (False, None)
-
-    def test_on_unrelated_feature_branch_does_not_fire(self):
-        # Mid-task on a branch that is not the shipped one.
-        decision = tb.auto_branch_decision("claude/y-0722", "claude/x-0722", tree_dirty=False)
-        assert decision == (False, None)
-
-    def test_no_marker_only_master_fires(self):
-        assert tb.auto_branch_decision("claude/x-0722", "", tree_dirty=False) == (False, None)
+    def test_on_a_feature_branch_does_not_fire(self):
+        # Mid-task, and also the "fix PR #42" case: the agent checked the PR's branch
+        # out before its first edit, so by the time this is consulted we are not on the
+        # default branch and the task's work belongs right here.
+        assert tb.auto_branch_decision("claude/x-0722", tree_dirty=False) == (False, None)
+        assert tb.auto_branch_decision("fix/upstream-pr", tree_dirty=True) == (False, None)
 
     def test_detached_head_does_not_fire(self):
-        assert tb.auto_branch_decision("", "claude/x-0722", tree_dirty=False) == (False, None)
+        assert tb.auto_branch_decision("", tree_dirty=False) == (False, None)
+
+    def test_a_shipped_branch_no_longer_auto_branches(self):
+        """Regression: the shipped-marker trigger cut a branch under a PR follow-up.
+
+        Sitting on a just-shipped branch with a clean tree is exactly the state "the PR
+        gate went red, fix it" arrives in, and the old second trigger fired there --
+        moving the session to a fresh branch off the default, so the fix landed where
+        the PR could never see it. The decision now has one trigger; the shipped case is
+        `spent_branch_notice`'s job.
+        """
+        assert tb.auto_branch_decision("claude/x-0722", tree_dirty=False) == (False, None)
 
     def test_custom_default_branch_bases_on_it(self):
         # On a `main`-default repo, cutting from master's origin would be wrong.
-        assert tb.auto_branch_decision("main", "", tree_dirty=False, default_branch="main") == (
+        assert tb.auto_branch_decision("main", tree_dirty=False, default_branch="main") == (
             True,
             "origin/main",
         )
+
+
+class TestSpentBranchNotice:
+    def test_fires_on_the_shipped_branch_with_a_clean_tree(self):
+        notice = tb.spent_branch_notice(
+            "claude/x-0722", "claude/x-0722", False, "claude/y-0801", "main"
+        )
+        assert "claude/x-0722" in notice
+        # Both readings must be offered -- the whole point is that the hook does not
+        # guess which one this prompt is.
+        assert "NEW work" in notice
+        assert "continues that PR" in notice
+
+    def test_names_the_exact_command_and_the_real_default_branch(self):
+        notice = tb.spent_branch_notice("claude/x", "claude/x", False, "claude/y-0801", "trunk")
+        assert "git checkout --no-track -b claude/y-0801 origin/trunk" in notice
+        assert "origin/main" not in notice
+
+    def test_silent_when_the_tree_is_dirty(self):
+        # Work already exists here; nothing to advise, and this is what bounds how
+        # often the note can repeat.
+        assert tb.spent_branch_notice("claude/x", "claude/x", True, "claude/y", "main") == ""
+
+    def test_silent_on_a_different_branch(self):
+        assert tb.spent_branch_notice("claude/y", "claude/x", False, "claude/z", "main") == ""
+
+    def test_silent_with_no_marker_or_detached_head(self):
+        assert tb.spent_branch_notice("claude/x", "", False, "claude/y", "main") == ""
+        assert tb.spent_branch_notice("", "", False, "claude/y", "main") == ""
+
+
+class TestWorktreeFile:
+    def test_returns_the_path_git_reports(self):
+        def git(*args):
+            assert args == ("rev-parse", "--git-path", "agent-shipped")
+            return _cp(0, ".git/worktrees/wt/agent-shipped\n")
+
+        path = tb.worktree_file(git, tb.SHIPPED_MARKER_NAME)
+        assert path is not None
+        assert path.as_posix() == ".git/worktrees/wt/agent-shipped"
+
+    def test_none_when_git_fails(self):
+        assert tb.worktree_file(lambda *a: _cp(1, ""), "agent-shipped") is None
+
+    def test_none_on_empty_output(self):
+        assert tb.worktree_file(lambda *a: _cp(0, "  \n"), "agent-shipped") is None
+
+    def test_none_when_git_cannot_be_spawned(self):
+        def boom(*args):
+            raise OSError("no git")
+
+        assert tb.worktree_file(boom, "agent-shipped") is None
+
+    def test_marker_names_are_distinct(self):
+        """Three markers share one directory; a collision would silently cross wires."""
+        names = {tb.SHIPPED_MARKER_NAME, tb.TASK_INTENT_MARKER_NAME, tb.STOP_ROUNDS_MARKER_NAME}
+        assert len(names) == 3
 
 
 class TestPlatformManagesBranch:

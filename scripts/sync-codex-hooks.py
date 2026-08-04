@@ -5,13 +5,9 @@
 its hooks from .codex/hooks.json, so this generator keeps that file in lock-step
 with Claude instead of hand-editing.
 
-This is the ONLY settings artifact Codex consumes from a .claude mirror. Codex has
-no .agents/settings.json concept -- inside .agents/ it reads AGENTS.md and
-plugins/marketplace.json, nothing else -- so there is no second settings file to
-keep in sync. Codex's own configuration lives in .codex/config.toml (approval
-policy, sandbox mode, shell env) and ~/.codex/config.toml (model, reasoning
-effort); Claude keys like `model: opus` or `permissions.allow` are meaningless
-there and must never be mirrored into a Codex-facing file.
+Codex's own configuration lives in .codex/config.toml (approval policy, sandbox
+mode, shell env) and ~/.codex/config.toml (model, reasoning effort). Claude keys
+like `model: opus` or `permissions.allow` are not copied there.
 
 Codex supports most, but not all, Claude hook events and uses structured JSON
 instead of non-zero exit codes for blocking. This generator therefore:
@@ -20,7 +16,7 @@ instead of non-zero exit codes for blocking. This generator therefore:
 - resolves shared scripts from the git root so subdirectory sessions work, and
 - wraps command hooks with the Codex compatibility adapter.
 
-Invoked by scripts/sync-agents-context.py after the .agents/ directory mirror.
+Invoked by scripts/sync-codex-context.py after the repository skill mirror.
 
 `to_codex_hooks` is pure and unit-tested
 (scripts/hooks/tests/test_sync_codex_hooks.py).

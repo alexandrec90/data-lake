@@ -286,8 +286,8 @@ POLICY_CLAUSES = (
 
 
 def _instruction_files() -> list[Path]:
-    """Every CLAUDE.md in the repo, skipping generated mirrors and vendor trees."""
-    skip = (".agents", "node_modules", ".venv", "templates")
+    """Every CLAUDE.md in the repo, skipping generated and vendor trees."""
+    skip = ("node_modules", ".venv", "templates")
     return [
         p
         for p in REPO_ROOT.rglob("CLAUDE.md")
@@ -533,31 +533,6 @@ def test_claude_md_defers_to_the_vendored_policy_rather_than_restating_it():
                 f"{rel} restates vendored policy ({clause!r}). Cite "
                 f"{VENDORED_POLICY} instead -- a second copy is not drift-checked."
             )
-
-
-@consumes_harness
-def test_agents_mirror_is_in_sync_when_present():
-    """`AGENTS.md` is generated from `CLAUDE.md`; a divergence means someone edited it.
-
-    The mirror exists so Codex-style harnesses read the same instructions Claude does,
-    and it is only trustworthy while it is byte-identical. A hand-edit is silent in the
-    worst way: both files look authoritative, nothing regenerates on read, and the two
-    harnesses quietly follow different rules from that point on. `--pull` cannot catch
-    it either, since the mirror is generated per project and not in the MANIFEST.
-    """
-    mirrors = [
-        (p, p.with_name("AGENTS.md"))
-        for p in _instruction_files()
-        if p.with_name("AGENTS.md").exists()
-    ]
-    if not mirrors:
-        pytest.skip("project does not mirror CLAUDE.md to AGENTS.md")
-    for claude, agents in mirrors:
-        assert agents.read_text(encoding="utf-8") == claude.read_text(encoding="utf-8"), (
-            f"{agents.relative_to(REPO_ROOT)} has drifted from "
-            f"{claude.relative_to(REPO_ROOT)} -- edit CLAUDE.md and re-run "
-            "`python scripts/sync-agents-context.py`; never hand-edit the mirror"
-        )
 
 
 @consumes_harness

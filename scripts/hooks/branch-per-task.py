@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
-"""UserPromptSubmit hook: start each new task on a fresh branch off origin/master.
+"""UserPromptSubmit hook: record what to name this task's branch, and advise.
 
-Vibe-coding many small changes in parallel means every task should get its own
-short-lived branch cut from the latest master -- otherwise work piles onto
-whatever branch happened to be checked out and the branches drift. This hook
-handles the "start" half automatically for the PRIMARY checkout: when a prompt
-arrives while sitting on `master`, it cuts a new `claude/<slug>` branch.
+This hook no longer cuts a branch. It has the prompt text and nothing else, which
+is the wrong basis for a checkout:
 
-It fires on two safe triggers (see `task_branch.auto_branch_decision`): sitting
-on the default branch (primary checkout), or sitting on the branch `/ship` just
-shipped with a clean tree (the worktree case -- `/ship` drops a per-worktree
-marker, this hook consumes it). On any other branch, or mid-task, it is a fast
-no-op -- it must never cut a branch mid-task. The marker is cleared after an
-auto-branch so an empty fresh branch never re-triggers.
+  - "What does stop.py do?" asked from the default branch cut a branch named after
+    the question, for a turn that never wrote a file.
+  - "Fix PR #42, it has merge conflicts" cut `claude/fix-pr-42-...` off the default
+    branch, when the work belongs on the PR's own branch -- so the agent had to
+    check that branch out anyway and left a stray empty one behind.
+
+So it writes the slug to a per-worktree marker and stops. `branch-on-write.py`
+consumes the marker at the first mutating tool call, when "is this actually new
+work, and where are we?" is answerable. See `task_branch.auto_branch_decision`.
+
+The one thing it still reports on is a prompt arriving on a branch `/ship` already
+shipped (`task_branch.spent_branch_notice`): that state is both "the branch is
+spent" and "you are about to be asked to fix the PR", and only the prompt tells
+them apart -- so the note goes to the model rather than the decision being guessed
+here.
 
 Best-effort and always exit 0: a failure here can never block the prompt. The
 decision/formatting helpers live in `scripts/task_branch.py` (shared with
-`/task`) and are unit-tested in `scripts/hooks/tests/test_task_branch.py`.
+`/ship`) and are unit-tested in `scripts/hooks/tests/test_task_branch.py`.
 """
 
 import contextlib
@@ -37,47 +43,41 @@ def _git(*args: str, timeout: float = 30.0) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _current_branch() -> str:
+def _git_quiet(*args: str) -> subprocess.CompletedProcess[str]:
+    """`_git` that never raises -- returns a failed CompletedProcess instead.
+
+    `worktree_file` and `detect_default_branch` take an injected git callable and
+    expect a CompletedProcess back; handing them one that can raise moves the
+    error handling to every call site.
+    """
     try:
-        result = _git("branch", "--show-current")
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
+        return _git(*args)
+    except (OSError, subprocess.SubprocessError):
+        return subprocess.CompletedProcess(list(args), 1, "", "")
+
+
+def _current_branch() -> str:
+    result = _git_quiet("branch", "--show-current")
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
 def _tree_dirty() -> bool:
-    try:
-        result = _git("status", "--porcelain")
-    except (OSError, subprocess.TimeoutExpired):
+    result = _git_quiet("status", "--porcelain")
+    if result.returncode != 0:
         return True  # unknown -> treat as dirty (the safe, non-clobbering choice)
     return bool(result.stdout.strip())
 
 
 def _existing_branches() -> set[str]:
-    try:
-        result = _git("branch", "--list", "--format=%(refname:short)")
-    except (OSError, subprocess.TimeoutExpired):
-        return set()
+    result = _git_quiet("branch", "--list", "--format=%(refname:short)")
     if result.returncode != 0:
         return set()
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
-def _marker_path() -> Path | None:
-    """Resolve the per-worktree shipped-marker path via `git rev-parse`."""
-    try:
-        result = _git("rev-parse", "--git-path", tb.SHIPPED_MARKER_NAME)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    raw = result.stdout.strip()
-    return Path(raw) if raw else None
-
-
-def _read_shipped_marker() -> str:
-    """Branch name `/ship` recorded, or '' when there is no marker."""
-    path = _marker_path()
+def _read_marker(name: str) -> str:
+    """Contents of a per-worktree marker, or '' when there is none."""
+    path = tb.worktree_file(_git_quiet, name)
     if path is None or not path.exists():
         return ""
     try:
@@ -86,11 +86,16 @@ def _read_shipped_marker() -> str:
         return ""
 
 
-def _clear_shipped_marker() -> None:
-    path = _marker_path()
-    if path is not None:
-        with contextlib.suppress(OSError):
-            path.unlink(missing_ok=True)
+def write_intent(slug: str) -> bool:
+    """Record `slug` for `branch-on-write.py` to name its cut after. Best-effort."""
+    path = tb.worktree_file(_git_quiet, tb.TASK_INTENT_MARKER_NAME)
+    if path is None:
+        return False
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(slug, encoding="utf-8")
+        return True
+    return False
 
 
 def _emit_context(text: str) -> None:
@@ -116,46 +121,25 @@ def main() -> int:
         raw = ""
 
     # Cloud/remote (Claude Code on the web / mobile): the platform owns the branch
-    # lifecycle. Standing down here keeps a post-`/ship` prompt from cutting a new
-    # local branch that diverges from the one the mobile app tracks. See
-    # tb.platform_manages_branch and the guard in .claude/hooks/session-start.sh.
+    # lifecycle. Standing down here keeps the harness from competing with the branch
+    # the mobile app tracks. See tb.platform_manages_branch and the guard in
+    # .claude/hooks/session-start.sh.
     if tb.platform_manages_branch(os.environ):
         return 0
 
-    current = _current_branch()
-    shipped = _read_shipped_marker()
-    dirty = _tree_dirty()
-    # Resolve the repo's default branch (main/master/...) rather than assuming one.
-    default_branch = tb.detect_default_branch(_git)
-    should, base = tb.auto_branch_decision(current, shipped, dirty, default_branch)
-    if not should:
-        return 0  # mid-task, or on an unshipped feature branch, or detached -- no-op.
+    slug = tb.slug_from_prompt(tb.parse_prompt(raw))
+    write_intent(slug)
 
-    # Starting new work: refresh origin so the cut is from latest.
-    # Offline is fine -- fall back to whatever origin/<default> we already have.
-    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-        _git("fetch", "--prune", "origin", default_branch, timeout=60.0)
-
-    name = tb.branch_name(tb.slug_from_prompt(tb.parse_prompt(raw)), _existing_branches())
-    argv = tb.checkout_argv(name, base)
-    try:
-        result = _git(*argv)
-    except (OSError, subprocess.TimeoutExpired):
+    # The spent-branch case is the only one worth a word to the model.
+    shipped = _read_marker(tb.SHIPPED_MARKER_NAME)
+    if not shipped:
         return 0
-    if result.returncode != 0:
-        return 0  # never block the prompt on a git failure.
-
-    # Consume the marker so the fresh (empty) branch never re-triggers.
-    _clear_shipped_marker()
-
-    if base:
-        origin = f" (the shipped '{shipped}' was left behind)" if shipped == current else ""
-        _emit_context(f"Started task on fresh branch '{name}' (cut from {base}){origin}.")
-    else:
-        _emit_context(
-            f"Started task on fresh branch '{name}' carrying your uncommitted "
-            f"changes (tree was dirty, so it was not reset onto origin/{default_branch})."
-        )
+    current = _current_branch()
+    default_branch = tb.detect_default_branch(_git_quiet)
+    suggested = tb.branch_name(slug, _existing_branches())
+    notice = tb.spent_branch_notice(current, shipped, _tree_dirty(), suggested, default_branch)
+    if notice:
+        _emit_context(notice)
     return 0
 
 

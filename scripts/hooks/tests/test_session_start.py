@@ -287,6 +287,207 @@ def test_pre_commit_absence_is_a_warning_not_a_failure(tmp_path):
     assert PATH_EXPORT in (env_file.read_text(encoding="utf-8") if env_file.exists() else "")
 
 
+# --- the local auto-rebase must not rewrite published history ------------------
+# A rebase rewrites commits. On a branch with an open PR that marks every review comment
+# outdated and forces the next push -- an outward-facing consequence no prompt asked for,
+# applied silently at session start. The clean-tree guard never caught it: a pushed,
+# reviewed branch is clean.
+
+GIT = shutil.which("git")
+
+needs_git = pytest.mark.skipif(GIT is None, reason="needs git")
+
+
+def _git_env(tmp_path: Path) -> dict[str, str]:
+    """Environment that pins git to `tmp_path` and to nothing it inherited.
+
+    `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` are cleared explicitly: if the process
+    running the tests has any of them set -- and a git hook or a harness perfectly well
+    might -- every git call below would silently operate on *that* repository instead of
+    the throwaway one, and the script under test would report on the wrong branch.
+    """
+    env = {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": str(tmp_path / "gitconfig"),
+        "GIT_CONFIG_SYSTEM": str(tmp_path / "gitconfig-system"),
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@e",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@e",
+    }
+    for leaked in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CEILING_DIRECTORIES"):
+        env.pop(leaked, None)
+    return env
+
+
+def _local_repo(tmp_path: Path, *, publish: bool) -> Path:
+    """A real repo on a feature branch, optionally pushed to a local bare `origin`."""
+    assert GIT is not None
+    origin = tmp_path / "origin.git"
+    work = tmp_path / "work"
+    env = _git_env(tmp_path)
+
+    def git(*args: str, cwd: Path = work) -> None:
+        subprocess.run([GIT, *args], cwd=cwd, env=env, check=True, capture_output=True)
+
+    subprocess.run(
+        [GIT, "init", "--bare", "-b", "main", str(origin)], check=True, capture_output=True
+    )
+    work.mkdir()
+    git("init", "-b", "main")
+    (work / "f.txt").write_text("one\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-m", "base")
+    git("remote", "add", "origin", str(origin))
+    git("push", "-u", "origin", "main")
+    git("checkout", "-b", "feature/x")
+    (work / "f.txt").write_text("two\n", encoding="utf-8")
+    git("commit", "-am", "work")
+    if publish:
+        git("push", "-u", "origin", "feature/x")
+    return work
+
+
+def _gh_free_path(stub_bin: Path) -> str:
+    """PATH for the "no `gh` installed at all" case, with no ambient directory on it.
+
+    Dropping `/usr/bin` is not optional here: GitHub's runners ship `gh` at `/usr/bin/gh`,
+    so a PATH that keeps `/usr/bin` in order to reach `git` reaches a real `gh` too, and
+    the no-gh branch under test is never taken. That is exactly how these tests passed on
+    a developer machine -- where gh lives outside `/usr/bin` -- and failed in CI.
+
+    `git` is the only external the local block needs, so it comes in as an explicit shim
+    to the real binary rather than by way of a directory that may hold anything else.
+    """
+    assert GIT is not None
+    _write_exec(stub_bin / "git", f'#!/bin/sh\nexec "{Path(GIT).as_posix()}" "$@"\n')
+    return str(stub_bin)
+
+
+def _run_local(project: Path, tmp_path: Path, *, gh_state: str | None, gh_exit: int = 0) -> str:
+    """Drive the script's LOCAL branch (CLAUDE_CODE_REMOTE unset). Returns its output.
+
+    `gh_state` None means no `gh` on PATH at all -- the absent-tool fallback.
+    `gh_exit` non-zero makes the stub fail every call, standing in for a `gh` that is
+    installed but cannot answer: not authenticated, no GitHub remote, or offline.
+    """
+    assert BASH is not None and GIT is not None
+    stub_bin = tmp_path / "localbin"
+    log = tmp_path / "local-calls.log"
+    # python3 is what session-sync.py would be invoked as; stubbing it proves whether the
+    # rebase was attempted without actually rewriting anything.
+    _write_exec(stub_bin / "python3", f'#!/bin/sh\necho "python3 $*" >> "{log}"\nexit 0\n')
+    if gh_state is None:
+        path = _gh_free_path(stub_bin)
+    else:
+        _write_exec(stub_bin / "gh", f'#!/bin/sh\necho "{gh_state}"\nexit {gh_exit}\n')
+        # git's own directory, explicitly. `/usr/bin` and `/bin` alone leave `git`
+        # resolving off whatever the ambient PATH happened to contain -- these tests
+        # passed standalone and failed under the Stop hook for exactly that reason, and
+        # a git the script cannot run makes the whole local block a silent no-op.
+        path = os.pathsep.join([str(stub_bin), str(Path(GIT).parent), "/usr/bin", "/bin"])
+
+    env = _git_env(tmp_path)
+    env.pop("CLAUDE_CODE_REMOTE", None)
+    env.update(
+        # POSIX form: this value reaches bash's `cd`, and a Windows path with backslashes
+        # is read there as escape sequences rather than separators.
+        CLAUDE_PROJECT_DIR=project.as_posix(),
+        PATH=path,
+    )
+    proc = subprocess.run(
+        [BASH, str(SCRIPT)], cwd=project, env=env, capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    calls = log.read_text(encoding="utf-8") if log.exists() else ""
+    output = proc.stdout + proc.stderr + calls
+    # No output at all means the local block never ran -- `cd` failed, or git was not
+    # reachable. Every assertion below would then be judging a script that did nothing,
+    # and the "not in output" ones would pass vacuously.
+    assert output.strip(), (
+        "session-start.sh produced no output: the local sync block did not run. "
+        "Check that CLAUDE_PROJECT_DIR is a path bash can cd into and that git is on PATH."
+    )
+    return output
+
+
+@needs_git
+def test_auto_sync_is_skipped_on_a_branch_with_an_open_pr(tmp_path):
+    project = _local_repo(tmp_path, publish=True)
+    output = _run_local(project, tmp_path, gh_state="OPEN")
+    assert "Skipping auto-sync" in output, output
+    assert "open PR" in output
+    assert "session-sync.py" not in output, "the rebase must not even be attempted"
+
+
+@needs_git
+def test_auto_sync_still_runs_when_the_pr_is_merged_or_absent(tmp_path):
+    """The feature has to keep working -- this guard is a narrowing, not a disabling."""
+    project = _local_repo(tmp_path, publish=False)
+    output = _run_local(project, tmp_path, gh_state="MERGED")
+    assert "Skipping auto-sync" not in output, output
+    assert "session-sync.py" in output, output
+
+
+@needs_git
+def test_without_gh_a_published_branch_is_left_alone(tmp_path):
+    """No `gh` means the PR question cannot be asked, so fall back to the safe proxy.
+
+    A branch that exists on origin is one where a rewrite means a force-push. Guessing
+    "probably no PR" is the one answer with a blast radius.
+    """
+    project = _local_repo(tmp_path, publish=True)
+    output = _run_local(project, tmp_path, gh_state=None)
+    assert "Skipping auto-sync" in output, output
+    assert "published branch" in output
+
+
+@needs_git
+def test_without_gh_an_unpublished_branch_still_syncs(tmp_path):
+    project = _local_repo(tmp_path, publish=False)
+    output = _run_local(project, tmp_path, gh_state=None)
+    assert "Skipping auto-sync" not in output, output
+    assert "session-sync.py" in output, output
+
+
+@needs_git
+def test_a_gh_that_cannot_answer_is_not_read_as_there_being_no_pr(tmp_path):
+    """Installed is not the same as able to answer, and the difference is a force-push.
+
+    `gh pr view` exits non-zero for "this branch has no PR" *and* for "gh cannot reach
+    GitHub" -- not authenticated, no GitHub remote, offline. Treating the second as the
+    first rebases published history on any machine where gh was installed but never
+    logged in, so an unusable gh has to fall back to the same proxy as a missing one.
+    """
+    project = _local_repo(tmp_path, publish=True)
+    output = _run_local(project, tmp_path, gh_state="gh: not logged in", gh_exit=1)
+    assert "Skipping auto-sync" in output, output
+    assert "published branch" in output
+    assert "session-sync.py" not in output, "the rebase must not even be attempted"
+
+
+@needs_git
+def test_a_gh_that_cannot_answer_still_syncs_an_unpublished_branch(tmp_path):
+    """Falling back is a narrowing: nothing is published, so no rewrite can be forced."""
+    project = _local_repo(tmp_path, publish=False)
+    output = _run_local(project, tmp_path, gh_state="gh: not logged in", gh_exit=1)
+    assert "Skipping auto-sync" not in output, output
+    assert "session-sync.py" in output, output
+
+
+@needs_git
+def test_a_working_gh_overrides_the_published_branch_proxy(tmp_path):
+    """When gh *can* answer, its answer wins -- that is the point of preferring it.
+
+    A pushed branch with no open PR is the parallel-worktree case this auto-sync exists
+    for, so the proxy must not veto it once gh has confirmed there is no PR to disturb.
+    """
+    project = _local_repo(tmp_path, publish=True)
+    output = _run_local(project, tmp_path, gh_state="", gh_exit=0)
+    assert "Skipping auto-sync" not in output, output
+    assert "session-sync.py" in output, output
+
+
 def test_script_contains_no_die_on_unset_expansions():
     """Guards the bug class, not just the one instance.
 

@@ -99,3 +99,10 @@ def test_defaults_come_from_the_manifest():
 def test_min_max_bytes_is_below_the_configured_cap():
     """A manifest that sets max_bytes under the floor would reject every call."""
     assert hook.CFG.bash.max_bytes >= hook.MIN_MAX_BYTES
+
+
+def test_min_max_bytes_has_one_definition():
+    """The floor is enforced here and quoted by `enforce-capped-bash.py`'s block
+    message. Two literals would let the message advertise a floor the wrapper does not
+    apply, which is the drift the message's cap value is already pinned against."""
+    assert hook.MIN_MAX_BYTES is hook.harness_config.MIN_MAX_BYTES
