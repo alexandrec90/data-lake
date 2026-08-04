@@ -1,4 +1,5 @@
 {
+  "devkit_tag": "v0.6.0",
   "files": {
     ".claude/hooks/session-start.sh": "52a01d4f7a8733cf1b280d71a6cd1dc209229fac70198296c66e8d5b9e1bea0f",
     ".claude/rules/authoring.md": "55def2e448d71f9f85ab414e7dc58c52713bd5194e80ea5fd57a88eb444c1a1b",
