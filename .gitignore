@@ -14,6 +14,10 @@ build/
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
+# Hypothesis's example database and its downloaded unicode tables. A sweep
+# committed `.hypothesis/unicode_data/…/charmap.json.gz` once because this line
+# was missing; it is a regenerable cache, never source.
+.hypothesis/
 .coverage
 .coverage.*
 htmlcov/
