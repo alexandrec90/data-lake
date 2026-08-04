@@ -1,0 +1,39 @@
+# Per-project config for the vendored agent-harness hook scripts
+# (scripts/hooks/*.py). Those scripts are byte-identical across every project;
+# everything project-specific lives here. Loaded by scripts/hooks/harness_config.py.
+# Schema + neutral defaults: that module's dataclasses.
+#
+# This file is deliberately NOT in sync-devkit.py's MANIFEST — it is the per-project
+# seam, so editing it here is correct and will never be reported as drift.
+
+[project]
+# Prefix for the harness control env vars:
+#   DATA_LAKE_SKIP_STOP_VERIFY, DATA_LAKE_STOP_TESTS_AUTOSTART
+env_prefix = "DATA_LAKE"
+
+# Trailing slashes are load-bearing: `stop.py` selects checks with
+# `path.startswith(CFG.app_dir)`, so a bare "src/data_lake" would also match a
+# sibling `src/data_lake_extra/`. The vendored contract test asserts it.
+[paths]
+app = "src/data_lake/"
+tests = "tests/"
+unit_tests = "tests/"
+
+# The PreToolUse Bash output cap. `enforce-capped-bash.py` blocks an uncapped Bash
+# call and quotes `max_bytes` in the reason; `invoke-capped.py` applies it. One
+# field feeds both, so the number the agent is told to use is the number it gets.
+[bash]
+max_bytes = 4000
+head_bytes = 2000
+
+# No DB tier, and unlike most consumers that is not a "not yet" — it is the design.
+# This package owns NO engine and NO migrations: a consumer hands it a session factory
+# through `data_lake.configure()`. The whole suite runs on in-memory SQLite with
+# per-call injection (see tests/conftest.py), so there is no compose service for the
+# Stop hook to bring up and nothing here for it to connect to.
+[db]
+enabled = false
+
+# No frontend: this is an installable library, not an application.
+[frontend]
+enabled = false
