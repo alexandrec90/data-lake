@@ -1,22 +1,31 @@
-"""Lake-side tables: market, corporate, news, social and derived-feature data.
+"""Lake-side tables — every domain the lake holds, not one of them.
 
-These are the datasets the shared lake is allowed to hold: non-PII, non-account, reusable by a
-foreign consumer. Account-shaped tables — orders, executions, predictions, backtest runs, risk
-state — belong to the consumer and are declared in *its* repo against this ``Base``, so the
-dependency runs consumer → lake and never the reverse. Adding such a table here would ship a
-consumer's audit trail to every other consumer of the package; ``tests/test_lake_seam.py``
-enforces that mechanically.
+The market/corporate/news/social tables came first because ``ibkr_trader`` was the first
+consumer, and that is the *only* reason they dominate this module. **The lake is not a
+finance package.** A rental-listing table, a sports-fixture table, anything else a consumer
+wants to share: all are equally at home here, and nothing in the seam tests says otherwise.
+
+What the boundary actually is: **nothing account-shaped.** Orders, executions, predictions,
+backtest runs, risk state — a consumer's audit trail — belong in *its* repo, declared against
+this ``Base``, so the dependency runs consumer → lake and never the reverse. Declaring such a
+table here would ship one consumer's private records to every other consumer of the package.
+``tests/test_lake_seam.py`` enforces that mechanically, by table name and by column shape.
+
+The question to ask of a new table is therefore "would a foreign consumer be harmed or
+confused by receiving this?", not "is this the same subject as the tables above it".
 
 Conventions:
 - Timestamps are timezone-aware UTC.
-- External payloads are preserved in a `raw` JSON column for reprocessing.
-- Upsert keys: (source, external_id) for text content; (instrument, ts, bar_size, source,
-  what_to_show) for bars.
-- Privacy (Québec Law 25): social authors are stored as
-  hashes, never usernames.
+- External payloads are preserved in a `raw` JSON column for reprocessing, so a parser fix
+  never requires re-fetching.
+- Upsert keys: (source, external_id) for text content; (platform, external_id) for scraped
+  listings; (instrument, ts, bar_size, source, what_to_show) for bars.
+- Privacy (Québec Law 25): people are stored as hashes, never names — social authors and
+  listing sellers alike.
 """
 
 from datetime import date, datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     JSON,
@@ -27,6 +36,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Index,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -211,6 +221,85 @@ class SocialPost(Base):
     sentiment_model: Mapped[str | None] = mapped_column(String(32))
     raw: Mapped[dict | None] = mapped_column(JSON)
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class Listing(Base):
+    """One scraped rental/classified listing, plus the verdict a consumer reached on it.
+
+    Written by ``apt-finder`` (Kijiji and Facebook Marketplace, Gatineau QC). It lives here
+    rather than in that consumer because it is ordinary shared content — scraped public ads,
+    nothing account-shaped — and a second consumer looking for housing data should find it
+    rather than re-scrape.
+
+    Two columns are deliberately loose, because the *judging* is the consumer's business and
+    the *data* is the lake's:
+
+    - ``verdict`` / ``verdict_reasons`` are free-form strings owned by whichever consumer
+      wrote the row. The lake does not define the vocabulary; apt-finder uses
+      ``match``/``maybe``/``reject`` with machine-readable reason codes, and another consumer
+      with different criteria can use its own without a migration here.
+    - The appliance columns are tri-state strings (``present``/``absent``/``unknown``), never
+      nullable booleans. "The ad says there is no washer" and "the ad never mentions one" are
+      different facts, and collapsing them is what makes a filter either miss good units or
+      surface ones with only a hookup.
+
+    Privacy (Québec Law 25): ``seller_hash`` is a ``stable_hash`` digest. The seller's name,
+    profile URL and phone number are never stored — the hash exists only to spot one landlord
+    posting twenty units.
+    """
+
+    __tablename__ = "listings"
+    __table_args__ = (
+        UniqueConstraint("platform", "external_id"),
+        Index("ix_listings_verdict_seen", "verdict", "last_seen_at"),
+        Index("ix_listings_posted_at", "posted_at"),
+    )
+
+    id: Mapped[int] = mapped_column(SqliteFriendlyBigInt, primary_key=True)
+    platform: Mapped[str] = mapped_column(String(16))  # kijiji | facebook
+    external_id: Mapped[str] = mapped_column(String(128))
+    url: Mapped[str | None] = mapped_column(Text)
+
+    title: Mapped[str | None] = mapped_column(Text)
+    description: Mapped[str | None] = mapped_column(Text)
+
+    # Numeric, not Float: rent is money, and 1499.99 must not become 1499.9899999.
+    price_cad: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
+    #: What the source quoted before normalisation to monthly ("month" | "week" | "day" |
+    #: "unknown"). A weekly quote normalised to monthly is still worth flagging — it usually
+    #: means a short-term rental rather than a cheap one.
+    price_period: Mapped[str | None] = mapped_column(String(16))
+
+    city: Mapped[str | None] = mapped_column(String(128))
+    province: Mapped[str | None] = mapped_column(String(8))
+    postal_prefix: Mapped[str | None] = mapped_column(String(3))  # forward sortation area
+    latitude: Mapped[float | None] = mapped_column(Float)
+    longitude: Mapped[float | None] = mapped_column(Float)
+    distance_km: Mapped[float | None] = mapped_column(Float)
+
+    #: Québec room notation kept as a room count ("4 1/2" -> 4.5). It is what locals search
+    #: by, and converting to bedrooms loses information, so both are stored.
+    rooms: Mapped[float | None] = mapped_column(Float)
+    bedrooms: Mapped[float | None] = mapped_column(Float)
+    unit_type: Mapped[str | None] = mapped_column(String(32))
+    is_room_rental: Mapped[bool | None] = mapped_column(Boolean)
+
+    washer: Mapped[str | None] = mapped_column(String(8))
+    dryer: Mapped[str | None] = mapped_column(String(8))
+    fridge: Mapped[str | None] = mapped_column(String(8))
+    stove: Mapped[str | None] = mapped_column(String(8))
+    dishwasher: Mapped[str | None] = mapped_column(String(8))
+
+    verdict: Mapped[str] = mapped_column(String(8))
+    verdict_reasons: Mapped[list | None] = mapped_column(JsonVariant)
+
+    posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: Never updated after insert. "How long has this been listed?" is what separates a real
+    #: vacancy from a stale repost.
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    seller_hash: Mapped[str | None] = mapped_column(String(64))  # sha256, never the name
+    raw: Mapped[dict | None] = mapped_column(JsonVariant)
 
 
 class TrendPoint(Base):
