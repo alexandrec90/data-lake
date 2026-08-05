@@ -49,6 +49,21 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
+# E501 (line-too-long) is off deliberately, and was never chosen in the first place:
+# `"E"` above is a *family prefix* and line-too-long is one of its 19 members, so it
+# arrived with the family, not because anyone decided lines should be capped.
+#
+# `.claude/rules/engineering.md` already settles it: lint is for correctness and
+# security, and "anything a formatter can decide" is off. `line-length` above is
+# untouched and still drives `ruff format`, so code is still wrapped -- silently, on
+# every edit, instead of failing a commit. E501 only ever fires where the formatter
+# *cannot* split (long string literals, URLs), which is exactly where the report
+# cannot be acted on.
+#
+# The rest of `E` stays: E711/E712/E722/E902/E999 are real correctness checks. Adding a
+# rule family here means checking its members for more cosmetic riders like this one.
+ignore = ["E501"]
+
 [tool.mypy]
 # Matches ibkr_trader's floor: numpy's bundled stubs use 3.12+ syntax, so a 3.11 analysis
 # target makes mypy choke parsing them. requires-python = ">=3.11" still holds at runtime.
