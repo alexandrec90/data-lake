@@ -82,11 +82,33 @@ to publishing only datasets backed by a lake table.
 The consumer declares its private tables against the same `data_lake.db.base.Base`, so a
 single `Base.metadata` still covers everything its Alembic needs to see.
 
+### …and what may: any domain at all
+
+**This is not a finance package.** The market/corporate/news/social tables dominate
+`db/models.py` only because `ibkr_trader` was the first consumer. `listings` (rental ads,
+written by `apt-finder`) is here on exactly the same footing, and a sports-fixture table
+would be too. Nothing in the seam tests looks at subject matter.
+
+The question to ask of a new table is **"would a foreign consumer be harmed or confused
+by receiving this?"** — not "is it the same topic as what's already there". Account
+records fail that test. Scraped public content does not.
+
+Two practical consequences worth knowing before you add one:
+
+- Every consumer's `Base.metadata` grows, so their `alembic --autogenerate` will propose
+  creating your table. This is not a reason to keep a shareable table out — it is what
+  `db/adoption.py` is for: `include_only({"listings"})` gives a consumer's Alembic a
+  filter admitting only the tables it has adopted, applied to both sides of the
+  comparison so an unadopted table is neither created nor dropped.
+- Personal data in a shared table is still personal data. Hash it before it lands (see
+  Privacy, below); the bucket and every consumer's database inherit whatever you store.
+
 ## Privacy
 
-Social payloads are scraped content held under Québec Law 25. **Authors are stored
-hashed only** (`ingestion.base.stable_hash`) — never usernames — and the archive bucket
-must be private. R2 buckets are private by default, but an enabled `r2.dev` managed
+Social payloads and rental listings are scraped content held under Québec Law 25.
+**People are stored hashed only** (`ingestion.base.stable_hash`) — never usernames, never
+a listing seller's name, profile URL or phone number — and the archive bucket must be
+private. R2 buckets are private by default, but an enabled `r2.dev` managed
 domain or a custom domain makes objects public, and S3 credentials cannot report that:
 only the Cloudflare REST API or the dashboard can.
 
