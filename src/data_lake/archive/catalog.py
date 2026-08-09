@@ -15,6 +15,7 @@ Parquet), not to *read* an existing manifest.
 """
 
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -24,12 +25,24 @@ import pandas as pd
 from data_lake.archive.parquet_io import as_utc, parquet_bytes_to_frame
 from data_lake.archive.store import ObjectStore
 
+logger = logging.getLogger(__name__)
+
 #: Where manifests live in the bucket. Kept out of the data prefixes so listing a dataset's
 #: partitions never trips over its manifest and vice versa.
 CATALOG_PREFIX = "_catalog/"
 
 #: Bumped when the manifest JSON shape changes so consumers can detect an older writer.
 CATALOG_SCHEMA_VERSION = 1
+
+
+class ManifestError(ValueError):
+    """A manifest object exists but is not one this package can read.
+
+    Deliberately **not** ``KeyError``: :func:`load_manifest` reserves that for "no such
+    object", and conflating the two would let a corrupt manifest be reported as an absent
+    one — the difference between "nothing archived yet" and "the record of what was
+    archived is damaged".
+    """
 
 
 @dataclass(frozen=True)
@@ -99,6 +112,8 @@ class PartitionEntry:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PartitionEntry":
+        if not isinstance(data, dict):
+            raise ManifestError(f"partition entry must be an object, not {type(data).__name__}")
         return cls(
             rows=int(data["rows"]),
             min_ts=_parse_ts(data["min_ts"]),
@@ -143,19 +158,44 @@ class DatasetManifest:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "DatasetManifest":
-        return cls(
-            dataset=data["dataset"],
-            ts_column=data["ts_column"],
-            key_columns=list(data["key_columns"]),
-            schema=dict(data.get("schema", {})),
-            partitions={
-                key: PartitionEntry.from_dict(entry)
-                for key, entry in data.get("partitions", {}).items()
-            },
-            schema_version=int(data.get("schema_version", CATALOG_SCHEMA_VERSION)),
-            updated_at=_parse_ts(data["updated_at"]) if data.get("updated_at") else None,
-        )
+    def from_dict(cls, data: Any) -> "DatasetManifest":
+        """Parse a stored manifest, raising :class:`ManifestError` on anything unreadable.
+
+        The bucket is shared, so this is handed whatever JSON happens to sit under
+        ``_catalog/`` — another tool's manifest, a hand-edit, a half-finished write. Every
+        shape failure is funnelled into one exception type so callers have a single thing
+        to catch instead of the ``KeyError``/``TypeError``/``ValueError`` spread that the
+        raw subscripting below would otherwise leak.
+        """
+        if not isinstance(data, dict):
+            raise ManifestError(f"manifest must be a JSON object, not {type(data).__name__}")
+        dataset = data.get("dataset")
+        if not isinstance(dataset, str) or not dataset:
+            raise ManifestError("manifest has no 'dataset' name")
+        try:
+            return cls(
+                dataset=dataset,
+                ts_column=data["ts_column"],
+                key_columns=list(data["key_columns"]),
+                schema=dict(data.get("schema", {})),
+                partitions={
+                    key: PartitionEntry.from_dict(entry)
+                    for key, entry in data.get("partitions", {}).items()
+                },
+                schema_version=int(data.get("schema_version", CATALOG_SCHEMA_VERSION)),
+                updated_at=_parse_ts(data["updated_at"]) if data.get("updated_at") else None,
+            )
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise ManifestError(f"manifest {dataset!r}: {_reason(exc)}") from exc
+
+
+def _reason(exc: Exception) -> str:
+    """Render a parse failure as something an operator can act on."""
+    if isinstance(exc, ManifestError):
+        return str(exc)
+    if isinstance(exc, KeyError):
+        return f"missing field {exc.args[0]!r}"
+    return f"{type(exc).__name__}: {exc}"
 
 
 def _parse_ts(value: str) -> datetime:
@@ -181,12 +221,20 @@ def _schema_of(frame: pd.DataFrame) -> dict[str, str]:
 
 
 def load_manifest(store: ObjectStore, dataset: str) -> DatasetManifest | None:
-    """The stored manifest for ``dataset``, or ``None`` if the dataset was never catalogued."""
+    """The stored manifest for ``dataset``, or ``None`` if the dataset was never catalogued.
+
+    Raises :class:`ManifestError` when the object exists but cannot be read as one of this
+    package's manifests — never ``None``, which would report damage as absence.
+    """
     try:
         raw = store.get_bytes(manifest_key(dataset))
     except KeyError:
         return None
-    return DatasetManifest.from_dict(json.loads(raw))
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeDecodeError) as exc:  # JSONDecodeError is a ValueError
+        raise ManifestError(f"manifest {dataset!r}: not valid JSON: {exc}") from exc
+    return DatasetManifest.from_dict(payload)
 
 
 def _write_manifest(store: ObjectStore, manifest: DatasetManifest) -> None:
@@ -225,20 +273,41 @@ def record_partition(
 
 
 def list_datasets(store: ObjectStore) -> list[str]:
-    """Names of every catalogued dataset (from the manifest objects under ``_catalog/``)."""
+    """Names of every catalogued dataset (from the manifest objects under ``_catalog/``).
+
+    Names only — this reads no manifest bodies, so a damaged or foreign one still appears
+    here. It is deliberately *not* filtered against :data:`DATASET_SPECS`: a consumer's own
+    dataset is a legitimate catalog entry that this package has never heard of.
+    """
     names = []
     for obj in store.list_objects(CATALOG_PREFIX):
         name = obj.key.removeprefix(CATALOG_PREFIX)
-        if name.endswith(".json"):
-            names.append(name.removesuffix(".json"))
+        if not name.endswith(".json"):
+            continue
+        name = name.removesuffix(".json")
+        # nested or empty keys are something else's; manifest_key() never produces one
+        if name and "/" not in name:
+            names.append(name)
     return sorted(names)
 
 
 def load_catalog(store: ObjectStore) -> dict[str, DatasetManifest]:
-    """Every stored manifest, keyed by dataset name — the whole catalog in one call."""
+    """Every *readable* stored manifest, keyed by dataset name — the catalog in one call.
+
+    Unreadable manifests are logged and skipped rather than raised. The bucket is shared:
+    another consumer's tool may write its own manifests under the same ``_catalog/``
+    prefix, and any single object can be half-written or hand-edited. One such object must
+    not make "what's in here" unanswerable for every dataset that *is* readable — which is
+    what propagating the parse error would do. Call :func:`load_manifest` directly when you
+    need one named dataset and want the failure.
+    """
     catalog = {}
     for name in list_datasets(store):
-        manifest = load_manifest(store, name)
+        try:
+            manifest = load_manifest(store, name)
+        except ManifestError as exc:
+            logger.warning("skipping unreadable manifest %s: %s", manifest_key(name), exc)
+            continue
         if manifest is not None:
             catalog[name] = manifest
     return catalog

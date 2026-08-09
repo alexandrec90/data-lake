@@ -17,6 +17,7 @@ from data_lake.archive.bars import archive_price_bars
 from data_lake.archive.catalog import (
     CATALOG_PREFIX,
     DATASET_SPECS,
+    ManifestError,
     list_datasets,
     load_catalog,
     load_manifest,
@@ -136,6 +137,132 @@ def test_manifest_is_valid_json_under_catalog_prefix(tmp_path):
     payload = json.loads(store.get_bytes(manifest_key("price_bars")))
     assert payload["dataset"] == "price_bars"
     assert manifest_key("price_bars").startswith(CATALOG_PREFIX)
+
+
+# --- a shared bucket: manifests this package did not write ------------------------------
+#
+# The archive prefix is shared with every other consumer of this package, so `_catalog/`
+# holds whatever they wrote there too. One unreadable object must never take down the
+# whole catalog — before this was fixed, a single foreign manifest made load_catalog()
+# raise and "what's in here" became unanswerable for every dataset in the bucket.
+
+
+def _foreign_manifest(store, name: str, payload: bytes) -> None:
+    store.put_bytes(f"{CATALOG_PREFIX}{name}.json", payload)
+
+
+@pytest.mark.parametrize(
+    ("label", "payload"),
+    [
+        ("not json at all", b"<html>404</html>"),
+        ("json but not an object", b'["price_bars"]'),
+        ("no dataset name", b'{"ts_column": "ts", "key_columns": ["a"]}'),
+        ("missing ts_column", b'{"dataset": "fixtures", "key_columns": ["a"]}'),
+        ("missing key_columns", b'{"dataset": "fixtures", "ts_column": "ts"}'),
+        (
+            "unparseable timestamp",
+            b'{"dataset": "fixtures", "ts_column": "ts", "key_columns": ["a"],'
+            b' "updated_at": "last tuesday"}',
+        ),
+        (
+            "partition entry of the wrong shape",
+            b'{"dataset": "fixtures", "ts_column": "ts", "key_columns": ["a"],'
+            b' "partitions": {"p.parquet": 12}}',
+        ),
+        (
+            "partition entry missing a field",
+            b'{"dataset": "fixtures", "ts_column": "ts", "key_columns": ["a"],'
+            b' "partitions": {"p.parquet": {"rows": 3}}}',
+        ),
+    ],
+)
+def test_load_manifest_raises_manifest_error_on_unreadable_object(tmp_path, label, payload):
+    store = LocalDirStore(tmp_path)
+    _foreign_manifest(store, "fixtures", payload)
+
+    with pytest.raises(ManifestError):
+        load_manifest(store, "fixtures")
+
+
+def test_manifest_error_is_not_a_key_error(tmp_path):
+    """A damaged manifest must not be mistakable for an absent one.
+
+    ``load_manifest`` returns None for "never catalogued" by catching KeyError off the
+    store; if a parse failure also surfaced as KeyError, a caller narrowing on it would
+    silently read damage as absence.
+    """
+    store = LocalDirStore(tmp_path)
+    _foreign_manifest(store, "fixtures", b'{"ts_column": "ts", "key_columns": ["a"]}')
+
+    assert not issubclass(ManifestError, KeyError)
+    with pytest.raises(ManifestError):
+        load_manifest(store, "fixtures")
+
+
+def test_load_catalog_skips_a_foreign_manifest_and_keeps_the_readable_ones(tmp_path, caplog):
+    store = LocalDirStore(tmp_path)
+    record_partition(
+        store, spec_for("price_bars"), "price_bars/p.parquet", _bars_frame([NOW]), now=NOW
+    )
+    # another consumer's tool, writing its own manifest shape under the same prefix
+    _foreign_manifest(store, "rental_listings", b'{"version": 2, "rows": {"2026-07": 88}}')
+
+    with caplog.at_level("WARNING"):
+        catalog = load_catalog(store)
+
+    assert set(catalog) == {"price_bars"}
+    assert catalog["price_bars"].total_rows == 1
+    # skipped loudly, not silently — and the offending key is named
+    assert "rental_listings" in caplog.text
+
+
+def test_load_catalog_survives_a_truncated_manifest(tmp_path):
+    """A crash mid-write leaves half a JSON object; the rest of the catalog still reads."""
+    store = LocalDirStore(tmp_path)
+    record_partition(
+        store, spec_for("price_bars"), "price_bars/p.parquet", _bars_frame([NOW]), now=NOW
+    )
+    good = store.get_bytes(manifest_key("price_bars"))
+    _foreign_manifest(store, "news_articles", good[: len(good) // 2])
+
+    catalog = load_catalog(store)
+
+    assert set(catalog) == {"price_bars"}
+
+
+def test_list_datasets_reports_names_without_reading_bodies(tmp_path):
+    """Listing is name-only, so an unreadable manifest is still discoverable."""
+    store = LocalDirStore(tmp_path)
+    _foreign_manifest(store, "rental_listings", b"not json")
+
+    assert list_datasets(store) == ["rental_listings"]
+
+
+def test_list_datasets_ignores_keys_that_are_not_manifests(tmp_path):
+    store = LocalDirStore(tmp_path)
+    record_partition(
+        store, spec_for("price_bars"), "price_bars/p.parquet", _bars_frame([NOW]), now=NOW
+    )
+    store.put_bytes(f"{CATALOG_PREFIX}README.md", b"# what lives here")
+    store.put_bytes(f"{CATALOG_PREFIX}nested/other.json", b"{}")
+    store.put_bytes(f"{CATALOG_PREFIX}.json", b"{}")
+
+    assert list_datasets(store) == ["price_bars"]
+
+
+def test_record_partition_refuses_to_clobber_an_unreadable_manifest(tmp_path):
+    """Read-modify-write must fail loudly rather than overwrite a manifest it cannot read.
+
+    Silently replacing it would destroy another tool's manifest on a name collision;
+    ``rebuild_catalog`` is the deliberate repair path.
+    """
+    store = LocalDirStore(tmp_path)
+    _foreign_manifest(store, "price_bars", b'{"dataset": "price_bars", "ts_column": 5}')
+
+    with pytest.raises(ManifestError):
+        record_partition(
+            store, spec_for("price_bars"), "price_bars/p.parquet", _bars_frame([NOW]), now=NOW
+        )
 
 
 # --- integration: archive writers keep the catalog in step ------------------------------
