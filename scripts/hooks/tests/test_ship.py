@@ -54,36 +54,19 @@ def _wire_main(monkeypatch, *, branch="claude/x", clean=True, lint=True, push=Tr
     monkeypatch.setattr(ship, "_porcelain", lambda: "" if clean else " M x.py\n")
     monkeypatch.setattr(ship, "_run_lint", lambda: lint)
     monkeypatch.setattr(ship, "_push", lambda value: push)
-    marked: list[str] = []
-    monkeypatch.setattr(ship, "write_shipped_marker", marked.append)
-    return marked
 
 
 def test_preflight_reports_branch_and_base(monkeypatch, capsys):
-    marked = _wire_main(monkeypatch)
+    _wire_main(monkeypatch)
     assert ship.main(["--preflight"]) == ship.EXIT_OK
     assert "branch=claude/x base=main" in capsys.readouterr().out
-    assert marked == []
 
 
 def test_push_requires_clean_tree(monkeypatch):
-    marked = _wire_main(monkeypatch, clean=False)
+    _wire_main(monkeypatch, clean=False)
     assert ship.main([]) == ship.EXIT_DIRTY_TREE
-    assert marked == []
-
-
-def test_push_does_not_mark_branch_shipped(monkeypatch):
-    marked = _wire_main(monkeypatch)
-    assert ship.main([]) == ship.EXIT_OK
-    assert marked == []
-
-
-def test_mark_shipped_is_separate_post_pr_step(monkeypatch):
-    marked = _wire_main(monkeypatch, clean=False, lint=False, push=False)
-    assert ship.main(["--mark-shipped"]) == ship.EXIT_OK
-    assert marked == ["claude/x"]
 
 
 def test_unknown_arguments_are_rejected(monkeypatch):
     _wire_main(monkeypatch)
-    assert ship.main(["--preflight", "--mark-shipped"]) == ship.EXIT_USAGE
+    assert ship.main(["--preflight", "--nonsense"]) == ship.EXIT_USAGE

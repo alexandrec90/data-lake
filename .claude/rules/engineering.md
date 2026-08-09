@@ -88,6 +88,52 @@ The split has a practical consequence worth stating: a lint rule that fires on
 something a formatter would fix is misconfigured, not useful. Turn it off rather than
 teaching everyone to ignore it.
 
+### Rule families are how cosmetic rules get in
+
+**Adding a family prefix to `select` enables every member, including the cosmetic
+ones.** `"E"` is not one rule; it is nineteen, and `E501` (line-too-long) is one of
+them. Nobody in this workspace ever decided to cap line length — `select = ["E", "F",
+"I", "UP"]` was added once, E501 came along, and the same commit already carried two
+`per-file-ignores` entries turning it back off. It spread to every generated project
+from there and was suppressed one directory at a time for years.
+
+So, when adding a family: **read its members and ignore the cosmetic ones in the same
+change.** A rule already exempted in two or three directories is not a rule anyone
+wants — that is the signal it should be off globally, not exempted a fourth time.
+
+Currently off by this policy, and they are not to be re-enabled without a reason that
+names a defect they would catch:
+
+| Selector | What it enforces |
+| --- | --- |
+| `I` | import ordering |
+| `UP` | preferred modern syntax |
+| `SIM` | readability rewrites |
+| `N` | naming conventions |
+| `T20` | stray `print()` calls |
+| `E101 E401 E501 E701 E702 E703 E731 E741 E742 E743` | the cosmetic members of `E` |
+
+`E402`, `E711`–`E714`, `E721`, `E722`, `E902` and `E999` stay on: those catch real
+defects. So do `F`, `B`, `ASYNC`, `S` and `RUF`.
+
+`line-length` is a **formatter** setting and stays. Dropping E501 does not stop code
+being wrapped; it stops the wrapping being a commit failure.
+
+Two things make this stick rather than drift back:
+
+- devkit's `test_generated_projects_do_not_enforce_cosmetic_rules` fails if a newly
+  generated project would enforce any of the above. It tests *reachability*, because
+  dropping a family from `select` and listing a code in `ignore` are equally effective
+  and a check on one spelling would miss the other.
+- Selectors do not span linters. `S` is flake8-bandit and does **not** select `SIM108`
+  from flake8-simplify; only the numeric part matches as a prefix, which is why `E5`
+  covers `E501`. Assume otherwise and you will disable, or fail to disable, the wrong
+  set.
+
+This is a deliberate deletion of obsolete checks, which the closing paragraph of *When
+a linter is wrong* permits explicitly. It is **not** licence to skip a failing check:
+everything still enabled gets fixed or reported, never ignored.
+
 ### Never silence a finding without naming the reason
 
 `# noqa`, `# type: ignore`, `# nosec`, `eslint-disable` — each one is a claim that the

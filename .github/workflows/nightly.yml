@@ -1,0 +1,82 @@
+name: Nightly
+
+# The scheduled full run against the default branch. The PR gate only fires on a
+# change, so it is structurally blind to every failure that arrives without one: a
+# dependency published inside this project's version bounds, a runner image bump, an
+# expired credential, a test that is flaky rather than broken.
+#
+# `cancel-in-progress: false` is deliberate and is asserted by the vendored
+# `test_ci_workflow_contract.py` — a scheduled run that cancels itself reports nothing
+# on exactly the night two runs overlap.
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  full-suite:
+    name: Full suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-python-env
+        with:
+          python-version: "3.11"
+      - name: Application suite
+        run: uv run python scripts/run-tests.py
+      - name: Harness hook tests
+        run: uv run python -m pytest scripts/hooks/tests/ -q
+      - name: Lint and type-check
+        run: uv run python scripts/lint-all.py
+      - name: Failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-failures
+          path: logs/
+          if-no-files-found: ignore
+
+  optional-extras:
+    # The suite above runs against `uv sync --all-extras --all-groups`, which installs
+    # pyarrow, boto3 and duckdb. That is the opposite of what a consumer gets by
+    # default, and the guarded-import contract in CLAUDE.md ("importing the package
+    # must never require it") is only actually exercised without them.
+    name: Import surface without the optional extras
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Install without extras
+        run: |
+          pip install uv
+          uv sync --no-default-groups
+      - name: Every module imports with archive and research absent
+        run: |
+          uv run python - <<'PY'
+          import importlib
+          import pkgutil
+
+          import data_lake
+
+          failures = []
+          for module in pkgutil.walk_packages(data_lake.__path__, "data_lake."):
+              try:
+                  importlib.import_module(module.name)
+              except ImportError as exc:
+                  failures.append(f"{module.name}: {exc}")
+          if failures:
+              raise SystemExit(
+                  "modules that need an optional extra merely to import:\n  "
+                  + "\n  ".join(failures)
+              )
+          PY

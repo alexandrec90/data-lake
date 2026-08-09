@@ -23,16 +23,6 @@
         ]
       }
     ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"${CLAUDE_PROJECT_DIR:-.}/scripts/hooks/branch-per-task.py\""
-          }
-        ]
-      }
-    ],
     "PreToolUse": [
       {
         "matcher": "^Bash$",
@@ -40,15 +30,6 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PROJECT_DIR:-.}/scripts/hooks/enforce-capped-bash.py\""
-          }
-        ]
-      },
-      {
-        "matcher": "^(Edit|Write|MultiEdit|NotebookEdit|apply_patch|create_file)$",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"${CLAUDE_PROJECT_DIR:-.}/scripts/hooks/branch-on-write.py\""
           }
         ]
       }

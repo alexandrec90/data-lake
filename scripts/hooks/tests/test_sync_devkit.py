@@ -1,5 +1,6 @@
 """Unit tests for scripts/sync-devkit.py (harness vendoring + drift check)."""
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -821,3 +822,141 @@ def test_block_manifest_ships_empty_until_the_content_moves():
     test. Delete this the moment a block is configured; it is a scope marker, and
     leaving it would make the migration look like a regression."""
     assert sh.BLOCK_MANIFEST == ()
+
+
+# --- unwiring a retired hook ------------------------------------------------
+# A pull DELETES retired scripts, so a settings entry still naming one is not inert:
+# the harness runs it, the interpreter fails, and every prompt in that project carries
+# a hook error. These assert the pull cleans up after itself.
+
+
+def _settings(*commands: str) -> dict:
+    return {
+        "model": "opus",
+        "hooks": {
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": commands[0]}]}],
+            "PreToolUse": [
+                {
+                    "matcher": "^(Edit|Write)$",
+                    "hooks": [{"type": "command", "command": c} for c in commands[1:]],
+                }
+            ],
+        },
+    }
+
+
+def test_a_retired_hook_command_is_dropped():
+    payload = _settings(
+        'python3 "${CLAUDE_PROJECT_DIR:-.}/scripts/hooks/branch-per-task.py"',
+        'python3 "${CLAUDE_PROJECT_DIR:-.}/scripts/hooks/lint-fix.py"',
+    )
+    pruned, dropped = sh.prune_hook_commands(payload, ("scripts/hooks/branch-per-task.py",))
+    assert dropped == ["branch-per-task.py"]
+    assert "UserPromptSubmit" not in pruned["hooks"]
+    assert pruned["hooks"]["PreToolUse"][0]["hooks"][0]["command"].endswith('lint-fix.py"')
+
+
+def test_a_surviving_hook_in_the_same_group_is_kept():
+    """The group is shared, so this must drop a command, not the matcher it sits in."""
+    payload = _settings(
+        'python3 "x/scripts/hooks/branch-per-task.py"',
+        'python3 "x/scripts/hooks/branch-on-write.py"',
+        'python3 "x/scripts/hooks/lint-fix.py"',
+    )
+    pruned, dropped = sh.prune_hook_commands(
+        payload, ("scripts/hooks/branch-per-task.py", "scripts/hooks/branch-on-write.py")
+    )
+    assert sorted(dropped) == ["branch-on-write.py", "branch-per-task.py"]
+    kept = pruned["hooks"]["PreToolUse"][0]["hooks"]
+    assert len(kept) == 1 and kept[0]["command"].endswith('lint-fix.py"')
+
+
+def test_an_emptied_event_is_removed_not_left_as_a_husk():
+    """`{"hooks": []}` is a shape the next reader cannot tell from an accident."""
+    payload = _settings('python3 "x/scripts/hooks/branch-per-task.py"')
+    pruned, _ = sh.prune_hook_commands(payload, ("scripts/hooks/branch-per-task.py",))
+    assert pruned["hooks"] == {}
+    assert pruned["model"] == "opus"  # everything outside `hooks` is untouched
+
+
+def test_nothing_is_dropped_when_no_hook_is_retired():
+    payload = _settings('python3 "x/scripts/hooks/lint-fix.py"')
+    pruned, dropped = sh.prune_hook_commands(payload, ("scripts/hooks/branch-per-task.py",))
+    assert dropped == []
+    assert pruned == payload
+
+
+@pytest.mark.parametrize("payload", [None, [], "text", {}, {"hooks": "nonsense"}])
+def test_a_settings_shape_this_does_not_understand_is_returned_untouched(payload):
+    assert sh.prune_hook_commands(payload, ("scripts/hooks/branch-per-task.py",)) == (payload, [])
+
+
+def test_prune_settings_rewrites_the_file(tmp_path):
+    path = tmp_path / sh.SETTINGS_FILE
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(_settings('python3 "x/scripts/hooks/branch-per-task.py"')), encoding="utf-8"
+    )
+    assert sh.prune_settings(tmp_path, ("scripts/hooks/branch-per-task.py",)) == [
+        "branch-per-task.py"
+    ]
+    assert "branch-per-task" not in path.read_text(encoding="utf-8")
+
+
+def test_prune_settings_leaves_an_unparseable_file_exactly_as_it_was(tmp_path):
+    """Rewriting a settings file this could not read is how a pull would take a
+    project's whole harness config with it."""
+    path = tmp_path / sh.SETTINGS_FILE
+    path.parent.mkdir(parents=True)
+    path.write_text("{ not json, branch-per-task.py", encoding="utf-8")
+    assert sh.prune_settings(tmp_path, ("scripts/hooks/branch-per-task.py",)) == []
+    assert path.read_text(encoding="utf-8") == "{ not json, branch-per-task.py"
+
+
+def test_prune_settings_is_silent_when_there_is_no_settings_file(tmp_path):
+    assert sh.prune_settings(tmp_path, ("scripts/hooks/branch-per-task.py",)) == []
+
+
+def test_a_live_hook_merely_mentioning_a_retired_basename_is_kept():
+    """Regression. Matching on the BASENAME made `README.md` a retired "hook", because
+    `.claude/skills/state-tools/README.md` is in RETIRED_PATHS -- and carameli wires a
+    markdownlint hook whose command lists `"README.md"` among its arguments. A pull
+    would have silently deleted that hook from its settings.
+
+    Matching on the repo-relative path is both precise and correct: a hook command
+    embeds the path (`.../scripts/hooks/branch-on-write.py`), never the bare name.
+    """
+    lint = 'markdownlint-cli2 --config .config.yaml "docs/roadmap.md" "README.md"'
+    payload = _settings(lint)
+    pruned, dropped = sh.prune_hook_commands(payload, (".claude/skills/state-tools/README.md",))
+    assert dropped == []
+    assert pruned == payload
+
+
+def test_only_scripts_can_be_retired_hooks():
+    """A retired skill, rule or test file can never be a hook command, so it must not
+    even be a candidate -- that is what keeps a name like `README.md` out of the
+    matching set in the first place."""
+    candidates = sh.retired_hook_paths(
+        (
+            "scripts/hooks/branch-on-write.py",
+            "scripts/hooks/tests/test_branch_on_write.py",
+            ".claude/skills/state-tools/README.md",
+            ".claude/skills/test-skill/write-artifacts.py",
+        )
+    )
+    assert "scripts/hooks/branch-on-write.py" in candidates
+    assert not any(c.endswith(".md") for c in candidates)
+    assert not any(c.startswith(".claude/") for c in candidates)
+
+
+def test_the_retired_branch_hooks_are_listed_so_a_pull_unwires_them():
+    """Reversion check: drop these from RETIRED_PATHS and every consumer keeps a hook
+    entry pointing at a file the same pull deleted."""
+    for rel in (
+        "scripts/hooks/branch-per-task.py",
+        "scripts/hooks/branch-on-write.py",
+        "scripts/hooks/tests/test_branch_on_write.py",
+    ):
+        assert rel in sh.RETIRED_PATHS
+        assert rel not in sh.MANIFEST

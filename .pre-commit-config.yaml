@@ -1,0 +1,41 @@
+# Fast, deterministic commit-time checks. DevKit's SessionStart hook installs these
+# automatically for clones that do not use the machine-wide policy dispatcher.
+repos:
+  - repo: https://github.com/alexandrec90/devkit
+    rev: v0.7.0
+    hooks:
+      - id: devkit-manifest
+      - id: devkit-hooks-stdlib-only
+      - id: devkit-drift
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.0
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+        files: ^\.claude/settings\.json$
+      - id: check-added-large-files
+
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        exclude: |
+          (?x)^(
+            uv\.lock|
+            \.env\.example|
+            DEVKIT_FILES\.json
+          )$
