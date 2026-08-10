@@ -6,6 +6,21 @@ import pytest
 from conftest import load_module
 
 hook = load_module("scripts/sync-codex-hooks.py")
+sync_devkit = load_module("scripts/sync-devkit.py")
+
+
+def test_codex_runtime_and_tests_are_vendored():
+    """Generated commands must not depend on files held by only one consumer."""
+    required = {
+        "scripts/hooks/codex-hook-adapter.py",
+        "scripts/hooks/codex-session-start.py",
+        "scripts/hooks/tests/test_codex_hook_adapter.py",
+        "scripts/hooks/tests/test_codex_session_start.py",
+    }
+
+    assert required <= set(sync_devkit.MANIFEST)
+    for relative in required:
+        assert (sync_devkit.REPO_ROOT / relative).is_file(), relative
 
 
 class TestRewriteCommand:
@@ -190,3 +205,99 @@ def test_sync_missing_src_is_noop(tmp_path):
     dest = tmp_path / "hooks.json"
     assert hook.sync(src, dest) == 0
     assert not dest.exists()
+
+
+# --- the workstation-level pair ---------------------------------------------
+# ~/.claude/settings.json wires the hooks that are NOT vendored into any repo -- the
+# home-branch edit guard and the task-slug recorder. Codex had neither, so its edits
+# landed on home branches with nothing catching them.
+
+
+def test_a_python_command_is_wrapped_like_python3():
+    """The workstation hooks are hand-written with the interpreter Windows has. A
+    prefix list that only knew `python3 ` let every user-level hook through unwrapped,
+    so Codex got the raw command and none of the adapter's exit-code translation."""
+    wrapped = hook.wrap_command("PreToolUse", 'python "C:/devkit/scripts/guard.py"')
+    assert "codex-hook-adapter.py" in wrapped
+    assert "--event PreToolUse" in wrapped
+
+
+def test_an_absolute_root_replaces_the_git_rev_parse_expression():
+    """A Codex session opened outside any checkout makes `$(git rev-parse ...)` fail
+    and takes the hook with it -- which is exactly where the workstation file is read."""
+    wrapped = hook.wrap_command("PreToolUse", 'python "x/guard.py"', root="C:/ws/devkit")
+    assert "C:/ws/devkit/scripts/hooks/codex-hook-adapter.py" in wrapped
+    assert "git rev-parse" not in wrapped
+
+
+def test_the_per_repo_form_still_resolves_through_the_git_root():
+    """Repo-level files must stay repo-relative so a fresh clone works anywhere."""
+    wrapped = hook.wrap_command("PreToolUse", 'python3 "x/guard.py"')
+    assert "$(git rev-parse --show-toplevel)" in wrapped
+
+
+def test_session_start_is_redirected_through_the_absolute_codex_entrypoint():
+    wrapped = hook.wrap_command(
+        "SessionStart", 'bash ".claude/hooks/session-start.sh"', root="C:/ws/devkit"
+    )
+    assert "C:/ws/devkit/scripts/hooks/codex-session-start.py" in wrapped
+
+
+def test_stable_root_never_points_into_a_box(tmp_path, monkeypatch):
+    """A box is destroyed when its PR merges. The workstation file is read for as long
+    as the machine exists, so a root resolved to a box would leave every Codex hook
+    invoking a deleted directory -- and running --user from a box is now the normal
+    way this repo is worked on."""
+    box = tmp_path / ".worktrees" / "devkit--topic-0808" / "scripts"
+    box.mkdir(parents=True)
+    (tmp_path / "devkit").mkdir()
+    monkeypatch.setattr(hook, "__file__", str(box / "sync-codex-hooks.py"))
+    assert hook.stable_root() == (tmp_path / "devkit").as_posix()
+
+
+def test_stable_root_is_the_repo_itself_outside_a_box(tmp_path, monkeypatch):
+    scripts = tmp_path / "devkit" / "scripts"
+    scripts.mkdir(parents=True)
+    monkeypatch.setattr(hook, "__file__", str(scripts / "sync-codex-hooks.py"))
+    assert hook.stable_root() == (tmp_path / "devkit").as_posix()
+
+
+def test_sync_creates_the_destination_directory(tmp_path):
+    """~/.codex may exist while ~/.codex/hooks.json's parent chain does not on a fresh
+    machine; the old code raised FileNotFoundError instead of writing."""
+    src = tmp_path / "settings.json"
+    src.write_text(json.dumps({"hooks": {}}), encoding="utf-8")
+    dest = tmp_path / "nested" / "deeper" / "hooks.json"
+    assert hook.sync(src, dest) == 0
+    assert dest.is_file()
+
+
+def test_the_user_pair_carries_the_guard_and_the_slug_recorder(tmp_path):
+    """The regression this whole change exists for: both must reach Codex."""
+    src = tmp_path / "settings.json"
+    src.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {"hooks": [{"type": "command", "command": 'python "d/task_slug.py"'}]}
+                    ],
+                    "PreToolUse": [
+                        {
+                            "matcher": "^(Edit|Write)$",
+                            "hooks": [
+                                {"type": "command", "command": 'python "d/worktree-guard.py"'}
+                            ],
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    dest = tmp_path / "hooks.json"
+    hook.sync(src, dest, root="C:/ws/devkit")
+    body = dest.read_text(encoding="utf-8")
+    assert "task_slug.py" in body
+    assert "worktree-guard.py" in body
+    assert "git rev-parse" not in body

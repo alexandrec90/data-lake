@@ -33,6 +33,7 @@ dev = [
     "pytest-cov>=6",
     "ruff>=0.4",
     "mypy>=1.10",
+    "pre-commit>=4.6",
 ]
 
 [build-system]
@@ -79,13 +80,13 @@ select = ["E", "F", "B"]
 # Still on: E402, E711/E712/E713/E714 (comparison bugs), E721, E722 (bare except),
 # E902, E999. Those catch real defects.
 #
-# E731 is deliberately absent from this list, and rejoins it on the next devkit pull.
-# The vendored `scripts/hooks/tests/test_repo_contract.py` carries a `# noqa: E731`;
-# ignoring E731 here would make that directive dead and RUF100 would flag it -- in a
-# file this repo is not allowed to edit (the `devkit-drift` gate enforces that, and it
-# compares against the pinned devkit rev, not a local checkout). devkit has already
-# dropped the directive upstream, so `sync-devkit.py --pull` is what unblocks this.
-ignore = ["E101", "E401", "E501", "E701", "E702", "E703", "E741", "E742", "E743"]
+# E731 (lambda assignment) rejoined this list with the v0.7.0 pull, which is what the
+# previous note here said would unblock it. It was held out because the vendored
+# `scripts/hooks/tests/test_repo_contract.py` carried a `# noqa: E731`, and ignoring the
+# rule would have made that directive dead -- in a file this repo may not edit, since
+# the `devkit-drift` gate compares against the pinned devkit rev. Upstream dropped the
+# directive, so the rule can go off here without stranding a suppression.
+ignore = ["E101", "E401", "E501", "E701", "E702", "E703", "E731", "E741", "E742", "E743"]
 
 [tool.mypy]
 # Matches ibkr_trader's floor: numpy's bundled stubs use 3.12+ syntax, so a 3.11 analysis

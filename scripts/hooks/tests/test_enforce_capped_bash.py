@@ -299,6 +299,116 @@ def test_block_message_explains_both_new_rules():
     assert "ls/cat/git status" in msg
 
 
+# --- three shapes the gate was never meant to catch ---------------------------
+# Each of these blocked a real call in one session, and each was worse than an ordinary
+# false positive: the remedy the block message offers does not resolve any of them.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # The exact chain that was blocked: everything is silent or capped, and the
+        # `rm` alone stopped it. There is no way to cap a command that prints nothing.
+        'cd /tmp && rm -rf out && mkdir -p out && python3 scripts/hooks/invoke-capped.py --command "x"',
+        "rm -rf build",
+        "rm -f a.txt b.txt",
+        "cp a b",
+        "mv a b",
+        "rmdir empty",
+        "ln -s a b",
+        "chmod +x scripts/hook.py",
+    ],
+)
+def test_commands_silent_on_success_need_no_wrapper(command):
+    assert hook.is_capped(command) is True
+    assert hook.decide(payload("Bash", command)) == (0, "")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # `-v` is the one flag that turns this family into per-file output scaling with
+        # the tree, and it was a live hole in the entries that were already exempt.
+        "rm -rv big/",
+        "mkdir -pv a/b/c",
+        "cp -rv src dst",
+        "chmod -R --verbose 755 .",
+    ],
+)
+def test_verbose_revokes_the_silent_on_success_exemption(command):
+    assert hook.is_bounded(command) is False
+    assert hook.decide(payload("Bash", command))[0] == hook.EXIT_BLOCK
+
+
+def test_a_loop_whose_body_is_capped_is_allowed():
+    """Before this, EVERY loop was blocked, whatever its body did.
+
+    `statements()` splits on `;`, so a loop arrives shredded into `do` / `done`
+    fragments that can carry no cap and match no bounded command. The block message's
+    remedy cannot help either: the wrapper runs through cmd.exe, where bash loop syntax
+    is a parse error, so this shape had no legal spelling at all.
+    """
+    command = (
+        'for f in *.py; do python3 scripts/hooks/invoke-capped.py --command "ruff check $f"; done'
+    )
+    assert hook.is_capped(command) is True
+    assert hook.decide(payload("Bash", command)) == (0, "")
+
+
+def test_a_loop_body_still_needs_its_cap():
+    """The keyword is peeled off; what it introduces is judged on its own merits."""
+    assert hook.is_bounded("do ls -R /") is False
+    assert hook.is_capped('for d in */; do ls -R "$d"; done') is False
+    assert hook.decide(payload("Bash", "for d in */; do ls -R $d; done"))[0] == hook.EXIT_BLOCK
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    ["done", "fi", "esac", "then", "else", "}", "for f in *.py", "case $x in", "do rm -rf x"],
+)
+def test_control_flow_fragments_are_bounded(fragment):
+    assert hook.is_bounded(fragment) is True
+
+
+def test_a_heredoc_body_is_not_read_as_statements():
+    """A commit message is data. The newline split read every line of one as a command.
+
+    Nothing about the body can be capped, and a heredoc cannot be handed to the wrapper
+    either (it does not survive cmd.exe) — so this shape forced a write-the-message-to-a-
+    file detour every single time.
+    """
+    command = "git commit -F - <<'EOF' | head -c 400\nSubject line\n\nls -R / in the body\nEOF"
+    assert hook.statements(command) == ["git commit -F - <<'EOF' | head -c 400"]
+    assert hook.is_capped(command) is True
+
+
+def test_a_heredoc_does_not_launder_the_statements_after_it():
+    command = "cat <<EOF | head -c 100\nbody\nEOF\nls -R /"
+    assert hook.statements(command) == ["cat <<EOF | head -c 100", "ls -R /"]
+    assert hook.is_capped(command) is False
+
+
+@pytest.mark.parametrize("operator", ["<<EOF", "<<-EOF", "<<'EOF'", '<<"EOF"'])
+def test_every_heredoc_operator_spelling_consumes_its_body(operator):
+    command = f"cat {operator} | head -c 100\nls -R /\nEOF"
+    assert hook.statements(command) == [f"cat {operator} | head -c 100"]
+
+
+def test_an_unterminated_heredoc_consumes_the_rest():
+    """What a shell does too. Failing closed here would block on a typo instead."""
+    assert hook.statements("cat <<EOF | head -c 10\nbody\nmore") == ["cat <<EOF | head -c 10"]
+
+
+def test_a_here_string_is_not_a_heredoc():
+    """`<<<` feeds one word, not a body; treating it as one would swallow real code."""
+    assert hook.statements("grep x <<<'text'\nls -R /") == ["grep x <<<'text'", "ls -R /"]
+
+
+def test_a_heredoc_inside_quotes_is_not_an_operator():
+    command = "python3 scripts/hooks/invoke-capped.py --command \"echo 'a << b'\""
+    assert hook.statements(command) == [command]
+
+
 def test_get_value_dotted_and_missing():
     obj = {"tool_input": {"command": "x"}}
     assert hook.get_value(obj, "tool_input.command") == "x"

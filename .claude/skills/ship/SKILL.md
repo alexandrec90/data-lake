@@ -20,8 +20,15 @@ Run each step in order. Stop on failure; never open a PR for an unverified branc
    Reuse it when present. Otherwise inspect the repository's PR template and run
    `gh pr create` with the detected base branch, current branch, commit subject (or
    `$ARGUMENTS`), and a concise body covering the change and verification.
-5. Only after a PR URL exists, run `python scripts/ship.py --mark-shipped`. This arms
-   the next-prompt branch hook. Never mark a pushed branch that has no PR.
-6. Report the PR number and URL.
+5. Report the PR number and URL.
 
 Do not enable auto-merge, wait on CI, or start an autofix loop unless the user asks.
+
+## Do not clean up after yourself
+
+Shipping ends at the PR. If this branch is in an ephemeral box, **leave the box
+alone** — do not reap it, do not delete the branch, do not stop its stack.
+
+`worktree.py reconcile` owns that, and it waits for the PR to actually merge before
+destroying anything. Reaping here would do it on the strength of the push instead,
+which is the one moment the work exists only locally if the PR was never created.

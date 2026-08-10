@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Mechanical checks, lint, push, and shipped-marker handling for /ship."""
+"""Mechanical checks, lint and push for /ship.
+
+The shipped-marker half is gone with `branch-per-task.py`. The marker existed to tell
+the *next prompt* that this branch was spent, so the branch hook could leave it — and
+with agent work happening in a box that is destroyed after its PR merges, there is no
+next prompt on a spent branch to warn.
+"""
 
 from __future__ import annotations
 
-import contextlib
 import subprocess
 import sys
 import time
@@ -67,16 +72,6 @@ def _porcelain() -> str:
     return result.stdout if result.returncode == 0 else ""
 
 
-def write_shipped_marker(branch: str) -> None:
-    """Record a successfully PR'd branch for the next-prompt branch hook."""
-    result = _git("rev-parse", "--git-path", tb.SHIPPED_MARKER_NAME)
-    if result.returncode != 0 or not result.stdout.strip():
-        return
-    path = REPO_ROOT / result.stdout.strip()
-    with contextlib.suppress(OSError):
-        path.write_text(branch + "\n", encoding="utf-8")
-
-
 def _run_lint() -> bool:
     if not LINT_ALL.is_file():
         print(f"ship: required lint runner is missing: {LINT_ALL}", file=sys.stderr)
@@ -115,8 +110,8 @@ def _push(branch: str, sleep=time.sleep) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if argv not in ([], ["--preflight"], ["--mark-shipped"]):
-        print("usage: ship.py [--preflight | --mark-shipped]", file=sys.stderr)
+    if argv not in ([], ["--preflight"]):
+        print("usage: ship.py [--preflight]", file=sys.stderr)
         return EXIT_USAGE
 
     branch = current_branch()
@@ -128,11 +123,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if argv == ["--preflight"]:
         print(f"ship: branch={branch} base={base}")
-        return EXIT_OK
-
-    if argv == ["--mark-shipped"]:
-        write_shipped_marker(branch)
-        print(f"ship: marked '{branch}' shipped; the next prompt starts a fresh task branch.")
         return EXIT_OK
 
     if not tree_clean(_porcelain()):

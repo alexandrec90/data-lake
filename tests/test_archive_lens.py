@@ -162,7 +162,7 @@ def test_s3_settings_create_scoped_temporary_secret_without_network(monkeypatch)
         archive_s3_endpoint_url="https://account.r2.cloudflarestorage.com",
         archive_s3_region="auto",
         archive_s3_access_key_id="test-key",
-        archive_s3_secret_access_key="test-secret",
+        archive_s3_secret_access_key="test-secret",  # pragma: allowlist secret - fixture, no bucket exists
     )
 
     returned = lens.connect_lens(settings)
@@ -199,7 +199,7 @@ def test_s3_empty_dataset_gets_typed_empty_view(monkeypatch):
         archive_backend="s3",
         archive_s3_bucket="empty-archive",
         archive_s3_access_key_id="test-key",
-        archive_s3_secret_access_key="test-secret",
+        archive_s3_secret_access_key="test-secret",  # pragma: allowlist secret
     )
 
     lens.connect_lens(settings)

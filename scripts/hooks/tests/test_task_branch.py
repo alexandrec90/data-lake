@@ -119,21 +119,6 @@ class TestSlugFromPrompt:
         assert len(tb.slug_from_prompt("supercalifragilistic " * 10)) <= tb.SLUG_MAX_LEN
 
 
-class TestShouldBranch:
-    def test_true_on_default(self):
-        assert tb.should_branch("master") is True
-
-    def test_false_on_feature_branch(self):
-        assert tb.should_branch("claude/foo-0722") is False
-
-    def test_false_on_detached_head(self):
-        assert tb.should_branch("") is False
-
-    def test_respects_custom_default(self):
-        assert tb.should_branch("main", default_branch="main") is True
-        assert tb.should_branch("master", default_branch="main") is False
-
-
 class TestBranchName:
     def test_includes_prefix_slug_and_date(self):
         assert tb.branch_name("add-sms", set(), today=dt.date(2026, 7, 22)) == "claude/add-sms-0722"
@@ -150,124 +135,13 @@ class TestBranchName:
         assert tb.branch_name("x", existing, today=dt.date(2026, 7, 22)) == "claude/x-0722-4"
 
 
-class TestCheckoutBase:
-    def test_clean_tree_bases_on_origin_master(self):
-        assert tb.checkout_base(tree_dirty=False) == "origin/master"
-
-    def test_dirty_tree_bases_on_head(self):
-        assert tb.checkout_base(tree_dirty=True) is None
-
-    def test_respects_custom_default_branch(self):
-        assert tb.checkout_base(tree_dirty=False, default_branch="main") == "origin/main"
-
-
-class TestCheckoutArgv:
-    def test_cuts_the_branch_off_the_base(self):
-        assert tb.checkout_argv("claude/x-0729", "origin/main") == [
-            "checkout",
-            "--no-track",
-            "-b",
-            "claude/x-0729",
-            "origin/main",
-        ]
-
-    def test_no_base_branches_from_head(self):
-        # Dirty-tree case: no start point, so the new branch carries the edits.
-        assert tb.checkout_argv("claude/x-0729", None) == [
-            "checkout",
-            "--no-track",
-            "-b",
-            "claude/x-0729",
-        ]
-
-    def test_never_tracks_the_base(self):
-        # Regression: without --no-track, `checkout -b <name> origin/<default>`
-        # branches from a remote-tracking ref, so autoSetupMerge sets the new
-        # branch's upstream to origin/<default> -- and the task's first push (or
-        # VS Code "Sync Changes") lands on the default branch instead of
-        # publishing a branch to open a PR from.
-        for base in ("origin/main", "origin/master", None):
-            assert "--no-track" in tb.checkout_argv("claude/x-0729", base)
-
-    def test_no_track_precedes_the_branch_name(self):
-        # After a bare `-b`, git reads the next token as the branch name: with the
-        # flag misplaced the branch would literally be named "--no-track".
-        argv = tb.checkout_argv("claude/x-0729", "origin/main")
-        assert argv.index("--no-track") < argv.index("-b")
-
-
-class TestAutoBranchDecision:
-    def test_on_master_clean_bases_on_origin(self):
-        assert tb.auto_branch_decision("master", tree_dirty=False) == (True, "origin/master")
-
-    def test_on_master_dirty_carries_changes(self):
-        assert tb.auto_branch_decision("master", tree_dirty=True) == (True, None)
-
-    def test_on_a_feature_branch_does_not_fire(self):
-        # Mid-task, and also the "fix PR #42" case: the agent checked the PR's branch
-        # out before its first edit, so by the time this is consulted we are not on the
-        # default branch and the task's work belongs right here.
-        assert tb.auto_branch_decision("claude/x-0722", tree_dirty=False) == (False, None)
-        assert tb.auto_branch_decision("fix/upstream-pr", tree_dirty=True) == (False, None)
-
-    def test_detached_head_does_not_fire(self):
-        assert tb.auto_branch_decision("", tree_dirty=False) == (False, None)
-
-    def test_a_shipped_branch_no_longer_auto_branches(self):
-        """Regression: the shipped-marker trigger cut a branch under a PR follow-up.
-
-        Sitting on a just-shipped branch with a clean tree is exactly the state "the PR
-        gate went red, fix it" arrives in, and the old second trigger fired there --
-        moving the session to a fresh branch off the default, so the fix landed where
-        the PR could never see it. The decision now has one trigger; the shipped case is
-        `spent_branch_notice`'s job.
-        """
-        assert tb.auto_branch_decision("claude/x-0722", tree_dirty=False) == (False, None)
-
-    def test_custom_default_branch_bases_on_it(self):
-        # On a `main`-default repo, cutting from master's origin would be wrong.
-        assert tb.auto_branch_decision("main", tree_dirty=False, default_branch="main") == (
-            True,
-            "origin/main",
-        )
-
-
-class TestSpentBranchNotice:
-    def test_fires_on_the_shipped_branch_with_a_clean_tree(self):
-        notice = tb.spent_branch_notice(
-            "claude/x-0722", "claude/x-0722", False, "claude/y-0801", "main"
-        )
-        assert "claude/x-0722" in notice
-        # Both readings must be offered -- the whole point is that the hook does not
-        # guess which one this prompt is.
-        assert "NEW work" in notice
-        assert "continues that PR" in notice
-
-    def test_names_the_exact_command_and_the_real_default_branch(self):
-        notice = tb.spent_branch_notice("claude/x", "claude/x", False, "claude/y-0801", "trunk")
-        assert "git checkout --no-track -b claude/y-0801 origin/trunk" in notice
-        assert "origin/main" not in notice
-
-    def test_silent_when_the_tree_is_dirty(self):
-        # Work already exists here; nothing to advise, and this is what bounds how
-        # often the note can repeat.
-        assert tb.spent_branch_notice("claude/x", "claude/x", True, "claude/y", "main") == ""
-
-    def test_silent_on_a_different_branch(self):
-        assert tb.spent_branch_notice("claude/y", "claude/x", False, "claude/z", "main") == ""
-
-    def test_silent_with_no_marker_or_detached_head(self):
-        assert tb.spent_branch_notice("claude/x", "", False, "claude/y", "main") == ""
-        assert tb.spent_branch_notice("", "", False, "claude/y", "main") == ""
-
-
 class TestWorktreeFile:
     def test_returns_the_path_git_reports(self):
         def git(*args):
             assert args == ("rev-parse", "--git-path", "agent-shipped")
             return _cp(0, ".git/worktrees/wt/agent-shipped\n")
 
-        path = tb.worktree_file(git, tb.SHIPPED_MARKER_NAME)
+        path = tb.worktree_file(git, "agent-shipped")
         assert path is not None
         assert path.as_posix() == ".git/worktrees/wt/agent-shipped"
 
@@ -283,22 +157,9 @@ class TestWorktreeFile:
 
         assert tb.worktree_file(boom, "agent-shipped") is None
 
-    def test_marker_names_are_distinct(self):
-        """Three markers share one directory; a collision would silently cross wires."""
-        names = {tb.SHIPPED_MARKER_NAME, tb.TASK_INTENT_MARKER_NAME, tb.STOP_ROUNDS_MARKER_NAME}
-        assert len(names) == 3
-
-
-class TestPlatformManagesBranch:
-    def test_true_when_remote_flag_set(self):
-        # Claude Code on the web / mobile sets CLAUDE_CODE_REMOTE=true.
-        assert tb.platform_manages_branch({"CLAUDE_CODE_REMOTE": "true"}) is True
-
-    def test_false_when_flag_absent(self):
-        assert tb.platform_manages_branch({}) is False
-
-    def test_false_when_flag_not_literal_true(self):
-        # Only the literal "true" counts -- mirrors session-start.sh's check.
-        assert tb.platform_manages_branch({"CLAUDE_CODE_REMOTE": "1"}) is False
-        assert tb.platform_manages_branch({"CLAUDE_CODE_REMOTE": "false"}) is False
-        assert tb.platform_manages_branch({"CLAUDE_CODE_REMOTE": ""}) is False
+    def test_the_surviving_marker_is_the_stop_counter(self):
+        """`agent-shipped` and `agent-task-intent` are gone with the branch hooks; a
+        marker nothing reads is a file every session writes for no one."""
+        assert tb.STOP_ROUNDS_MARKER_NAME == "agent-stop-rounds"
+        assert not hasattr(tb, "SHIPPED_MARKER_NAME")
+        assert not hasattr(tb, "TASK_INTENT_MARKER_NAME")

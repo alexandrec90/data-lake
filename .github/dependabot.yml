@@ -1,0 +1,29 @@
+version: 2
+
+# `github-actions` is the entry the vendored contract test asserts specifically:
+# every workflow here pins actions by major (`actions/checkout@v7`), and nothing else
+# in the repository moves those pins. `uv` covers the Python side, which is where this
+# project's own dependency surface lives.
+#
+# Updates land grouped and are merged by `.github/workflows/dependabot-automerge.yml`
+# once `PR Gate` passes.
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch

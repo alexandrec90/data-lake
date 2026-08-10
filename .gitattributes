@@ -1,0 +1,22 @@
+# Normalize line endings to LF in the repository.
+#
+# DevKit drift checks compare vendored files byte-for-byte. Without this rule,
+# Windows can check the same tracked blob out as CRLF and report false drift.
+* text=auto eol=lf
+
+# Binaries Git must never translate.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.parquet binary
+
+# Generated locks: keep them out of diffs and language statistics.
+*.lock linguist-generated=true
+package-lock.json linguist-generated=true -diff
+uv.lock linguist-generated=true -diff

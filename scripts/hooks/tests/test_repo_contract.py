@@ -45,6 +45,8 @@ hook = load_module("scripts/hooks/stop.py")
 
 CFG = hook.CFG
 SETTINGS = REPO_ROOT / ".claude" / "settings.json"
+CODEX_HOOKS = REPO_ROOT / ".codex" / "hooks.json"
+CODEX_ROOT_PATH_RE = re.compile(r'\$\(git rev-parse --show-toplevel\)/([^"\r\n]+)')
 
 
 def _wires_stop_hook() -> bool:
@@ -91,7 +93,7 @@ def _toml_schema() -> dict[str, frozenset[str]]:
     keys (`[paths] app` -> `app_dir`); the rest map 1:1 onto their dataclass, so
     they are derived and cannot drift as fields are added.
     """
-    fields = lambda dc: frozenset(f.name for f in dataclasses.fields(dc))  # noqa: E731
+    fields = lambda dc: frozenset(f.name for f in dataclasses.fields(dc))
     return {
         "project": frozenset({"env_prefix"}),
         "paths": frozenset({"app", "tests", "unit_tests"}),
@@ -261,6 +263,62 @@ def test_frontend_paths_exist_when_the_tier_is_on():
         pytest.skip("project has no frontend tier")
     assert (REPO_ROOT / CFG.frontend.dir).is_dir(), f"[frontend] dir = {CFG.frontend.dir!r}"
     assert (REPO_ROOT / CFG.frontend.src).is_dir(), f"[frontend] src = {CFG.frontend.src!r}"
+
+
+# --- generated Codex handlers -------------------------------------------------
+
+
+def _codex_commands(payload: dict) -> list[tuple[str, str]]:
+    """Return ``(event, command)`` pairs without assuming a project's topology."""
+    commands: list[tuple[str, str]] = []
+    hooks = payload.get("hooks", {})
+    assert isinstance(hooks, dict), ".codex/hooks.json: `hooks` must be an object"
+    for event, groups in hooks.items():
+        assert isinstance(groups, list), f".codex/hooks.json: {event} must be a list"
+        for group in groups:
+            assert isinstance(group, dict), f".codex/hooks.json: {event} group must be an object"
+            handlers = group.get("hooks", [])
+            assert isinstance(handlers, list), f".codex/hooks.json: {event}.hooks must be a list"
+            for handler in handlers:
+                if not isinstance(handler, dict) or handler.get("type") != "command":
+                    continue
+                command = handler.get("command")
+                assert isinstance(command, str), (
+                    f".codex/hooks.json: {event} command hook has no string command"
+                )
+                commands.append((event, command))
+    return commands
+
+
+def test_generated_codex_handlers_exist():
+    """Every git-root path emitted into an opted-in repo must name a real file.
+
+    Converter unit tests prove the JSON rewrite. They cannot prove a consumer
+    received the adapter, session bridge, or project-owned handler named by that
+    JSON. This is the runtime half of the contract: an absent handler is a hook that
+    looks configured, is trusted successfully, and fails only when its event fires.
+    """
+    if not CODEX_HOOKS.is_file():
+        pytest.skip("repo has not opted into project-local Codex hooks")
+
+    try:
+        payload = json.loads(CODEX_HOOKS.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        pytest.fail(f"{CODEX_HOOKS.relative_to(REPO_ROOT)} is invalid JSON: {exc}")
+
+    missing: list[str] = []
+    referenced = 0
+    for event, command in _codex_commands(payload):
+        assert "${CLAUDE_PROJECT_DIR" not in command, (
+            f"{event} still contains Claude's project-dir placeholder: {command}"
+        )
+        for relative in CODEX_ROOT_PATH_RE.findall(command):
+            referenced += 1
+            if not (REPO_ROOT / relative).is_file():
+                missing.append(f"{event}: {relative}")
+
+    assert referenced, ".codex/hooks.json contains no git-root handler paths to validate"
+    assert not missing, "generated Codex hook handler(s) are missing:\n  " + "\n  ".join(missing)
 
 
 # --- the instruction tier -----------------------------------------------------
