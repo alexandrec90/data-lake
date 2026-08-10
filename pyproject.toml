@@ -20,7 +20,7 @@ dependencies = [
 # clear install hint when a command actually needs to read or write Parquet.
 archive = [
     "pyarrow>=17",
-    "boto3>=1.34",
+    "boto3>=1.43.66",
 ]
 # Read-only DuckDB research lens over the archived Parquet.
 research = [
@@ -31,7 +31,7 @@ research = [
 dev = [
     "pytest>=8",
     "pytest-cov>=6",
-    "ruff>=0.4",
+    "ruff>=0.16.2",
     "mypy>=1.10",
     "pre-commit>=4.6",
 ]
