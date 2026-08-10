@@ -177,7 +177,7 @@ def test_store_from_settings_s3_backend_builds_client():
             archive_s3_bucket="my-bucket",
             archive_s3_endpoint_url="https://example.r2.cloudflarestorage.com",
             archive_s3_access_key_id="key",
-            archive_s3_secret_access_key="secret",
+            archive_s3_secret_access_key="secret",  # pragma: allowlist secret - fixture, no bucket exists
         )
     )
     assert isinstance(store, S3ObjectStore)

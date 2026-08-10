@@ -75,7 +75,7 @@ def test_fmp_fetch_upserts_price_bars(monkeypatch):
         assert params["symbol"] == "AAPL"
         assert "from" not in params
         assert "apikey" not in params
-        assert headers["apikey"] == "test-fmp-key"
+        assert headers["apikey"] == "test-fmp-key"  # pragma: allowlist secret
         assert timeout == 30
         return FakeResponse(payload)
 

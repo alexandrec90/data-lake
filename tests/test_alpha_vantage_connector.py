@@ -120,7 +120,7 @@ def test_alpha_vantage_upserts_adjusted_bars(monkeypatch):
         assert url == av.BASE_URL
         assert params["function"] == "TIME_SERIES_DAILY_ADJUSTED"
         assert params["symbol"] == "NVDA"
-        assert params["apikey"] == "test-key"
+        assert params["apikey"] == "test-key"  # pragma: allowlist secret
         assert timeout == 30
         return FakeResponse(_adjusted_payload())
 
