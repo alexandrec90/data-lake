@@ -43,10 +43,12 @@ does not resolve any of them:
   - *Heredoc bodies.* Splitting on newlines turned every line of a `git commit -F -
     <<'EOF'` message into its own "statement", so the prose was evaluated as commands.
     `split_top_level` now consumes the body between the operator and its terminator.
-  - *`rm`, `cp`, `mv`.* Silent on success, exactly like the `mkdir`/`touch` already
-    exempt, and simply omitted. A setup chain -- `cd x && rm -rf out && mkdir out &&
-    <capped run>` -- was blocked by the `rm` alone, and there is no way to cap a command
-    that prints nothing.
+  - *`rm`, `cp`, `mv`, `git add`.* Silent on success, exactly like the `mkdir`/`touch`
+    already exempt, and simply omitted. A setup chain -- `cd x && rm -rf out && mkdir
+    out && <capped run>` -- was blocked by the `rm` alone, and there is no way to cap a
+    command that prints nothing. `git add` is the same omission found later and from the
+    other end: it blocked the staging step of every commit, and the heredoc carrying the
+    message cannot go through the wrapper either.
 
 The cap size comes from `[bash]` in `.devkit.toml` (see `harness_config.py`),
 so a project can widen it without forking this file -- and the number quoted in the
@@ -105,7 +107,15 @@ VERBOSE_FLAG_RE = re.compile(r"(?:^|\s)(?:-[A-Za-z]*v[A-Za-z]*|--verbose)(?=\s|$
 
 # Commands with no output path at all when they succeed. Named rather than inlined into
 # `BOUNDED_COMMANDS` because `VERBOSE_FLAG_RE` has to be scoped to exactly this family.
-SILENT_ON_SUCCESS = re.compile(r"(?:cd|export|unset|mkdir|rmdir|touch|rm|cp|mv|ln|chmod)\s")
+#
+# `git add` is here for the same reason `rm` and `cp` are, and was found the same way:
+# it prints nothing on success, so there is no output to cap and no legal spelling of
+# the command that satisfies the gate. It blocked the staging step of every commit --
+# `git add -A && git commit -F - <<'EOF' ... ` fails on the `git add` alone, and the
+# heredoc that follows cannot be handed to the wrapper either.
+SILENT_ON_SUCCESS = re.compile(
+    r"(?:cd|export|unset|mkdir|rmdir|touch|rm|cp|mv|ln|chmod|git\s+add)\s"
+)
 
 # A heredoc's body is data, not commands. Without this the `\n` split turns every line
 # of a commit message into a "statement" that is neither bounded nor cappable, so the

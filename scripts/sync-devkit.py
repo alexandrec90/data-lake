@@ -98,6 +98,12 @@ MANIFEST: tuple[str, ...] = (
     "scripts/hooks/tests/test_enforce_capped_bash.py",
     "scripts/hooks/invoke-capped.py",
     "scripts/hooks/tests/test_invoke_capped.py",
+    # The task-layer failure artifact. Vendored rather than templated because nothing
+    # in it varies: it resolves `logs/` from the cwd the task set, and the task label
+    # it is given names the file. `notify-wrap.py` is its sibling and stays a template
+    # only because it already was -- the two compose, one per concern.
+    "scripts/log-wrap.py",
+    "scripts/hooks/tests/test_log_wrap.py",
     # Branch lifecycle: default-branch auto-detected (detect_default_branch), so
     # these vendor unchanged. session-start.sh is the SessionStart entrypoint.
     "scripts/task_branch.py",
@@ -166,10 +172,30 @@ MANIFEST: tuple[str, ...] = (
     #
     # The auto-merge workflow qualifies because nothing in it varies: no `branches:`
     # filter, and the workflow it waits on is titled `PR Gate` in every project
-    # including devkit. The composite action qualifies because its one variable (the
-    # Python version) moved to the caller -- each project's gate passes its own.
+    # including devkit.
+    #
+    # `.github/actions/setup-python-env/action.yml` was here in v0.7.0 and is NOT any
+    # more. The argument for vendoring it was that its one variable -- the Python
+    # version -- had moved to the caller, so nothing project-specific was left. Two
+    # consumers disproved that on the first pull that reached them, and both failures
+    # were silent-until-CI:
+    #
+    #   - apt-finder's copy opened with a step that clones its private sibling
+    #     `data-lake` into `../data-lake`, because `[tool.uv.sources]` declares an
+    #     editable path dependency there. The vendored copy deleted the step, and every
+    #     job then died on `Distribution not found` before running a check.
+    #   - carameli does not use `uv sync` at all. It installs pip-tools compiled locks
+    #     with `uv pip install --system -r requirements.txt -r requirements-dev.txt`,
+    #     pinning uv itself to the version in that lock, and takes an `extra-packages`
+    #     input its weekly mutation job passes. `uv sync --all-extras --all-groups`
+    #     cannot serve any of that -- there is no `uv.lock` to sync from.
+    #
+    # What varies is not the Python version. It is **how a project installs**, and that
+    # is exactly the kind of thing `templates/` is for. It is rendered from
+    # `templates/core/dot-github/actions/setup-python-env/action.yml`, which is a
+    # byte-identical copy of devkit's own -- `test_setup_action_template_matches_devkits`
+    # holds the two together the way `notify.py` is held to its template.
     ".github/workflows/dependabot-automerge.yml",
-    ".github/actions/setup-python-env/action.yml",
     # The rest of the CI surface -- `dependabot.yml`, the gate, the nightly -- cannot
     # be vendored for the reason above, and `templates/` cannot keep them honest
     # either: a one-shot copy has no way to notice that a project never received a

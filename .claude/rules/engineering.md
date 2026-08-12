@@ -47,6 +47,36 @@ logic itself didn't change.
 Instruction files — `CLAUDE.md`, `.claude/rules/*`, `.claude/skills/*` — are covered by
 this same mandate. See `.claude/rules/authoring.md`.
 
+## Every Bash call carries an output cap
+
+`scripts/hooks/enforce-capped-bash.py` is a PreToolUse gate: a Bash command whose
+output is not bounded is **blocked**, not trimmed. Route it through the wrapper —
+
+```bash
+python3 scripts/hooks/invoke-capped.py --command "<the command>"
+```
+
+which keeps a head *and* a tail window and preserves the exit code. Omit
+`--max-bytes`; it defaults to this project's `[bash] max_bytes`.
+
+Learn this here rather than from the gate. Until this paragraph existed, nothing in
+any instruction file mentioned the hook, so **the only way to find out it was running
+was to be blocked by it** — and each block spends a turn plus the ~1 KB of remedy text
+the block message has to carry precisely because it is a first introduction. That is a
+tax on every session, and it is worst in the skills that open with several commands in
+a row.
+
+Two things not to reach for when it fires:
+
+- **`is_capped` is not a style check to satisfy.** Bounded commands are already exempt
+  — `pwd`, `git rev-parse`, `--version` probes, the silent-on-success family
+  (`mkdir`, `rm`, `cp`), and shell control flow. If one of those is blocked, that is a
+  defect in the gate worth reporting, not a command to wrap.
+- **`ls`, `cat` and `git status` are exempt on purpose — they are not.** Their output
+  grows with the tree, and the answer for them is the Read/Glob/Grep tools, which cost
+  no subprocess and no cap. Reach for the wrapper for test and lint runs, where the
+  summary at the end is the part worth keeping.
+
 ## Scripts
 
 All scripts under `scripts/` are Python, for cross-environment compatibility (a local

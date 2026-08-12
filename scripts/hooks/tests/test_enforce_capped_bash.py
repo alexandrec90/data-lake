@@ -5,7 +5,9 @@ not depend on the `[bash]` block of whichever repo they run in.
 """
 
 import json
+import re
 
+import conftest
 import pytest
 from conftest import load_module
 
@@ -407,6 +409,87 @@ def test_a_here_string_is_not_a_heredoc():
 def test_a_heredoc_inside_quotes_is_not_an_operator():
     command = "python3 scripts/hooks/invoke-capped.py --command \"echo 'a << b'\""
     assert hook.statements(command) == [command]
+
+
+# --- git add is silent on success, like rm and cp ---
+
+
+@pytest.mark.parametrize("command", ["git add -A", "git add -- .", "git add path/to/file"])
+def test_git_add_is_bounded(command):
+    """No output on success means no output to cap, so blocking it has no remedy."""
+    assert hook.is_bounded(command) is True
+
+
+def test_git_add_before_a_heredoc_commit_is_allowed():
+    """The shape this was found in: the staging step blocked the whole commit."""
+    command = "git add -A && git commit -F - <<'EOF' | head -c 500\nSubject\nEOF"
+    assert hook.is_capped(command) is True
+
+
+def test_verbose_git_add_is_not_bounded():
+    """`-v` prints a line per file, so it scales with the change like any other."""
+    assert hook.is_bounded("git add -v -A") is False
+
+
+@pytest.mark.parametrize("command", ["git added -A", "git address"])
+def test_the_git_add_exemption_does_not_extend_by_prefix(command):
+    """`\\s` after the alternative is what stops `git add` matching a longer word."""
+    assert hook.is_bounded(command) is False
+
+
+def test_other_git_subcommands_stay_blocked():
+    """The exemption is `git add` specifically, not `git`."""
+    assert hook.is_bounded("git status") is False
+    assert hook.is_bounded("git diff") is False
+    assert hook.is_bounded("git log") is False
+
+
+# --- the /ship skill has to tell the agent about this gate ---
+#
+# The gate blocks every one of /ship's five steps -- `ship.py --preflight`, `git
+# status`, `git diff`, `ship.py`, `gh pr view` -- because each one's output scales
+# with the repo. The skill used to name them all bare, so a ship spent five blocked
+# calls and five copies of a ~1 KB block message rediscovering the same rule, in every
+# project that vendors both files. These assert the directive that fixes that is still
+# there, still honest, and still project-agnostic.
+
+SHIP_SKILL = conftest.REPO_ROOT / ".claude/skills/ship/SKILL.md"
+BASELINE_RULE = conftest.REPO_ROOT / ".claude/rules/engineering.md"
+WRAPPER_RELPATH = "scripts/hooks/invoke-capped.py"
+
+
+def test_the_baseline_rule_introduces_the_gate():
+    """The gate has to be discoverable somewhere other than a block message.
+
+    `engineering.md` is unscoped and vendored byte-identical, so it is the one file
+    that reaches every task in every project. Before it named the wrapper, being
+    blocked was the *only* way to learn the hook existed -- which is why the block
+    message grew to a ~1 KB tutorial repeated on every hit.
+    """
+    text = BASELINE_RULE.read_text(encoding="utf-8")
+    assert WRAPPER_RELPATH in text
+    assert "enforce-capped-bash.py" in text
+
+
+def test_the_ship_skill_directs_its_bash_through_the_wrapper():
+    """Without this the gate is rediscovered one blocked step at a time, every ship."""
+    assert WRAPPER_RELPATH in SHIP_SKILL.read_text(encoding="utf-8")
+
+
+def test_the_wrapper_the_ship_skill_names_exists():
+    """A directive naming a path that moved is worse than none: it reads as verified."""
+    assert (conftest.REPO_ROOT / WRAPPER_RELPATH).is_file()
+
+
+def test_the_ship_skill_does_not_pin_a_byte_cap():
+    """`--max-bytes` defaults to this project's `[bash] max_bytes`.
+
+    SKILL.md is vendored byte-for-byte, so a literal here is one project's cap
+    imposed on every other -- the exact hard-coding `CLAUDE.md` forbids in a vendored
+    file. Leaving the flag off is what makes the one wording correct everywhere.
+    """
+    text = SHIP_SKILL.read_text(encoding="utf-8")
+    assert not re.search(r"--max-bytes[= ]\s*\d", text)
 
 
 def test_get_value_dotted_and_missing():
