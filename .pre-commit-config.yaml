@@ -2,7 +2,7 @@
 # automatically for clones that do not use the machine-wide policy dispatcher.
 repos:
   - repo: https://github.com/alexandrec90/devkit
-    rev: v0.7.0
+    rev: v0.8.0
     hooks:
       - id: devkit-manifest
       - id: devkit-hooks-stdlib-only

@@ -5,13 +5,18 @@ value specific to one project. What it asserts is devkit's policy about *which* 
 Actions files every repo has, plus the cross-cutting settings that make a workflow safe
 to leave running unattended.
 
-Why a contract test rather than more vendoring. Two of the required files carry no
-per-project content and are therefore shipped whole: `dependabot-automerge.yml` and
-`setup-python-env/action.yml` are in `sync-devkit.py`'s MANIFEST and drift-checked
-byte-for-byte. The other two cannot be. A `dependabot.yml` names the ecosystems this
-project actually has; a gate or a nightly names its services, its migrations and its
-frontend tier, and carameli's five-job gate is the standing proof that a shared one
-would have to delete real work or live permanently exempted.
+Why a contract test rather than more vendoring. One of the required files carries no
+per-project content and is therefore shipped whole: `dependabot-automerge.yml` is in
+`sync-devkit.py`'s MANIFEST and drift-checked byte-for-byte. The rest cannot be. A
+`dependabot.yml` names the ecosystems this project actually has; a gate or a nightly
+names its services, its migrations and its frontend tier, and carameli's five-job gate
+is the standing proof that a shared one would have to delete real work or live
+permanently exempted.
+
+`setup-python-env/action.yml` was briefly in that first group and is not any more: how
+a project installs its dependencies is exactly the kind of thing that varies. Vendoring
+it deleted apt-finder's private-sibling clone and handed carameli a `uv sync` it has no
+lock for. Rendered from `templates/` now, like the gate.
 
 So those two are rendered from `templates/`, which is a **one-shot copy**: `--pull`
 never looks at a template again. Nothing checked that a project still had one, or had
