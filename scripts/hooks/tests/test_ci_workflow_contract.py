@@ -5,9 +5,11 @@ value specific to one project. What it asserts is devkit's policy about *which* 
 Actions files every repo has, plus the cross-cutting settings that make a workflow safe
 to leave running unattended.
 
-Why a contract test rather than more vendoring. One of the required files carries no
-per-project content and is therefore shipped whole: `dependabot-automerge.yml` is in
-`sync-devkit.py`'s MANIFEST and drift-checked byte-for-byte. The rest cannot be. A
+Why a contract test rather than more vendoring. Some of the required files carry no
+per-project content and are therefore shipped whole: `dependabot-automerge.yml` and
+`scheduled-failure-issue.yml` are in `sync-devkit.py`'s MANIFEST and drift-checked
+byte-for-byte -- each waits on a workflow by a title every project shares, and neither
+names anything else about the repo it runs in. The rest cannot be. A
 `dependabot.yml` names the ecosystems this project actually has; a gate or a nightly
 names its services, its migrations and its frontend tier, and carameli's five-job gate
 is the standing proof that a shared one would have to delete real work or live
@@ -34,6 +36,7 @@ not assume the project's environment holds anything but the standard library.
 """
 
 import re
+import sys
 from pathlib import Path
 
 from conftest import REPO_ROOT
@@ -44,10 +47,13 @@ DEPENDABOT = REPO_ROOT / ".github" / "dependabot.yml"
 PR_GATE = "pr-gate.yml"
 AUTOMERGE = "dependabot-automerge.yml"
 NIGHTLY = "nightly.yml"
+FAILURE_REPORTER = "scheduled-failure-issue.yml"
 
 # The title `dependabot-automerge.yml` waits on. That file is vendored byte-identical,
 # so it cannot parameterise the name -- every project's gate is titled `PR Gate`.
 GATE_TITLE = "PR Gate"
+# And the title `scheduled-failure-issue.yml` waits on, for the same reason.
+NIGHTLY_TITLE = "Nightly"
 
 # What a project is told to write when it has no nightly. It lives in the failing
 # assertion because the remedy for a missing *template* render is the one thing
@@ -208,6 +214,57 @@ def test_dependabot_prs_have_something_that_merges_them():
     )
 
 
+def test_dependency_update_prs_are_assigned_to_someone():
+    """Otherwise they are visible in no aggregate view, in any repo.
+
+    Every tab on `github.com/pulls` is keyed to the viewer -- created, assigned,
+    mentioned, review-requested -- and a Dependabot PR is none of those: the bot is the
+    author, it mentions nobody, and it requests no review. The PRs are therefore
+    reachable only by opening each repository in turn, which is exactly the poll that
+    does not happen, and the state that ends with Dependabot turned off because "it just
+    piles up".
+
+    `assignees` is the one qualifier a config file can set that lands the PR in a tab
+    somebody already reads. Which login goes there is the project's own business; that
+    one is named is not.
+    """
+    text = _read(DEPENDABOT)
+    assert re.search(r"^\s*assignees:\s*$", text, re.M), (
+        ".github/dependabot.yml sets no `assignees:`, so its PRs appear under none of "
+        "the tabs on github.com/pulls -- not created, not assigned, not mentioned, not "
+        "review-requested -- and can only be found by opening this repo. Add it to "
+        "every `updates:` entry:\n\n"
+        "    assignees:\n"
+        "      - <your-github-login>\n\n"
+        "It is per-entry, not global: an entry without it is an ecosystem whose bumps "
+        "stay invisible."
+    )
+    entries = len(re.findall(r"^\s*-\s*package-ecosystem:", text, re.M))
+    assigned = len(re.findall(r"^\s*assignees:\s*$", text, re.M))
+    assert assigned == entries, (
+        f".github/dependabot.yml declares {entries} ecosystems but assigns {assigned} "
+        "of them. `assignees` is a per-update-entry key, so the unassigned ones open "
+        "PRs that reach no dashboard."
+    )
+
+
+def test_a_failed_scheduled_run_becomes_an_issue():
+    """A workflow run is the least visible artifact GitHub has.
+
+    It lives in one repo's Actions tab, and the cross-repository dashboards aggregate
+    issues and pull requests and nothing else -- so a red nightly and a nightly that
+    silently stopped running are the same observation: nothing. This file converts the
+    first into an assigned issue, and closes it again when the workflow goes green.
+    """
+    assert (WORKFLOWS_DIR / FAILURE_REPORTER).is_file(), (
+        f".github/workflows/{FAILURE_REPORTER} is missing -- run "
+        "`python scripts/sync-devkit.py --pull`. It is a MANIFEST file, so it arrives "
+        "whole, with the script it runs. Without it a scheduled failure is visible only "
+        "to someone who opens this repository's Actions tab and looks, which is the "
+        "poll a nightly exists to make unnecessary."
+    )
+
+
 def test_a_scheduled_full_run_exists():
     nightly = WORKFLOWS_DIR / NIGHTLY
     assert nightly.is_file(), NIGHTLY_REMEDY
@@ -219,6 +276,23 @@ def test_a_scheduled_full_run_exists():
     assert "workflow_dispatch" in triggers, (
         f"{NIGHTLY} has no `workflow_dispatch:`. A scheduled run that cannot also be "
         "triggered by hand can only be debugged one attempt per day."
+    )
+
+
+def test_the_nightly_carries_the_title_the_failure_reporter_waits_on():
+    """`workflow_run` matches by title, and an unmatched one produces no run at all.
+
+    The same trap as the gate's title, with a worse symptom: a renamed nightly still
+    fails visibly *in its own repo*, so nothing looks broken, while the reporter that
+    was supposed to carry that failure into a dashboard silently stops firing. The
+    failure of a failure-reporter is the one nobody notices.
+    """
+    nightly = WORKFLOWS_DIR / NIGHTLY
+    assert nightly.is_file(), NIGHTLY_REMEDY
+    assert re.search(rf"^name:\s*{re.escape(NIGHTLY_TITLE)}\s*$", _read(nightly), re.M), (
+        f"{NIGHTLY} is not titled {NIGHTLY_TITLE!r}. {FAILURE_REPORTER} is vendored "
+        "byte-identical and waits on that exact title in every project. Add the tiers "
+        "you want to this file, but keep the name."
     )
 
 
@@ -290,7 +364,94 @@ def test_third_party_actions_are_pinned_to_an_immutable_ref():
     assert not floating, f"actions pinned to a mutable ref: {floating}"
 
 
+# Every `uses: ./some/path` in a workflow. Deliberately separate from `USES`, which
+# matches the `owner/repo@ref` form -- a local action carries no `@ref` at all.
+LOCAL_USES = re.compile(r"^\s*-?\s*uses:\s*(\./[^\s\"'#]+)", re.MULTILINE)
+
+
+def _local_action_targets() -> list[tuple[Path, str]]:
+    """`(workflow, path)` for every local action reference across the workflows."""
+    return [(path, ref) for path in _workflows() for ref in LOCAL_USES.findall(_read(path))]
+
+
+def test_every_local_action_a_workflow_uses_actually_exists():
+    """A `uses: ./...` naming a directory this repo does not have fails the job at
+    startup, before a single step runs.
+
+    **This is the check that would have caught the un-vendoring.** When
+    `.github/actions/setup-python-env/action.yml` moved from the MANIFEST back to
+    `templates/`, `--pull` deleted it from every consumer that had not customised it and
+    put nothing back -- `templates/` is a one-shot copy, consulted only when a project is
+    generated. Two projects' gates died on the next push. A third's *nightly* was the
+    only workflow using it, so nothing failed anywhere a human was looking, and it
+    stayed broken for a week.
+
+    Every previous test in this file asks whether a file exists. This one asks whether
+    the files *agree with each other*, which is the failure a one-shot tier produces:
+    nothing is missing from any single point of view.
+
+    Portable by construction -- it reads this repo's own `.github/` and nothing else --
+    which is why it belongs in the vendored tier rather than in any one project's suite.
+    Had it been here, every consumer would have gone red in the same commit that broke
+    it, instead of one CI run at a time.
+    """
+    missing = [
+        f"{workflow.name}: uses {ref}, which is not in this repo"
+        for workflow, ref in _local_action_targets()
+        if not _resolves(ref)
+    ]
+    assert not missing, (
+        "workflow references a local action that does not exist:\n  "
+        + "\n  ".join(missing)
+        + "\n\nA deleted composite action fails the job at startup. If devkit un-vendored "
+        "it, the file is yours now: restore it from the project's history "
+        "(`git log --diff-filter=D -- <path>`) or render it from devkit's "
+        "`templates/core/dot-github/`."
+    )
+
+
+def _resolves(ref: str) -> bool:
+    """Whether `./x` names an action this repo has.
+
+    Both spellings count: a directory holding `action.yml`/`action.yaml`, which is the
+    composite form, and a direct path to the file.
+    """
+    target = REPO_ROOT / ref[2:]
+    return (
+        (target / "action.yml").is_file() or (target / "action.yaml").is_file() or target.is_file()
+    )
+
+
 # --- the parsers above, on inputs whose answer is known ------------------------
+
+
+def test_the_local_action_pattern_matches_the_shapes_a_workflow_uses():
+    """Pinned because a regex that silently matched nothing would make the check above
+    vacuous -- the same trap `test_the_workflow_scan_is_not_vacuous` guards for."""
+    text = "steps:\n  - uses: ./.github/actions/setup-python-env\n  - uses: actions/checkout@v7\n"
+    assert LOCAL_USES.findall(text) == ["./.github/actions/setup-python-env"]
+    # A commented-out reference is not a reference.
+    assert LOCAL_USES.findall("  # - uses: ./.github/actions/gone\n") == []
+
+
+def test_a_local_action_resolves_by_directory_or_by_file(tmp_path, monkeypatch):
+    """Both spellings GitHub accepts, against a tree whose answer is known.
+
+    Built rather than borrowed from this repo: the vendored suite may assert nothing
+    about which actions a particular project happens to have.
+    """
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+    composite = tmp_path / ".github" / "actions" / "setup"
+    composite.mkdir(parents=True)
+    assert not _resolves("./.github/actions/setup"), "a directory with no action.yml"
+
+    (composite / "action.yml").write_text("runs:\n", encoding="utf-8")
+    assert _resolves("./.github/actions/setup")
+
+    (composite / "action.yml").rename(composite / "action.yaml")
+    assert _resolves("./.github/actions/setup"), "the .yaml spelling counts too"
+
+    assert not _resolves("./.github/actions/never-created")
 
 
 def test_block_parser_reads_only_column_zero_keys():

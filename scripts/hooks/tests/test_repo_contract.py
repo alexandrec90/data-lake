@@ -46,19 +46,28 @@ hook = load_module("scripts/hooks/stop.py")
 CFG = hook.CFG
 SETTINGS = REPO_ROOT / ".claude" / "settings.json"
 CODEX_HOOKS = REPO_ROOT / ".codex" / "hooks.json"
-CODEX_ROOT_PATH_RE = re.compile(r'\$\(git rev-parse --show-toplevel\)/([^"\r\n]+)')
+CODEX_ROOT_PATH_RE = re.compile(
+    r'(?:\$\(git rev-parse --show-toplevel\)|__CODEX_PROJECT_ROOT__)/([^"\r\n]+)'
+)
+CODEX_LAUNCHER_ADAPTER_MARKER = "r/'scripts/hooks/codex-hook-adapter.py'"
 
 
 def _wires_stop_hook() -> bool:
     """True when this repo actually registers `stop.py` as a Stop hook.
 
-    The gate for every check below that reads the repo's shape off its manifest.
-    devkit itself is the case that needs it: it is the harness's source repo, not a
-    consumer of it, and its committed `.devkit.toml` is a deliberate *test
-    fixture* -- it turns on the DB and frontend tiers so the vendored suite exercises
-    them here, and describes a project shaped nothing like devkit. Asserting devkit's
-    files against that manifest would fail on a file the manifest never claimed
-    devkit has. A repo that wires the hook is making a real claim about itself.
+    The gate for every check below that reads the repo's shape off its manifest. A repo
+    that vendors these tests without wiring the hook has not adopted the tier they
+    describe, so asserting its files against a manifest nothing acts on would report a
+    failure about a tier nobody is running. Wiring the hook is the repo making a real
+    claim about itself.
+
+    This docstring used to justify the gate differently -- devkit's own `.devkit.toml`
+    being a *fixture* that "turns on the DB and frontend tiers" and describes a project
+    shaped nothing like devkit. That stopped being true when the manifest was rewritten
+    to describe devkit: both tiers are off, devkit does wire the hook, and the checks
+    below run here like anywhere else. The sentence outlived the fact by months, in a
+    file every project vendors — which is why a claim about a repo's shape belongs in
+    the assertion, where it fails, and not only in the prose above it.
     """
     try:
         settings = json.loads(SETTINGS.read_text(encoding="utf-8"))
@@ -290,6 +299,25 @@ def _codex_commands(payload: dict) -> list[tuple[str, str]]:
     return commands
 
 
+def _codex_command_paths(command: str) -> list[str]:
+    """Repo-relative files named by either generated launcher generation."""
+    paths = CODEX_ROOT_PATH_RE.findall(command)
+    if CODEX_LAUNCHER_ADAPTER_MARKER in command:
+        paths.append("scripts/hooks/codex-hook-adapter.py")
+    return paths
+
+
+def test_codex_command_paths_cover_the_launcher_and_handler():
+    command = (
+        "python3 -c \"r/'scripts/hooks/codex-hook-adapter.py'\" --event Stop -- "
+        'python3 "__CODEX_PROJECT_ROOT__/scripts/hooks/stop.py"'
+    )
+    assert _codex_command_paths(command) == [
+        "scripts/hooks/stop.py",
+        "scripts/hooks/codex-hook-adapter.py",
+    ]
+
+
 def test_generated_codex_handlers_exist():
     """Every git-root path emitted into an opted-in repo must name a real file.
 
@@ -312,12 +340,12 @@ def test_generated_codex_handlers_exist():
         assert "${CLAUDE_PROJECT_DIR" not in command, (
             f"{event} still contains Claude's project-dir placeholder: {command}"
         )
-        for relative in CODEX_ROOT_PATH_RE.findall(command):
+        for relative in _codex_command_paths(command):
             referenced += 1
             if not (REPO_ROOT / relative).is_file():
                 missing.append(f"{event}: {relative}")
 
-    assert referenced, ".codex/hooks.json contains no git-root handler paths to validate"
+    assert referenced, ".codex/hooks.json contains no repo-root handler paths to validate"
     assert not missing, "generated Codex hook handler(s) are missing:\n  " + "\n  ".join(missing)
 
 

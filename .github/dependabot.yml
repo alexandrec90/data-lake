@@ -7,12 +7,18 @@ version: 2
 #
 # Updates land grouped and are merged by `.github/workflows/dependabot-automerge.yml`
 # once `PR Gate` passes.
+#
+# `assignees` is per-entry, and it is what puts a bot PR on the "Assigned" tab of
+# github.com/pulls: nothing else about a Dependabot PR is keyed to a person, so an
+# unassigned entry opens PRs reachable only by opening this repository.
 
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    assignees:
+      - alexandrec90
     groups:
       actions:
         patterns:
@@ -22,6 +28,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    assignees:
+      - alexandrec90
     groups:
       minor-and-patch:
         update-types:

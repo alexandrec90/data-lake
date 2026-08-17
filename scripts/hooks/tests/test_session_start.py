@@ -86,7 +86,7 @@ def _make_project(tmp_path: Path, files: dict[str, str]) -> tuple[Path, Path, Pa
 
 
 def _run(
-    project: Path, log: Path, env_file: Path, *, inherit_path: bool = True
+    project: Path, log: Path, env_file: Path, *, inherit_path: bool = True, remote: bool = True
 ) -> tuple[int, str, str]:
     """Drive the script with the stub bin dir first on PATH.
 
@@ -95,6 +95,11 @@ def _run(
     a stub is not enough when the real binary is installed in the environment running the
     tests, which is exactly the case in CI (`uv run pre-commit` puts it on PATH) and made
     the pre-commit-absent test pass alone and fail in a full run.
+
+    `remote=False` drives the LOCAL branch — the one every test here used to skip, which
+    is how the pre-commit wiring came to be reachable only from a sandbox. The project is
+    not a git repository, so the auto-rebase half finds no branch and stands down; the
+    branch-protection tests below build a real one when they need it.
     """
     # `pytestmark` already skips this module when bash is absent, but that is a runtime
     # guard a type-checker cannot see — assert so `BASH` narrows from `str | None`.
@@ -108,7 +113,7 @@ def _run(
         # and none of those are what any of these tests stub out.
         path = os.pathsep.join([str(stub_bin), "/usr/bin", "/bin"])
     env.update(
-        CLAUDE_CODE_REMOTE="true",
+        CLAUDE_CODE_REMOTE="true" if remote else "false",
         CLAUDE_PROJECT_DIR=str(project),
         CLAUDE_ENV_FILE=str(env_file),
         # Do not inherit the developer machine's global core.hooksPath. Individual
@@ -236,6 +241,72 @@ def test_pre_commit_hook_is_installed_when_a_config_is_present(tmp_path):
     rc, output, _ = _run(project, log, env_file)
     assert rc == 0, output
     assert "pre-commit install" in output, output
+    # A cold sandbox builds the hook environments while it is provisioning anyway; the
+    # local branch deliberately does not (see the test below).
+    assert "--install-hooks" in output, output
+
+
+def test_the_pre_commit_gate_is_wired_on_a_local_session_too(tmp_path):
+    """The regression this whole block exists for.
+
+    `.git/hooks/` is not committed on *any* machine, so a fresh clone has
+    `.pre-commit-config.yaml` and none of the hooks it describes. The wiring used to sit
+    below the local `exit 0`, so the only shape it ever reached was a remote sandbox --
+    and a consuming project cloned onto a second machine committed ungated, with nothing
+    to report it: the config file is committed and looks like the gate, and CI runs the
+    same checks in a job, so both ends read healthy while the commit-time half is absent.
+    """
+    project, log, env_file = _make_project(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            ".pre-commit-config.yaml": "repos: []\n",
+        },
+    )
+    rc, output, _ = _run(project, log, env_file, remote=False)
+    assert rc == 0, output
+    assert "pre-commit install" in output, output
+    # The cheap form: it writes `.git/hooks/pre-commit` and nothing else. Building the
+    # hook environments here would put a multi-minute install in front of a session that
+    # already has its toolchain.
+    assert "--install-hooks" not in output, output
+    # And nothing else from the remote provisioning path ran.
+    assert "-e .[dev]" not in output, output
+
+
+def test_a_local_session_defers_to_the_global_devkit_dispatcher(tmp_path):
+    """The dispatcher check has to hold on the branch that actually meets it.
+
+    A machine with the global branch policy installed is the *local* case by definition,
+    so this is where overwriting `core.hooksPath` -- disabling the policy for every
+    repository on the machine -- would really happen.
+    """
+    project, log, env_file = _make_project(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            ".pre-commit-config.yaml": "repos: []\n",
+        },
+    )
+    global_hooks = tmp_path / "global-hooks"
+    global_hooks.mkdir()
+    (global_hooks / "devkit_git_policy.py").write_text("# installed\n", encoding="utf-8")
+    (tmp_path / "gitconfig").write_text(
+        f"[core]\n\thooksPath = {global_hooks.as_posix()}\n",
+        encoding="utf-8",
+    )
+
+    rc, output, _ = _run(project, log, env_file, remote=False)
+    assert rc == 0, output
+    assert "global Devkit dispatcher" in output, output
+    assert "pre-commit install" not in output, output
+
+
+def test_a_local_session_without_a_config_wires_nothing(tmp_path):
+    project, log, env_file = _make_project(tmp_path, {"pyproject.toml": PYPROJECT})
+    rc, output, _ = _run(project, log, env_file, remote=False)
+    assert rc == 0, output
+    assert "pre-commit install" not in output, output
 
 
 def test_pre_commit_install_defers_to_the_global_devkit_dispatcher(tmp_path):
@@ -285,6 +356,121 @@ def test_pre_commit_absence_is_a_warning_not_a_failure(tmp_path):
     # The PATH export is the line whose absence *is* the bug this file was written for:
     # provisioning must still reach the end of the script.
     assert PATH_EXPORT in (env_file.read_text(encoding="utf-8") if env_file.exists() else "")
+
+
+# --- what a LOCAL session is missing ------------------------------------------
+# The local branch used to assert in a comment that "local machines already have the venv
+# + node_modules". True of a checkout set up months ago; false for a fresh clone, which is
+# the one machine that has neither — and it then discovers that one failed ruff/pytest
+# call at a time, each looking like a broken tool rather than an empty checkout.
+#
+# The hook reports and does not install. These tests pin BOTH halves, because the
+# tempting fix (run the ladder under a `[ -d .venv ]` guard) puts a multi-minute
+# synchronous install in front of every fresh-clone session and duplicates a provisioner
+# `worktree.py` already owns.
+
+
+def _unprovisioned(tmp_path: Path, files: dict[str, str]) -> tuple[Path, Path, Path]:
+    """`_make_project` with the pre-created `.venv` removed: a fresh clone."""
+    project, log, env_file = _make_project(tmp_path, files)
+    shutil.rmtree(project / ".venv")
+    return project, log, env_file
+
+
+def test_a_fresh_clone_is_told_which_install_command_to_run(tmp_path):
+    project, log, env_file = _unprovisioned(tmp_path, {"uv.lock": "", "pyproject.toml": PYPROJECT})
+    rc, output, written = _run(project, log, env_file, remote=False)
+    assert rc == 0, output
+    assert "No .venv here" in output, output
+    assert "uv sync --all-extras --all-groups" in output, output
+    # Reported, not run: none of the remote provisioning path may have executed.
+    assert "Installing Python toolchain" not in output, output
+    assert written == "", "a local session must not rewrite PATH for a venv that does not exist"
+
+
+def test_a_provisioned_checkout_is_told_nothing(tmp_path):
+    """The no-op half. Every session on a working checkout pays this and must see nothing."""
+    project, log, env_file = _make_project(tmp_path, {"uv.lock": "", "pyproject.toml": PYPROJECT})
+    rc, output, _ = _run(project, log, env_file, remote=False)
+    assert rc == 0, output
+    assert "No .venv here" not in output, output
+
+
+@pytest.mark.parametrize(
+    ("files", "expected"),
+    [
+        pytest.param({"uv.lock": "", "pyproject.toml": PYPROJECT}, "uv sync", id="uv-lock"),
+        pytest.param(
+            {"requirements.txt": "ruff==0.15.0\n", "requirements-dev.txt": "uv==0.4.0\n"},
+            "-r requirements.txt -r requirements-dev.txt",
+            id="requirements-locks",
+        ),
+        pytest.param({"pyproject.toml": PYPROJECT}, "-e '.[dev]'", id="unlocked-pyproject"),
+    ],
+)
+def test_the_named_command_matches_the_project_dependency_model(tmp_path, files, expected):
+    """Same detection ladder as the installer, in the same order — a command that does not
+    fit the project is worse than no command, because it is followed."""
+    project, log, env_file = _unprovisioned(tmp_path, files)
+    rc, output, _ = _run(project, log, env_file, remote=False)
+    assert rc == 0, output
+    assert expected in output, output
+
+
+def test_a_project_with_no_dependency_file_is_told_nothing(tmp_path):
+    """There is nothing to install, so there is no command to name."""
+    project, log, env_file = _unprovisioned(tmp_path, {"README.md": "# probe\n"})
+    rc, output, _ = _run(project, log, env_file, remote=False)
+    assert rc == 0, output
+    assert "No .venv here" not in output, output
+
+
+def test_the_manifest_install_command_wins_over_detection(tmp_path):
+    project, log, env_file = _unprovisioned(
+        tmp_path,
+        {
+            "uv.lock": "",
+            "pyproject.toml": PYPROJECT,
+            ".devkit.toml": '[python]\ninstall_command = "make bootstrap"\n',
+        },
+    )
+    rc, output, _ = _run(project, log, env_file, remote=False)
+    assert rc == 0, output
+    assert "fix: make bootstrap" in output, output
+    assert "uv sync" not in output, "detection ran despite an explicit install_command"
+
+
+def test_a_frontend_tier_missing_node_modules_is_reported_too(tmp_path):
+    """`node_modules` is the other half of the claim this replaced."""
+    project, log, env_file = _make_project(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            ".devkit.toml": '[frontend]\nenabled = true\ndir = "web"\n',
+            "web/package.json": "{}\n",
+        },
+    )
+    rc, output, _ = _run(project, log, env_file, remote=False)
+    assert rc == 0, output
+    assert "No web/node_modules" in output, output
+    assert "npm install --prefix web" in output, output
+    # Named, not run — the stub would have logged an invocation.
+    assert "npm install --prefix web --no-audit" not in output, output
+
+
+def test_a_frontend_tier_with_node_modules_is_not_reported(tmp_path):
+    project, log, env_file = _make_project(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            ".devkit.toml": '[frontend]\nenabled = true\ndir = "web"\n',
+            "web/package.json": "{}\n",
+            "web/node_modules/.keep": "",
+        },
+    )
+    rc, output, _ = _run(project, log, env_file, remote=False)
+    assert rc == 0, output
+    assert "node_modules" not in output, output
 
 
 # --- the local auto-rebase must not rewrite published history ------------------

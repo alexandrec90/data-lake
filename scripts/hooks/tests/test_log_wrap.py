@@ -170,6 +170,83 @@ def test_a_real_failure_lands_in_the_file_the_terminal_points_at(tmp_path, capsy
     assert "logs/ship-sweep.log" in capsys.readouterr().err
 
 
+# --- the unattended caller ----------------------------------------------------
+#
+# Everything above assumes someone is watching the terminal. A scheduled job has no
+# terminal at all: on Windows it runs under `pythonw.exe`, where `sys.stdout` is None
+# rather than a stream that discards. These are the two things that breaks.
+
+
+def test_the_leading_always_flag_is_consumed_not_treated_as_the_title():
+    assert lw.parse_argv(["--always", "Nightly", "--", "x"]) == ("Nightly", ["x"], True)
+    assert lw.parse_argv(["Nightly", "--", "x"]) == ("Nightly", ["x"], False)
+
+
+def test_always_is_only_read_from_the_front():
+    """A title is free-form text and the wrapped command has its own flags; scanning
+    the whole argv would let either turn this mode on by accident."""
+    title, command, always = lw.parse_argv(["Deploy --always", "--", "x", "--always"])
+    assert (title, always) == ("Deploy --always", False)
+    assert command == ["x", "--always"]
+
+
+def test_a_malformed_argv_is_still_rejected_with_the_flag():
+    assert lw.parse_argv(["--always"]) is None
+    assert lw.parse_argv(["--always", "--", "x"]) is None  # no title
+
+
+def test_a_passing_unattended_run_records_that_it_passed(tmp_path):
+    """For a job nobody watches, an empty file cannot be told apart from a job that
+    stopped being scheduled -- which is the failure this whole tier exists to catch."""
+    assert (
+        lw.main(["--always", "Nightly", "--", "x"], run=lambda _c: (0, "skipped"), root=tmp_path)
+        == 0
+    )
+    written = (tmp_path / "logs" / "nightly.log").read_text(encoding="utf-8")
+    assert "# exit: 0" in written
+    assert "skipped" in written
+    assert "# when:" in written  # a passing report with no clock on it proves nothing
+
+
+def test_an_unattended_failure_still_reads_like_every_other_failure(tmp_path):
+    body = lw.artifact_body("Nightly", ["x"], 1, "boom", always=True)
+    assert "# exit: 1" in body
+    assert "# fix: re-run" in body
+    assert "boom" in body
+
+
+def test_a_watched_run_is_unchanged_by_the_new_parameter(tmp_path):
+    assert lw.artifact_body("T", ["x"], 0, "out") == ""
+
+
+def test_echo_survives_an_interpreter_with_no_stdout():
+    """`pythonw.exe` sets `sys.stdout` to None. Writing to it raised AttributeError on
+    the child's first line of output, killing the wrapper mid-run -- so the scheduled
+    job exited non-zero and wrote no artifact, which is the one context where nobody
+    would see either."""
+    lw.echo("a line", out=None)  # must not raise
+
+
+def test_echo_survives_a_stream_closed_underneath_it():
+    class Closed:
+        def write(self, _text):
+            raise ValueError("I/O operation on closed file")
+
+        def flush(self):
+            raise ValueError("I/O operation on closed file")
+
+    lw.echo("a line", out=Closed())  # must not raise
+
+
+def test_a_child_is_captured_even_with_no_terminal_to_mirror_to(tmp_path, monkeypatch):
+    """The end-to-end shape of the above: output still reaches the artifact when there
+    is nowhere to echo it."""
+    monkeypatch.setattr(sys, "stdout", None)
+    code, output = lw.stream([sys.executable, "-c", "print('captured anyway')"])
+    assert code == 0
+    assert "captured anyway" in output
+
+
 def test_the_script_runs_as_a_script(tmp_path):
     """It is invoked by `python scripts/log-wrap.py ...` from a task, never imported,
     so the `__main__` path has to work with no package context."""

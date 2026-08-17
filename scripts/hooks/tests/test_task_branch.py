@@ -121,18 +121,31 @@ class TestSlugFromPrompt:
 
 class TestBranchName:
     def test_includes_prefix_slug_and_date(self):
-        assert tb.branch_name("add-sms", set(), today=dt.date(2026, 7, 22)) == "claude/add-sms-0722"
+        assert tb.branch_name("add-sms", set(), today=dt.date(2026, 7, 22)) == "agent/add-sms-0722"
 
     def test_disambiguates_collision(self):
-        existing = {"claude/add-sms-0722"}
+        existing = {"agent/add-sms-0722"}
         assert (
             tb.branch_name("add-sms", existing, today=dt.date(2026, 7, 22))
-            == "claude/add-sms-0722-2"
+            == "agent/add-sms-0722-2"
         )
 
     def test_disambiguates_multiple_collisions(self):
-        existing = {"claude/x-0722", "claude/x-0722-2", "claude/x-0722-3"}
-        assert tb.branch_name("x", existing, today=dt.date(2026, 7, 22)) == "claude/x-0722-4"
+        existing = {"agent/x-0722", "agent/x-0722-2", "agent/x-0722-3"}
+        assert tb.branch_name("x", existing, today=dt.date(2026, 7, 22)) == "agent/x-0722-4"
+
+
+class TestManagedTaskBranch:
+    def test_recognizes_neutral_and_compatible_agent_namespaces(self):
+        for branch in ("agent/x", "claude/x", "codex/x"):
+            assert tb.is_managed_task_branch(branch)
+
+    def test_does_not_claim_arbitrary_feature_or_home_branches(self):
+        for branch in ("feature/x", "main", "carameli-b", ""):
+            assert not tb.is_managed_task_branch(branch)
+
+    def test_reports_the_prefix_for_safe_topic_extraction(self):
+        assert tb.managed_branch_prefix("codex/fix-shipping-0813") == "codex/"
 
 
 class TestWorktreeFile:

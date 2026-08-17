@@ -1,4 +1,4 @@
-"""Shared helpers for naming a task's `claude/<slug>` branch.
+"""Shared helpers for naming and recognizing agent task branches.
 
 Used by `scripts/task_slug.py` (UserPromptSubmit: records what this session's task
 is called), `scripts/worktree.py` and `scripts/sweep.py` (which name the branches
@@ -35,7 +35,11 @@ from pathlib import Path
 # pure helpers assume when a caller does not override -- keeping the module
 # project-agnostic while the branch name stays out of the logic.
 DEFAULT_BRANCH = "master"
-BRANCH_PREFIX = "claude/"
+# Branches created by devkit use a vendor-neutral namespace. Older devkit branches
+# and branches created directly by supported coding agents remain managed so adopting
+# the neutral name does not strand work or prevent cleanup.
+BRANCH_PREFIX = "agent/"
+MANAGED_BRANCH_PREFIXES = (BRANCH_PREFIX, "claude/", "codex/")
 SLUG_MAX_LEN = 40
 _SLUG_STRIP_RE = re.compile(r"[^a-z0-9]+")
 
@@ -172,8 +176,18 @@ def slug_from_prompt(text: str, max_len: int = SLUG_MAX_LEN) -> str:
     return slugify(topic(text) or text, max_len=max_len)
 
 
+def managed_branch_prefix(branch: str) -> str:
+    """The managed task-branch prefix used by ``branch``, or ``""`` when absent."""
+    return next((prefix for prefix in MANAGED_BRANCH_PREFIXES if branch.startswith(prefix)), "")
+
+
+def is_managed_task_branch(branch: str) -> bool:
+    """Whether devkit may apply task-branch lifecycle operations to ``branch``."""
+    return bool(managed_branch_prefix(branch))
+
+
 def branch_name(slug: str, existing: set[str], today: _dt.date | None = None) -> str:
-    """Unique `claude/<slug>-<mmdd>` name, disambiguated with -N against existing."""
+    """Unique `agent/<slug>-<mmdd>` name, disambiguated with -N against existing."""
     today = today or _dt.date.today()
     base = f"{BRANCH_PREFIX}{slug}-{today:%m%d}"
     if base not in existing:

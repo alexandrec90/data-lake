@@ -9,7 +9,9 @@ submodule. This script keeps that copy honest:
 
   - `--check` (default): fail (exit 1) if any vendored file drifts from the shared
     repo. Wired into the PR gate. **No-ops clean (exit 0) when the shared repo is
-    not configured**, so CI is safe before a project adopts the shared repo.
+    not configured and this project has never pulled**, so CI is safe before a
+    project adopts the shared repo; once `DEVKIT_VERSION` exists, an unresolvable
+    source is itself a failure rather than a skip (see `main`).
   - `--pull`: copy the shared repo's version into this project (adopt upstream).
     Also remove exact paths retired by the shared repo; project-owned skill state
     is never included in that retirement list.
@@ -196,6 +198,18 @@ MANIFEST: tuple[str, ...] = (
     # byte-identical copy of devkit's own -- `test_setup_action_template_matches_devkits`
     # holds the two together the way `notify.py` is held to its template.
     ".github/workflows/dependabot-automerge.yml",
+    # The scheduled-failure reporter qualifies on the same test: it watches a workflow
+    # titled `Nightly` (required of every project by the contract test below, exactly as
+    # `PR Gate` is) and reads its assignee from `github.repository_owner` at run time,
+    # so there is no project value left in either the workflow or its script.
+    #
+    # It is vendored rather than added as a job to the nightly *because* the nightly is
+    # a template. A one-shot copy would have delivered this to new projects only, and
+    # the repos that most need it are the existing ones -- the whole failure mode it
+    # addresses is a red scheduled run in a repo nobody has opened for a month.
+    ".github/workflows/scheduled-failure-issue.yml",
+    "scripts/report-workflow-failure.py",
+    "scripts/hooks/tests/test_report_workflow_failure.py",
     # The rest of the CI surface -- `dependabot.yml`, the gate, the nightly -- cannot
     # be vendored for the reason above, and `templates/` cannot keep them honest
     # either: a one-shot copy has no way to notice that a project never received a
@@ -820,6 +834,59 @@ def prune_settings(root: Path, retired: tuple[str, ...] = RETIRED_PATHS) -> list
     return dropped
 
 
+CODEX_HOOKS_FILE = ".codex/hooks.json"
+CODEX_GENERATOR = "scripts/sync-codex-hooks.py"
+
+
+def _codex_generator(root: Path, *flags: str) -> list[str]:
+    return [
+        sys.executable,
+        str(root / CODEX_GENERATOR),
+        *flags,
+        str(root / SETTINGS_FILE),
+        str(root / CODEX_HOOKS_FILE),
+    ]
+
+
+def codex_hooks_stale(root: Path) -> bool:
+    """Whether this project's committed `.codex/hooks.json` is what it would generate.
+
+    The generator is vendored; **its output is not**, and that asymmetry is the whole
+    reason this exists. `--pull` copies `sync-codex-hooks.py`, so a fix to what Codex
+    should be running lands in every consumer — and changes nothing, because the file
+    Codex actually reads was written by the *previous* generator and no gate on either
+    side ever looked at it. `regenerate_codex_hooks` closes it for a project that pulls;
+    this closes it for one whose file went stale some other way, so the PR gate says so
+    instead of a Codex session discovering it a blocked command at a time.
+
+    Runs the generator out-of-process rather than importing it: these are sibling
+    scripts at fixed vendored paths, and `sync-codex-context.py` already invokes it the
+    same way. Best-effort — a generator that is absent or that raises leaves this
+    reporting nothing, because a project with no `.codex/` has nothing to be stale.
+    """
+    if not (root / CODEX_HOOKS_FILE).is_file() or not (root / CODEX_GENERATOR).is_file():
+        return False
+    try:
+        result = subprocess.run(_codex_generator(root, "--check"), capture_output=True, text=True)
+    except OSError:
+        return False
+    return result.returncode == 1
+
+
+def regenerate_codex_hooks(root: Path) -> bool:
+    """Rewrite `.codex/hooks.json` from the just-pulled generator. True if it changed.
+
+    Only for a project that already has the file: generating one for a project that
+    never opted into `.codex/` would wire Codex hooks nobody asked for.
+    """
+    if not codex_hooks_stale(root):
+        return False
+    try:
+        return subprocess.run(_codex_generator(root)).returncode == 0
+    except OSError:
+        return False
+
+
 def remove_retired(root: Path) -> list[str]:
     """Delete only reviewed retired files, never project-owned sibling state."""
     removed = retired_present(root)
@@ -843,15 +910,76 @@ def receipt_retired_present(root: Path, manifest: tuple[str, ...]) -> list[str]:
     )
 
 
-def remove_receipt_retired(root: Path, manifest: tuple[str, ...]) -> tuple[list[str], list[str]]:
-    """Remove no-longer-managed files only when unchanged since the previous pull."""
+def template_outputs(src: Path | None) -> set[str]:
+    """Every project-relative path the source's `templates/` tier can produce.
+
+    The `dot-` prefix on a path component is the generator's spelling of a leading dot
+    (`dot-github/workflows/pr-gate.yml.tmpl` -> `.github/workflows/pr-gate.yml`), and a
+    trailing `.tmpl` marks a file that is rendered rather than copied. Both are stripped
+    here so the result is directly comparable with a MANIFEST path.
+
+    Best effort by design: a source with no `templates/` (an older devkit, or a consumer
+    pushing back) yields the empty set, and every caller treats that as "cannot tell".
+    """
+    if src is None:
+        return set()
+    root = src / "templates"
+    if not root.is_dir():
+        return set()
+    outputs: set[str] = set()
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        # `templates/<preset>/...` -- the preset directory is not part of the output.
+        parts = path.relative_to(root).parts[1:]
+        if not parts:
+            continue
+        renamed = [
+            part[4:] and f".{part[4:]}" if part.startswith("dot-") else part for part in parts
+        ]
+        renamed[-1] = renamed[-1].removesuffix(".tmpl")
+        outputs.add("/".join(renamed))
+    return outputs
+
+
+def remove_receipt_retired(
+    root: Path, manifest: tuple[str, ...], src: Path | None = None
+) -> tuple[list[str], list[str], list[str]]:
+    """Remove no-longer-managed files. `(removed, preserved, unvendored)`.
+
+    Three ways a path in the receipt can be absent from the MANIFEST, and only one of
+    them is a deletion:
+
+    - **Locally edited.** Preserved, as before: the sha no longer matches what the last
+      pull wrote, so someone owns it now.
+    - **Un-vendored** -- it left the MANIFEST because it became a `templates/` file.
+      **Preserved**, and this is the fix. Deleting it was silent data loss: `templates/`
+      is a one-shot copy consulted only by `new-project.py`, so nothing put the file
+      back and nothing on either side reported the gap. When
+      `.github/actions/setup-python-env/action.yml` was un-vendored, the pull deleted it
+      from every consumer that had *not* customised it -- and customising it was the
+      only thing that saved the two that survived, by accident of the sha check above.
+      Two projects' PR gates then died on an unresolvable local action, and a third's
+      nightly failed silently for a week because only its nightly used the action.
+    - **Retired.** Genuinely obsolete, nothing should have it. Deleted, as before.
+
+    The distinction needs the source, so `src=None` (a caller that cannot supply one)
+    falls back to the old behaviour rather than preserving everything -- a receipt entry
+    that is neither in the MANIFEST nor in `templates/` really is retired, and never
+    tidying those would leave a consumer accumulating dead files forever.
+    """
     receipt = read_receipt(root)
     current = set(manifest)
+    templates = template_outputs(src)
     removed: list[str] = []
     preserved: list[str] = []
+    unvendored: list[str] = []
     for rel, expected in sorted(receipt.items()):
         path = root / rel
         if rel in current or not path.is_file():
+            continue
+        if rel in templates:
+            unvendored.append(rel)
             continue
         if _sha256(path) != expected:
             preserved.append(rel)
@@ -859,7 +987,7 @@ def remove_receipt_retired(root: Path, manifest: tuple[str, ...]) -> tuple[list[
         path.unlink()
         removed.append(rel)
         _prune_dir(path.parent)
-    return removed, preserved
+    return removed, preserved, unvendored
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -906,9 +1034,33 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if src is None:
-        # Unconfigured: every mode is a clean no-op so the PR gate passes pre-adoption.
-        print(f"sync-harness: ${SRC_ENV} unset and no --src; nothing to do (skipping).")
-        return 0
+        # Unconfigured. Before adoption that is correct and every mode no-ops clean, so a
+        # project generated an hour ago -- no vendored files, and nothing to compare them
+        # against -- passes its own PR gate.
+        #
+        # After adoption the same silence is a lie. A stamped project HAS vendored files,
+        # `--check` is the gate over them, and exit 0 reports a comparison that never ran.
+        #
+        # The stamp is the one signal that separates the two, and the reason it works is
+        # that it is committed. `$DEVKIT_DIR` is a property of the *machine* -- a second
+        # workstation, a fresh clone, a CI job whose `env:` block was dropped -- and every
+        # one of those is a place where the gate goes quiet exactly when the project has
+        # the most vendored code to compare. `DEVKIT_VERSION` travels with the repo, so it
+        # can tell "not adopted yet" from "adopted, and this machine cannot check it".
+        stamped = read_version(REPO_ROOT)
+        if stamped is None:
+            print(f"sync-harness: ${SRC_ENV} unset and no --src; nothing to do (skipping).")
+            return 0
+        print(
+            f"sync-harness: this project vendors devkit ({VERSION_FILE} = {stamped}), but "
+            f"${SRC_ENV} is unset and no --src was given. There is nothing to compare "
+            f"against, so NOTHING WAS CHECKED.\n"
+            f"  point it at a devkit checkout:  {SRC_ENV}=<path> python scripts/sync-devkit.py\n"
+            f"  or drift-check without a clone: pre-commit run devkit-drift --all-files\n"
+            f"(that hook compares against the devkit rev pinned in {PRECOMMIT_FILE}, so it "
+            f"needs no ${SRC_ENV} and no local devkit at all)"
+        )
+        return 1
 
     if args.pull:
         # Both guards run *before* anything is copied: a refusal must leave the
@@ -935,8 +1087,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.pull or args.push:
         from_root, to_root = (src, REPO_ROOT) if args.pull else (REPO_ROOT, src)
-        managed_removed, preserved = (
-            remove_receipt_retired(REPO_ROOT, MANIFEST) if args.pull else ([], [])
+        managed_removed, preserved, unvendored = (
+            remove_receipt_retired(REPO_ROOT, MANIFEST, src) if args.pull else ([], [], [])
         )
         copied = [rel for rel in MANIFEST if _copy(rel, from_root, to_root)]
         skipped = [rel for rel in MANIFEST if rel not in copied]
@@ -944,6 +1096,10 @@ def main(argv: list[str] | None = None) -> int:
         # After the deletions, never before: pruning a hook whose script survived the
         # pull would disable a live hook.
         unwired = prune_settings(REPO_ROOT) if args.pull else []
+        # After the settings prune, never before: the Codex file is generated *from*
+        # those settings, so regenerating first would bake back in whatever the prune
+        # is about to remove.
+        codex_regenerated = regenerate_codex_hooks(REPO_ROOT) if args.pull else False
         blocks_written, blocks_failed = sync_blocks(from_root, to_root, BLOCK_MANIFEST)
         verb = "pulled" if args.pull else "pushed"
         print(
@@ -954,8 +1110,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  (absent) {rel}")
         for rel in preserved:
             print(f"  (preserved local edit) {rel}")
+        for rel in unvendored:
+            # Named on every pull, not just the one that moved it. The file is this
+            # project's own from here on -- devkit will not update it again, and the
+            # only thing that could tell you so is this line.
+            print(f"  (now yours -- un-vendored, devkit no longer updates it) {rel}")
         for name in unwired:
             print(f"  (unwired retired hook) {SETTINGS_FILE}: {name}")
+        if codex_regenerated:
+            # Named, because it is the one file the pull rewrote that was never copied
+            # from the source: it is generated here, from this project's own settings.
+            print(f"  (regenerated from {SETTINGS_FILE}) {CODEX_HOOKS_FILE}")
         if args.pull:
             # The SHA, always: DEVKIT_VERSION records the upstream *commit*, and
             # the vendored `test_harness_version_records_a_commit` asserts exactly
@@ -999,7 +1164,16 @@ def main(argv: list[str] | None = None) -> int:
     block_drifted, block_unusable, block_ok = classify_blocks(src, REPO_ROOT, BLOCK_MANIFEST)
     retired = retired_present(REPO_ROOT)
     receipt_retired = receipt_retired_present(REPO_ROOT, MANIFEST)
-    if not (drifted or missing or retired or receipt_retired or block_drifted or block_unusable):
+    codex_stale = codex_hooks_stale(REPO_ROOT)
+    if not (
+        drifted
+        or missing
+        or retired
+        or receipt_retired
+        or block_drifted
+        or block_unusable
+        or codex_stale
+    ):
         blocks = f" and {len(block_ok)} block(s)" if BLOCK_MANIFEST else ""
         print(f"sync-harness: all {len(MANIFEST)} vendored files{blocks} in sync with {src}.")
         return 0
@@ -1030,12 +1204,31 @@ def main(argv: list[str] | None = None) -> int:
         # Distinct from DRIFT on purpose: `--pull` fixes drift, and cannot fix a
         # missing marker pair. Saying so here saves the pull that would not help.
         print(f"BLOCK   {label} -- not comparable; --pull cannot fix this", file=sys.stderr)
-    print(
-        "sync-harness: vendored harness drifted from the shared repo. "
-        "Run `python scripts/sync-devkit.py --pull` to adopt upstream, "
-        "or `--push` if this project authored the change.",
-        file=sys.stderr,
-    )
+    if codex_stale:
+        # Not DRIFT: nothing upstream to compare against, and `--pull` fixes it only as
+        # a side effect of regenerating. Say which command actually rewrites the file.
+        print(
+            f"STALE   {CODEX_HOOKS_FILE} -- not what {SETTINGS_FILE} generates today; "
+            f"Codex is running hook wiring this repo no longer describes. "
+            f"Run `python scripts/sync-codex-context.py`",
+            file=sys.stderr,
+        )
+    if drifted or missing or retired or receipt_retired or block_drifted or block_unusable:
+        print(
+            "sync-harness: vendored harness drifted from the shared repo. "
+            "Run `python scripts/sync-devkit.py --pull` to adopt upstream, "
+            "or `--push` if this project authored the change.",
+            file=sys.stderr,
+        )
+    else:
+        # A `--pull` would resolve this one too, but only incidentally, and telling
+        # someone to adopt upstream when nothing upstream differs is the kind of advice
+        # that gets a red gate reclassified as noise.
+        print(
+            "sync-harness: every vendored file is in sync; only the generated Codex "
+            "hooks are stale.",
+            file=sys.stderr,
+        )
     return 1
 
 
