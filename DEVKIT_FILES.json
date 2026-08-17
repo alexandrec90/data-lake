@@ -1,5 +1,5 @@
 {
-  "devkit_tag": "v0.9.0",
+  "devkit_tag": "v0.9.1",
   "files": {
     ".claude/hooks/session-start.sh": "de052fbeca615c448055f76c85e50db0896229c7724021a9916752dd44671dda",
     ".claude/rules/authoring.md": "55def2e448d71f9f85ab414e7dc58c52713bd5194e80ea5fd57a88eb444c1a1b",
@@ -38,7 +38,7 @@
     "scripts/report-workflow-failure.py": "49219fe3b4fddd2602addbc8532b5dbe64562865da21fc9ed56cf69f958ab001",
     "scripts/ship.py": "6a9344dbd16be71f88286563eae71f4a21f641111abf7f688141c5a842dc46a8",
     "scripts/sync-codex-context.py": "732ed5619c3146f037aa30c356f61156371fd474d4f9c0b17da4dbc3c0e10df4",
-    "scripts/sync-codex-hooks.py": "d6aaa18621b3bc50ae52cd633960865d5b8c949a0c38d4c83db1fa4a6eff8f8c",
+    "scripts/sync-codex-hooks.py": "6c876c9be9b0cace281469c01d1d0ba68012fffe48172911be8373a41986d67c",
     "scripts/sync-devkit.py": "decdb385ed698810dc2cd39c370c46efb8b0f78659f4fee0d2a92abda7d9a17c",
     "scripts/task_branch.py": "0f25d11cb0d1d74c9912cbc667b92b8b387d65d2687cfef3110e5aee325da379"
   },

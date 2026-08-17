@@ -5,9 +5,11 @@
 its hooks from .codex/hooks.json, so this generator keeps that file in lock-step
 with Claude instead of hand-editing.
 
-Codex's own configuration lives in .codex/config.toml (approval policy, sandbox
-mode, shell env) and ~/.codex/config.toml (model, reasoning effort). Claude keys
-like `model: opus` or `permissions.allow` are not copied there.
+Hooks are the only thing a project owns here. Codex's own configuration -- model,
+reasoning effort, approval policy, sandbox mode, shell environment policy -- lives
+in ~/.codex/config.toml, because each of those is a property of whoever is driving
+the session rather than of the repo, and a per-project copy silently outranks the
+user's. Claude keys like `permissions.allow` are not copied across either.
 
 Codex supports most, but not all, Claude hook events and uses structured JSON
 instead of non-zero exit codes for blocking. This generator therefore:
