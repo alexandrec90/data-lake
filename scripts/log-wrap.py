@@ -5,7 +5,7 @@ output to a parseable file under `logs/` when the command fails. Exits with the
 wrapped command's code, so VS Code still shows the right task icon.
 
 Usage (tasks.json):
-  python scripts/log-wrap.py "Task Name" -- <command> [args...]
+  python scripts/log-wrap.py [--always] "Task Name" -- <command> [args...]
 
 Example:
   python scripts/notify-wrap.py "Ship: Sweep Workspace" --
@@ -22,6 +22,16 @@ and wrapping it anyway would produce a second, redundant file.
 to survive the terminal it scrolled past. `logs/<slug>.log` is overwritten per run and
 **emptied on success**, so a stale report can never outlive the failure it describes.
 
+**`--always` keeps the passing run too, and is for the unattended caller.** For a task
+someone clicked, an empty file is unambiguous -- they watched it pass. Nobody watches a
+scheduled job, and there "empty" covers three different states: it passed, it ran and
+declined to do anything, or it has not run since the last time it passed. A prune that
+skips every night because containers are up is *working as designed* and looks
+identical to one that stopped being scheduled at all, which is the failure
+`scripts/schedule_health.py` was written after. So a job on a schedule records its
+passes as well; the file is still overwritten per run and still capped, so the cost is
+one bounded file rather than a growing one.
+
 Colour survives the wrapping. A captured child is talking to a pipe rather than a
 terminal, and most tools drop their colour the moment they notice -- so `FORCE_COLOR`
 and `PY_COLORS` are set (when the caller has not) to keep the live view readable, and
@@ -33,6 +43,7 @@ Pure and stdlib-only; every decision is an importable function tested in
 
 from __future__ import annotations
 
+import datetime as _dt
 import os
 import re
 import subprocess
@@ -71,6 +82,31 @@ def split_argv(argv: list[str]) -> tuple[str, list[str]] | None:
     return title, command
 
 
+ALWAYS_FLAG = "--always"
+
+
+def _now() -> str:
+    """Local wall-clock, to the second. Local rather than UTC because the reader is
+    comparing it against "did this run last night", not against another machine."""
+    return _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_argv(argv: list[str]) -> tuple[str, list[str], bool] | None:
+    """`(title, command, always)`, or None when malformed.
+
+    The flag is consumed **only from the front**, ahead of the title. Everything after
+    the `--` belongs to the wrapped command, and a title is free-form text that could
+    itself contain the word; scanning the whole argv would let a task called
+    `Deploy --always` change this wrapper's behaviour by accident.
+    """
+    rest = argv[1:] if argv[:1] == [ALWAYS_FLAG] else argv
+    parsed = split_argv(rest)
+    if parsed is None:
+        return None
+    title, command = parsed
+    return title, command, rest is not argv
+
+
 def slug(title: str) -> str:
     """`"Ship: Sweep Workspace"` -> `"ship-sweep-workspace"`, the artifact's stem.
 
@@ -106,25 +142,34 @@ def cap(text: str, head: int = HEAD_LINES, tail: int = TAIL_LINES) -> str:
     return "\n".join(kept)
 
 
-def artifact_body(title: str, command: list[str], code: int, output: str) -> str:
-    """The file's full text -- **empty when the command succeeded**.
+def artifact_body(
+    title: str, command: list[str], code: int, output: str, always: bool = False
+) -> str:
+    """The file's full text -- **empty when the command succeeded**, unless `always`.
 
     Empty rather than absent: `logs/` keeps one file per task that has failed since it
     last passed, and a run that passes has to retract its own previous report.
 
     The header carries the command verbatim, because the reader of this file is
     usually not the person who clicked the task, and "re-run the task" is not something
-    an agent can do.
+    an agent can do. Under `always` it also carries the timestamp, which is the whole
+    question for an unattended job: a passing report with no clock on it cannot be told
+    apart from the same report written a fortnight ago.
     """
-    if code == 0:
+    if code == 0 and not always:
         return ""
+    stamped = f"# when: {_now()}\n" if always else ""
+    verdict = (
+        f"# fix: re-run `{' '.join(command)}` -- this file is overwritten per run\n"
+        if code
+        else "# result: passed -- kept because this task runs unattended\n"
+    )
     return (
         "# source: devkit scripts/log-wrap.py\n"
         f"# task: {title}\n"
+        f"{stamped}"
         f"# exit: {code}\n"
-        f"# fix: re-run `{' '.join(command)}` -- this file is overwritten per run\n"
-        + cap(strip_ansi(output))
-        + "\n"
+        f"{verdict}" + cap(strip_ansi(output)) + "\n"
     )
 
 
@@ -146,6 +191,29 @@ def child_env(base: dict[str, str] | None = None) -> dict[str, str]:
     for key, value in COLOR_ENV.items():
         env.setdefault(key, value)
     return env
+
+
+def echo(line: str, out=None) -> None:
+    """Mirror one captured line to the terminal, when there is one to mirror to.
+
+    `sys.stdout` is **None**, not a discarded stream, under `pythonw.exe` -- which is
+    how every unattended devkit job runs, precisely so no console window flashes up on
+    each fire. `sys.stdout.write` then raises `AttributeError` on the first line the
+    child prints, killing the wrapper whose entire job is to keep that output. The
+    scheduled run would exit non-zero having written no artifact, which is the exact
+    failure this file exists to prevent, in the one context where nobody is watching.
+
+    A closed or detached stream (`ValueError`) is the same case arriving later, so it
+    is swallowed here too: a task's output is never a reason to fail the task.
+    """
+    target = sys.stdout if out is None else out
+    if target is None:
+        return
+    try:
+        target.write(line)
+        target.flush()
+    except (ValueError, OSError):
+        return
 
 
 def stream(command: list[str]) -> tuple[int, str]:
@@ -187,26 +255,28 @@ def stream(command: list[str]) -> tuple[int, str]:
     assert process.stdout is not None  # noqa: S101 - PIPE above guarantees it
     for line in iter(process.stdout.readline, ""):
         captured.append(line)
-        sys.stdout.write(line)
-        sys.stdout.flush()
+        echo(line)
     process.stdout.close()
     return process.wait(), "".join(captured)
 
 
 def main(argv: list[str] | None = None, run=stream, root: Path | None = None) -> int:
-    parsed = split_argv(sys.argv[1:] if argv is None else argv)
+    parsed = parse_argv(sys.argv[1:] if argv is None else argv)
     if parsed is None:
         print(
-            'log-wrap: usage: python scripts/log-wrap.py "Task Name" -- <command> [args...]',
+            'log-wrap: usage: python scripts/log-wrap.py [--always] "Task Name" '
+            "-- <command> [args...]",
             file=sys.stderr,
         )
         return 2
-    title, command = parsed
+    title, command, always = parsed
 
     code, output = run(command)
 
     name = slug(title)
-    path = write_artifact(root or Path.cwd(), name, artifact_body(title, command, code, output))
+    path = write_artifact(
+        root or Path.cwd(), name, artifact_body(title, command, code, output, always)
+    )
     if code != 0 and path is not None:
         # One line, and only the path -- the failure text is already above, and
         # repeating it here is what buries the pointer to the file that keeps it.

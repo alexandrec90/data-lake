@@ -5,10 +5,118 @@
 # frontend node_modules), so the full lint suite can only run in CI — surfacing
 # lint drift one slow gate round at a time instead of in a single local pass.
 #
-# Synchronous + idempotent. Remote-only: local dev machines already have the
-# venv + node_modules, and container state is cached after this completes, so
-# re-runs are cheap (venv reused, pip/npm no-op when satisfied).
+# Synchronous + idempotent. The *installing* half is remote-only, and container state
+# is cached after this completes, so re-runs are cheap (venv reused, pip/npm no-op when
+# satisfied). A local session installs nothing but reports what is missing --
+# `report_missing_toolchain` carries why that line is not the same as the ladder below.
 set -uo pipefail
+
+# --- The pre-commit gate, wired for BOTH session kinds -------------------------
+# `.git/hooks/` is not committed, so a fresh clone has the config file and none of the
+# hooks it describes — the gate silently does not exist until someone runs
+# `pre-commit install`. That is a property of *cloning*, not of running in a sandbox,
+# and this used to sit below the local `exit 0`: the one shape it never reached was a
+# clone on a developer's machine, which is the common one. A consuming project cloned
+# onto a second machine therefore committed ungated, with nothing anywhere to say so —
+# `.pre-commit-config.yaml` is committed and looks like the gate, and CI runs the same
+# checks in a job, so both ends report healthy while the commit-time half is absent.
+#
+# Detection, not configuration, like everything else here: the config on disk is the
+# signal, so a project without one skips this entirely. Installing the hook does NOT run
+# it — nothing is checked until a commit is made.
+#
+# `$1` is `warm` to build the hook environments too. A cold sandbox pays that once, up
+# front, because it is about to run a gate; a local session gets the plain install, which
+# only writes `.git/hooks/pre-commit` and costs milliseconds at every single start.
+wire_pre_commit() {
+  [ -f .pre-commit-config.yaml ] || return 0
+  global_hooks_path="$(git config --global --get core.hooksPath 2>/dev/null)"
+  if [ -n "$global_hooks_path" ] && [ -f "$global_hooks_path/devkit_git_policy.py" ]; then
+    # The global dispatcher invokes `pre-commit run` itself after its branch policy
+    # passes. Installing here would target core.hooksPath and ask pre-commit to
+    # overwrite that dispatcher, disabling the policy for every repository.
+    echo "[session-start] Using the global Devkit dispatcher for pre-commit."
+    return 0
+  fi
+  # `Scripts/` as well as `bin/`: the local branch runs on whatever the developer has,
+  # and on Windows a venv's console scripts land in `Scripts/`. The remote sandbox is
+  # Linux, which is why `bin/` alone was enough while this was remote-only.
+  if [ -x ./.venv/bin/pre-commit ]; then
+    precommit="./.venv/bin/pre-commit"
+  elif [ -x ./.venv/Scripts/pre-commit.exe ]; then
+    precommit="./.venv/Scripts/pre-commit.exe"
+  elif command -v pre-commit >/dev/null 2>&1; then
+    precommit="pre-commit"
+  else
+    echo "[session-start] pre-commit not installed — skipping git hook wiring"
+    return 0
+  fi
+  echo "[session-start] Installing the pre-commit git hook..."
+  if [ "${1:-}" = "warm" ]; then
+    "$precommit" install --install-hooks >/dev/null 2>&1 \
+      || echo "[session-start] WARN: pre-commit install failed — commits will not be gated"
+  else
+    "$precommit" install >/dev/null 2>&1 \
+      || echo "[session-start] WARN: pre-commit install failed — commits will not be gated"
+  fi
+}
+
+# --- The toolchain a LOCAL session is missing ---------------------------------
+# This used to be a comment asserting that local machines already have the venv and
+# node_modules. That holds for a checkout someone set up months ago and is false for the
+# one shape where it matters — a FRESH CLONE, which is precisely the machine that has
+# neither. A session opened in one has no ruff, no mypy and no pytest, and finds that out
+# one failed command at a time, each looking like a broken tool rather than an empty
+# checkout. Same property as the pre-commit gate above: it is a consequence of *cloning*,
+# not of running in a sandbox.
+#
+# It reports and does not install, which is a deliberate line rather than a smaller fix:
+#
+#   - SessionStart is SYNCHRONOUS. A cold `uv sync` is minutes, charged to the start of a
+#     session that may have been opened to read one file.
+#   - The install ladder below resolves `./.venv/bin/python` — the Linux sandbox it was
+#     written for. `wire_pre_commit` above already carries the Windows correction
+#     (`Scripts/`), learned the hard way, and a second copy of that lesson is how the two
+#     drift apart.
+#   - Where ephemeral worktrees are in use, they already have an owner for this: devkit's
+#     own `worktree.py provision` walks the same ladder cross-platform and the worktree
+#     guard names it in the message that blocked the edit. A directory with two
+#     provisioners is worse off than one with none.
+#
+# So it names the state and the command, in the `(fix: ...)` shape the rest of this
+# workspace's session-start output uses. Detection, like everything else here: the
+# manifest's install_command wins, then the lockfile on disk decides.
+report_missing_toolchain() {
+  # `local` throughout: the remote branch below assigns `frontend_dir`/`frontend_enabled`
+  # for its own purposes, and a vendored file gets edited by people who will not have read
+  # both halves.
+  local fix="" install_command locks frontend_enabled frontend_dir
+  if [ ! -d .venv ]; then
+    install_command="$(python3 scripts/hooks/harness_config.py python.install_command 2>/dev/null)"
+    if [ -n "$install_command" ]; then
+      fix="$install_command"
+    elif [ -f uv.lock ]; then
+      fix="uv sync --all-extras --all-groups"
+    elif [ -f requirements-dev.txt ]; then
+      locks="-r requirements-dev.txt"
+      [ -f requirements.txt ] && locks="-r requirements.txt $locks"
+      fix="python -m venv .venv && uv pip install $locks"
+    elif [ -f pyproject.toml ]; then
+      fix="python -m venv .venv && uv pip install -e '.[dev]'"
+    fi
+    [ -n "$fix" ] &&
+      echo "[session-start] No .venv here — ruff/mypy/pytest are unavailable (fix: $fix)"
+  fi
+  # node_modules is the other half of the claim this replaced, and a frontend project
+  # missing it fails lint-all.py the same way.
+  frontend_enabled="$(python3 scripts/hooks/harness_config.py frontend.enabled 2>/dev/null)"
+  frontend_dir="$(python3 scripts/hooks/harness_config.py frontend.dir 2>/dev/null)"
+  frontend_dir="${frontend_dir:-frontend}"
+  if [ "$frontend_enabled" = "true" ] && [ -d "$frontend_dir" ] &&
+    [ ! -d "$frontend_dir/node_modules" ]; then
+    echo "[session-start] No $frontend_dir/node_modules — the frontend linters are unavailable (fix: npm install --prefix $frontend_dir)"
+  fi
+}
 
 # --- LOCAL sessions only: keep this branch current with origin/master ---------
 # Parallel worktrees drift from master the longer their branches live; on a
@@ -87,7 +195,16 @@ if [ "${CLAUDE_CODE_REMOTE:-}" != "true" ]; then
       fi
     fi
   ) || true
-  # Local machines already have the venv + node_modules; nothing to provision.
+  # Nothing is installed locally — a static checkout is provisioned once, and a box by
+  # `worktree.py provision`. But two things still have to happen on every machine:
+  # `.git/hooks/` is not committed, so the commit-time gate has to be wired here (see
+  # `wire_pre_commit`), and a checkout that has never been provisioned has to say so
+  # rather than let the session discover it (see `report_missing_toolchain`).
+  (
+    cd "${CLAUDE_PROJECT_DIR:-.}" || exit 0
+    wire_pre_commit
+    report_missing_toolchain
+  ) || true
   exit 0
 fi
 
@@ -188,38 +305,10 @@ else
   echo "[session-start] No frontend tier in .devkit.toml — skipping npm install"
 fi
 
-# Wire the pre-commit gate into .git/hooks. `.git/hooks/` is not committed, so a fresh
-# clone — and every fresh sandbox — has the config file but none of the hooks it
-# describes, and the gate silently does not exist. `pre-commit install` is idempotent and
-# runs in well under a second.
-#
-# Detection, not configuration, like everything else here: the config on disk is the
-# signal. Projects without one skip this entirely. Installing the hook does NOT run it —
-# nothing is checked until a commit is made.
-if [ -f .pre-commit-config.yaml ]; then
-  global_hooks_path="$(git config --global --get core.hooksPath 2>/dev/null)"
-  if [ -n "$global_hooks_path" ] && [ -f "$global_hooks_path/devkit_git_policy.py" ]; then
-    # The global dispatcher invokes `pre-commit run` itself after its branch policy
-    # passes. Installing here would target core.hooksPath and ask pre-commit to
-    # overwrite that dispatcher, disabling the policy for every repository.
-    echo "[session-start] Using the global Devkit dispatcher for pre-commit."
-  else
-    if [ -x ./.venv/bin/pre-commit ]; then
-      precommit="./.venv/bin/pre-commit"
-    elif command -v pre-commit >/dev/null 2>&1; then
-      precommit="pre-commit"
-    else
-      precommit=""
-    fi
-    if [ -n "$precommit" ]; then
-      echo "[session-start] Installing the pre-commit git hook..."
-      "$precommit" install --install-hooks >/dev/null 2>&1 \
-        || echo "[session-start] WARN: pre-commit install failed — commits will not be gated"
-    else
-      echo "[session-start] pre-commit not installed — skipping git hook wiring"
-    fi
-  fi
-fi
+# Wire the pre-commit gate into .git/hooks, building the hook environments while the
+# sandbox is being provisioned anyway. The local branch above calls the same function
+# without `warm`; see it for why this is not remote-only.
+wire_pre_commit warm
 
 # External lint binaries lint-all.py shells out to, installed to a PATH dir so
 # `shutil.which(...)` finds them. Best-effort: the runner skips a missing tool

@@ -71,6 +71,40 @@ def test_run_capped_merges_stderr():
     assert b"err" in out
 
 
+def test_powershell_mode_invokes_pwsh_directly(monkeypatch):
+    seen = {}
+
+    class Result:
+        returncode = 7
+        stdout = b"out"
+        stderr = b"err"
+
+    def fake_run(command, **kwargs):
+        seen["command"] = command
+        seen["kwargs"] = kwargs
+        return Result()
+
+    monkeypatch.setattr(hook.subprocess, "run", fake_run)
+    code, output = hook.run_capped(
+        "Get-Content README.md",
+        max_bytes=4000,
+        head_bytes=2000,
+        command_shell="powershell",
+    )
+
+    assert code == 7
+    assert output == b"outerr"
+    assert seen["command"] == [
+        "pwsh",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Get-Content README.md",
+    ]
+    assert seen["kwargs"] == {"capture_output": True}
+
+
 # --- main argument validation and config wiring ---
 
 

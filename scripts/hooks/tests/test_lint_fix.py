@@ -4,6 +4,7 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
 from conftest import load_module
 
 lint_fix = load_module("scripts/hooks/lint-fix.py")
@@ -157,8 +158,20 @@ def test_main_skips_non_python(monkeypatch):
     assert called == []  # returned before resolving ruff
 
 
+def _project(tmp_path: Path) -> Path:
+    """Make `tmp_path` look like a project, so its files are in scope to lint.
+
+    A bare temp directory is deliberately *out* of scope now -- see the
+    `project_root_for` tests below -- so a test about linting has to say which project
+    the file belongs to, the same way a real edit does.
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+    return tmp_path
+
+
 def test_main_noop_when_ruff_missing(monkeypatch, tmp_path):
-    f = tmp_path / "x.py"
+    f = _project(tmp_path) / "x.py"
     f.write_text("x = 1\n")
     monkeypatch.setattr(lint_fix, "_read_stdin", lambda: _payload(str(f)))
     monkeypatch.setattr(lint_fix, "find_ruff", lambda root: None)
@@ -166,23 +179,23 @@ def test_main_noop_when_ruff_missing(monkeypatch, tmp_path):
 
 
 def test_main_clean_file_returns_zero(monkeypatch, tmp_path):
-    f = tmp_path / "x.py"
+    f = _project(tmp_path) / "x.py"
     f.write_text("x = 1\n")
     monkeypatch.setattr(lint_fix, "_read_stdin", lambda: _payload(str(f)))
     monkeypatch.setattr(lint_fix, "find_ruff", lambda root: "ruff")
-    monkeypatch.setattr(lint_fix, "_run", lambda ruff, *args: result(returncode=0))
+    monkeypatch.setattr(lint_fix, "_run", lambda ruff, *args, **kw: result(returncode=0))
     assert lint_fix.main() == 0
 
 
 def test_main_relays_remaining_errors(monkeypatch, tmp_path, capsys):
-    f = tmp_path / "x.py"
+    f = _project(tmp_path) / "x.py"
     f.write_text("x = 1\n")
     monkeypatch.setattr(lint_fix, "_read_stdin", lambda: _payload(str(f)))
     monkeypatch.setattr(lint_fix, "find_ruff", lambda root: "ruff")
 
     calls = []
 
-    def fake_run(ruff, *args):
+    def fake_run(ruff, *args, **kw):
         calls.append(args)
         # `format` and `check --fix` succeed silently; the final reporting
         # `check` (no --fix) surfaces the unfixable finding.
@@ -195,9 +208,9 @@ def test_main_relays_remaining_errors(monkeypatch, tmp_path, capsys):
     assert lint_fix.main() == 2
     err = capsys.readouterr().err
     assert "F821" in err
-    # Fixers ran before the reporting check.
-    assert ("format", str(f)) in calls
-    assert ("check", "--fix", str(f)) in calls
+    # Fixers ran before the reporting check, against the project-relative path.
+    assert ("format", "x.py") in calls
+    assert ("check", "--fix", "x.py") in calls
 
 
 def test_main_missing_file_returns_zero(monkeypatch, tmp_path):
@@ -208,8 +221,9 @@ def test_main_missing_file_returns_zero(monkeypatch, tmp_path):
 
 
 def test_main_lints_every_python_file_in_codex_patch(monkeypatch, tmp_path):
-    first = tmp_path / "a.py"
-    second = tmp_path / "b.py"
+    root = _project(tmp_path)
+    first = root / "a.py"
+    second = root / "b.py"
     first.write_text("x = 1\n")
     second.write_text("y = 2\n")
     monkeypatch.setattr(
@@ -222,13 +236,76 @@ def test_main_lints_every_python_file_in_codex_patch(monkeypatch, tmp_path):
     monkeypatch.setattr(
         lint_fix,
         "_run",
-        lambda ruff, *args: calls.append(args) or result(returncode=0),
+        lambda ruff, *args, **kw: calls.append(args) or result(returncode=0),
     )
 
     assert lint_fix.main() == 0
-    assert ("format", str(first)) in calls
-    assert ("format", str(second)) in calls
+    assert ("format", "a.py") in calls
+    assert ("format", "b.py") in calls
     assert not any("README.md" in call for args in calls for call in args)
+
+
+# ---- project scope: lint a file by its own project, or not at all ----------
+
+
+def test_a_file_outside_every_project_is_not_linted(monkeypatch, tmp_path):
+    """The reported failure. A scratch script in a session temp directory was linted
+    with the *hook's* repo as the working directory, so ruff resolved per-file-ignores
+    against a config that does not own the file -- the ignores did not apply and rules
+    the project deliberately disables fired as blocking false positives."""
+    f = tmp_path / "probe.py"
+    f.write_text("import subprocess\n")
+    monkeypatch.setattr(lint_fix, "_read_stdin", lambda: _payload(str(f)))
+    monkeypatch.setattr(lint_fix, "find_ruff", lambda root: "ruff")
+    monkeypatch.setattr(
+        lint_fix, "_run", lambda *a, **kw: pytest.fail("linted a file outside every project")
+    )
+    assert lint_fix.main() == 0
+
+
+def test_a_file_in_another_project_is_linted_by_that_project(monkeypatch, tmp_path):
+    """The case that must keep working, and the reason scoping to the hook's own repo
+    would have been wrong: an agent edits inside an ephemeral worktree, which is not
+    under the checkout this hook is vendored into."""
+    elsewhere = _project(tmp_path / "box")
+    f = elsewhere / "thing.py"
+    f.write_text("x = 1\n")
+    monkeypatch.setattr(lint_fix, "_read_stdin", lambda: _payload(str(f)))
+    monkeypatch.setattr(lint_fix, "find_ruff", lambda root: "ruff")
+    seen = []
+
+    def fake_run(ruff, *args, **kw):
+        seen.append(kw.get("cwd"))
+        return result(returncode=0)
+
+    monkeypatch.setattr(lint_fix, "_run", fake_run)
+
+    assert lint_fix.main() == 0
+    assert seen and Path(seen[0]).resolve() == elsewhere.resolve()
+
+
+def test_the_nearest_project_wins(tmp_path):
+    """A box resolves to the box, not to the workspace above it -- the same order ruff
+    itself discovers configuration in."""
+    outer = _project(tmp_path)
+    inner = _project(outer / "nested")
+    assert lint_fix.project_root_for(inner / "x.py").resolve() == inner.resolve()
+
+
+def test_a_linked_worktree_counts_as_a_project(tmp_path):
+    """`.git` is a *file* in a linked worktree -- which is exactly what an ephemeral box
+    is -- so requiring a directory would put every box outside every project and
+    silently switch the hook off for all agent work."""
+    box = tmp_path / "box"
+    box.mkdir()
+    (box / ".git").write_text("gitdir: ../devkit/.git/worktrees/box\n", encoding="utf-8")
+    assert lint_fix.project_root_for(box / "x.py").resolve() == box.resolve()
+
+
+def test_no_marker_anywhere_above_is_none(tmp_path):
+    deep = tmp_path / "a" / "b" / "c"
+    deep.mkdir(parents=True)
+    assert lint_fix.project_root_for(deep / "x.py") is None
 
 
 # ---- ruff_arg: repo-relative POSIX so per-file-ignores globs match ----------

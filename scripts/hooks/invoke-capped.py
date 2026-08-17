@@ -6,13 +6,10 @@ this is what the agent routes the call through instead. Both windows of the cap 
 kept -- head and tail -- because the two useful parts of a long command's output are
 the first lines (what it was doing) and the last (how it failed).
 
-**The shell is the platform's, not the caller's.** `subprocess.run(shell=True)` uses
-`/bin/sh` on POSIX and **`cmd.exe` on Windows**, regardless of which shell the agent
-harness otherwise provides. On Windows that means heredocs fail, `'single quotes'`
-arrive with the quotes intact, and `\\|` alternation in a grep pattern is not
-understood. That is a property of the platform, not a bug here -- but it is the
-single most common way this wrapper surprises a caller, so it is also stated in the
-block message the hook prints.
+By default the shell is the platform's, not the caller's: `subprocess.run(shell=True)`
+uses `/bin/sh` on POSIX and `cmd.exe` on Windows. `--shell powershell` is the Codex
+Windows port. It invokes PowerShell 7 explicitly, so the wrapper and the shell tool
+interpret quoting, pipelines, and cmdlets the same way.
 
 Defaults come from `[bash]` in `.devkit.toml` (see `harness_config.py`) so a
 project can widen or tighten the cap without forking this file. Explicit CLI flags
@@ -20,7 +17,8 @@ still win.
 
 `cap_output` is pure and unit-tested in `scripts/hooks/tests/test_invoke_capped.py`.
 
-Usage: python3 scripts/hooks/invoke-capped.py --command "cmd" [--max-bytes N] [--head-bytes N]
+Usage: python3 scripts/hooks/invoke-capped.py --command "cmd" [--shell platform|powershell]
+       [--max-bytes N] [--head-bytes N]
 """
 
 from __future__ import annotations
@@ -56,11 +54,23 @@ def cap_output(data: bytes, max_bytes: int, head_bytes: int) -> bytes:
     return head + marker + tail
 
 
-def run_capped(command: str, max_bytes: int, head_bytes: int) -> tuple[int, bytes]:
+def run_capped(
+    command: str,
+    max_bytes: int,
+    head_bytes: int,
+    command_shell: str = "platform",
+) -> tuple[int, bytes]:
     """Run `command` in a shell and return (exit_code, capped combined output)."""
-    # shell=True is the whole point: this wrapper caps the output of an arbitrary
-    # shell command. The command is agent-supplied tooling, not external input.
-    result = subprocess.run(command, shell=True, capture_output=True)  # noqa: S602
+    # The command is agent-supplied tooling, not external input. The default preserves
+    # the original platform-shell behavior for Claude. Codex selects PowerShell
+    # explicitly because shell=True would silently switch its command to cmd.exe.
+    if command_shell == "powershell":
+        result = subprocess.run(
+            ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True,
+        )
+    else:
+        result = subprocess.run(command, shell=True, capture_output=True)  # noqa: S602
     combined = result.stdout + result.stderr
     return result.returncode, cap_output(combined, max_bytes, head_bytes)
 
@@ -68,6 +78,7 @@ def run_capped(command: str, max_bytes: int, head_bytes: int) -> tuple[int, byte
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--command", required=True)
+    parser.add_argument("--shell", choices=("platform", "powershell"), default="platform")
     parser.add_argument("--max-bytes", type=int, default=CFG.bash.max_bytes)
     parser.add_argument("--head-bytes", type=int, default=CFG.bash.head_bytes)
     args = parser.parse_args(argv)
@@ -76,7 +87,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"--max-bytes must be >= {MIN_MAX_BYTES}", file=sys.stderr)
         return 1
 
-    exit_code, capped = run_capped(args.command, args.max_bytes, args.head_bytes)
+    exit_code, capped = run_capped(
+        args.command,
+        args.max_bytes,
+        args.head_bytes,
+        command_shell=args.shell,
+    )
 
     sys.stdout.buffer.write(capped)
     if capped and not capped.endswith(b"\n"):

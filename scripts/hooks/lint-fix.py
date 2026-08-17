@@ -13,8 +13,23 @@ cross-file checks (mypy / vulture / frontend) belong in the Stop backstop and CI
 not on every keystroke. Best-effort throughout: a missing ruff or an unreadable
 payload exits 0 so a tooling gap never blocks the agent.
 
-Pure helpers (`parse_hook_input`, `extract_paths`, `is_lintable`, `find_ruff`) are
-unit-tested in `scripts/hooks/tests/test_lint_fix.py`.
+**A file is linted against the project it lives in, or not at all.** The hook's own
+location is the wrong root for both of the cases that actually occur. An agent edits
+inside an ephemeral box under `<workspace>/.worktrees/`, which is not under the static
+checkout this hook is vendored into, and it also writes scratch files to a session temp
+directory, which is not under any project at all. Both used to be linted anyway, with
+an absolute path and the *hook's* repo as the working directory, so ruff resolved
+`per-file-ignores` against a config that does not own the file — the ignores silently
+did not apply and rules the project deliberately disables (`S603`, `S607`, `T201`,
+`S101` in tests) fired as blocking false positives on a throwaway script.
+
+So `project_root_for` walks up from the file for a project marker: the file is linted
+with that directory as the working directory, and skipped entirely when there is no
+marker above it. A scratchpad stops being linted; a box starts being linted correctly,
+by its own config rather than the vendoring checkout's.
+
+Pure helpers (`parse_hook_input`, `extract_paths`, `is_lintable`, `find_ruff`,
+`project_root_for`) are unit-tested in `scripts/hooks/tests/test_lint_fix.py`.
 """
 
 from __future__ import annotations
@@ -28,6 +43,18 @@ from pathlib import Path
 
 ALLOWED_TOOLS = {"Edit", "Write", "MultiEdit", "apply_patch", "create_file"}
 REPO_ROOT = (Path(__file__).parent / "../..").resolve()
+
+# What makes a directory the root of a project ruff should be run from. Ordered by how
+# precisely each answers "which config governs this file": a ruff config is the direct
+# answer, `pyproject.toml` usually carries one, and `.git` is the backstop for a
+# repository that configures ruff nowhere and should still be linted with its own tree
+# as the root.
+#
+# `.git` is matched as a path that *exists* rather than a directory: in a linked
+# worktree -- which is exactly what an ephemeral box is -- `.git` is a file pointing at
+# the primary's git dir, and requiring a directory would put every box back outside
+# every project.
+PROJECT_MARKERS = ("ruff.toml", ".ruff.toml", "pyproject.toml", ".git")
 PATCH_PATH_RE = re.compile(
     r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*$",
     re.MULTILINE,
@@ -88,8 +115,8 @@ def is_lintable(path: str) -> bool:
 
 
 def ruff_arg(target: Path, repo_root: Path) -> str:
-    """Path form to hand ruff: repo-relative POSIX when `target` is inside the
-    project, else the absolute path.
+    """Path form to hand ruff: project-relative POSIX when `target` is inside
+    `repo_root`, else the absolute path.
 
     ruff matches `per-file-ignores` globs (e.g. `scripts/**/*.py`) against the file
     path relativised to the config-file directory. Handing ruff an absolute path
@@ -107,6 +134,28 @@ def ruff_arg(target: Path, repo_root: Path) -> str:
         return str(target)
 
 
+def project_root_for(target: Path) -> Path | None:
+    """The project directory governing `target`, or None when it belongs to none.
+
+    Walks up from the file's own directory and returns the first ancestor carrying a
+    `PROJECT_MARKERS` entry. None is the answer that matters: it means nothing here
+    configured ruff for this file, so linting it can only apply someone else's rules,
+    and the honest thing is to leave it alone.
+
+    Nearest-first, so a file inside a box resolves to the box rather than to the
+    workspace above it, and a nested sub-project wins over its parent -- the same order
+    ruff itself discovers configuration in.
+    """
+    try:
+        start = target.resolve().parent
+    except OSError:
+        return None
+    for directory in [start, *start.parents]:
+        if any((directory / marker).exists() for marker in PROJECT_MARKERS):
+            return directory
+    return None
+
+
 def find_ruff(repo_root: Path) -> str | None:
     """Resolve the ruff executable, preferring the project venv over PATH."""
     for sub in ("Scripts", "bin"):
@@ -117,10 +166,10 @@ def find_ruff(repo_root: Path) -> str | None:
     return shutil.which("ruff")
 
 
-def _run(ruff: str, *args: str) -> subprocess.CompletedProcess[str]:
+def _run(ruff: str, *args: str, cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [ruff, *args],
-        cwd=REPO_ROOT,
+        cwd=cwd,
         capture_output=True,
         check=False,
         text=True,
@@ -133,10 +182,6 @@ def main() -> int:
     if not paths:
         return 0
 
-    ruff = find_ruff(REPO_ROOT)
-    if not ruff:
-        return 0
-
     failures: list[str] = []
     for path in paths:
         target = Path(path)
@@ -145,21 +190,36 @@ def main() -> int:
         if not target.exists():
             continue
 
-        # Hand ruff the repo-relative POSIX path so `per-file-ignores` globs match
+        # Which project owns this file decides both whether to lint it and what config
+        # to lint it by. No owner means a scratch file outside every project, and the
+        # only rules available to judge it by would be someone else's.
+        root = project_root_for(target)
+        if root is None:
+            continue
+
+        # The project's own ruff first, so a box is linted by the toolchain it was
+        # provisioned with. Falling back to this checkout's rather than skipping: an
+        # unprovisioned box would otherwise lose the hook silently, which is the
+        # failure mode being fixed, not a second instance of it.
+        ruff = find_ruff(root) or find_ruff(REPO_ROOT)
+        if not ruff:
+            continue
+
+        # Hand ruff the project-relative POSIX path so `per-file-ignores` globs match
         # deterministically. Claude Code's hook payload sends `file_path` as a
         # lowercase-drive absolute path (`c:\...`) while this process runs with an
         # uppercase-drive cwd (`C:\...`); ruff relativises an absolute arg against
         # its resolved project root to match the globs, and that drive-case mismatch
         # makes it treat the file as outside the project -- silently dropping the
         # ignores so T201/S603/S607 (and S101 in tests) fire as false positives.
-        file_arg = ruff_arg(target, REPO_ROOT)
+        file_arg = ruff_arg(target, root)
         # Deterministic auto-fixers first, silently: formatting and import sorting
         # should never reach the agent as "errors" — they just get applied.
-        _run(ruff, "format", file_arg)
-        _run(ruff, "check", "--fix", file_arg)
+        _run(ruff, "format", file_arg, cwd=root)
+        _run(ruff, "check", "--fix", file_arg, cwd=root)
 
         # Whatever remains is a genuine finding ruff can't fix on its own.
-        remaining = _run(ruff, "check", file_arg, "--output-format=concise")
+        remaining = _run(ruff, "check", file_arg, "--output-format=concise", cwd=root)
         if remaining.returncode != 0:
             detail = (remaining.stdout + remaining.stderr).strip()
             failures.append(f"ruff found issues in {path} that need a manual fix:\n{detail}")

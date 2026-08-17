@@ -47,10 +47,11 @@ logic itself didn't change.
 Instruction files — `CLAUDE.md`, `.claude/rules/*`, `.claude/skills/*` — are covered by
 this same mandate. See `.claude/rules/authoring.md`.
 
-## Every Bash call carries an output cap
+## Claude Code's Bash calls carry an output cap
 
-`scripts/hooks/enforce-capped-bash.py` is a PreToolUse gate: a Bash command whose
-output is not bounded is **blocked**, not trimmed. Route it through the wrapper —
+In Claude Code, `scripts/hooks/enforce-capped-bash.py` is a PreToolUse gate: a Bash
+command whose output is not bounded is **blocked**, not trimmed. Route it through the
+wrapper —
 
 ```bash
 python3 scripts/hooks/invoke-capped.py --command "<the command>"
@@ -58,6 +59,18 @@ python3 scripts/hooks/invoke-capped.py --command "<the command>"
 
 which keeps a head *and* a tail window and preserves the exit code. Omit
 `--max-bytes`; it defaults to this project's `[bash] max_bytes`.
+
+**Codex is the exception.** Its shell tool already caps captured output before it
+reaches model context, so `scripts/sync-codex-hooks.py` omits this Claude-only gate.
+Issue ordinary Codex shell commands directly; routing them through `invoke-capped.py`
+adds visible indirection without adding another output bound.
+
+**A pipe into `head` or `tail` also counts**, in any of its spellings — `head -c N`,
+`tail -c N`, `head -N`, `tail -N`, and the `-n N` forms — as does redirecting stdout to
+a file, which bounds the output by sending it somewhere that is not your context at all.
+Those run in the harness's own shell rather than `cmd.exe`, so reach for one when the
+command needs POSIX syntax the wrapper would mangle; the cost is that the pipe masks the
+exit code, which is why the wrapper stays the default for test and lint runs.
 
 Learn this here rather than from the gate. Until this paragraph existed, nothing in
 any instruction file mentioned the hook, so **the only way to find out it was running
@@ -70,8 +83,34 @@ Two things not to reach for when it fires:
 
 - **`is_capped` is not a style check to satisfy.** Bounded commands are already exempt
   — `pwd`, `git rev-parse`, `--version` probes, the silent-on-success family
-  (`mkdir`, `rm`, `cp`), and shell control flow. If one of those is blocked, that is a
-  defect in the gate worth reporting, not a command to wrap.
+  (`mkdir`, `rm`, `cp`, `sleep`), condition tests (`test`, `[`), `git log` given a
+  commit count, and shell control flow. If one of those is blocked, that is a defect in
+  the gate worth reporting, not a command to wrap. Report it rather than working around
+  it: over half of every block this gate had issued turned out to be one of four cap
+  spellings it simply did not recognise, and it stayed that way because being blocked
+  reads as a rule to obey rather than as a bug.
+- **`git commit` and `gh pr create` are exempt, and wrapping them anyway breaks them.**
+  Their message is authored, multi-line, and does not survive the wrapper's `cmd.exe`;
+  the `| head -c N` fallback masks the exit code, so a commit a pre-commit hook
+  rejected reads as a success. Issue those two bare.
+
+  **Put the message in a file whenever it is multi-line or contains backticks:**
+
+  ```bash
+  git commit -F <path>            # bare, not through the wrapper
+  gh pr create --body-file <path>
+  ```
+
+  Backticks are why, and the gate is right to insist. A backtick inside a
+  double-quoted `-m` is command substitution in any POSIX shell — the shell runs what
+  is between the backticks — so that spelling is blocked, while the same message in
+  single quotes is allowed. Commit messages here are prose *about code* and are
+  therefore full of backticked identifiers, which makes the blocked spelling the common
+  one rather than the exception. `-F` sidesteps quoting entirely.
+
+  Note what is **not** the problem: `-F -` with a heredoc passes the gate. It fails
+  later, on `cmd.exe`, and only if you route it through the wrapper. A file is the one
+  spelling that works in both places.
 - **`ls`, `cat` and `git status` are exempt on purpose — they are not.** Their output
   grows with the tree, and the answer for them is the Read/Glob/Grep tools, which cost
   no subprocess and no cap. Reach for the wrapper for test and lint runs, where the
@@ -212,9 +251,16 @@ everything with no submodule and no install step.
 - `python scripts/sync-devkit.py --check` fails on drift, `--pull` adopts upstream,
   `--push` sends a change authored here back up. `DEVKIT_VERSION` records which
   upstream commit the vendored copy corresponds to.
-- **Every mode no-ops clean (exit 0) when `$DEVKIT_DIR` is unset.** That is
-  correct before adoption and a trap after: if `--check` ever prints "nothing to do
-  (skipping)" in CI, the gate is inert — fix the wiring, don't ignore it.
+- **`$DEVKIT_DIR` unset means there is nothing to compare against, and the stamp
+  decides what that is worth.** Before adoption every mode no-ops clean (exit 0):
+  nothing is vendored, so the gate has nothing to miss. Once `DEVKIT_VERSION` exists,
+  the same silence would report a comparison that never ran, so it **fails** instead.
+  `$DEVKIT_DIR` is a property of the machine and `DEVKIT_VERSION` is committed, which
+  is what makes the distinction reliable: a second workstation, a fresh clone or a CI
+  job missing its `env:` block is where the gate would otherwise go quiet. On a machine
+  with no devkit clone at all, the drift check that still works is
+  `pre-commit run devkit-drift --all-files` — same comparison, against the rev pinned
+  in `.pre-commit-config.yaml`.
 - A vendored script may depend on a file the project owns (`lint-all.py`,
   `run-tests.py`). Those dependencies are asserted by
   `scripts/hooks/tests/test_repo_contract.py`, because at runtime a missing one is a
