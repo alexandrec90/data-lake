@@ -9,8 +9,7 @@
       "Glob(*)",
       "WebFetch(*)",
       "WebSearch(*)"
-    ],
-    "defaultMode": "bypassPermissions"
+    ]
   },
   "hooks": {
     "SessionStart": [
@@ -66,7 +65,5 @@
         ]
       }
     ]
-  },
-  "effortLevel": "high",
-  "model": "opus"
+  }
 }
