@@ -1,16 +1,4 @@
 {
-  "permissions": {
-    "allow": [
-      "Bash(*)",
-      "Read(*)",
-      "Edit(*)",
-      "Write(*)",
-      "Grep(*)",
-      "Glob(*)",
-      "WebFetch(*)",
-      "WebSearch(*)"
-    ]
-  },
   "hooks": {
     "SessionStart": [
       {
