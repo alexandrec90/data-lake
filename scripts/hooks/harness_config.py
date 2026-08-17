@@ -108,6 +108,23 @@ class PythonConfig:
 
 
 @dataclass(frozen=True)
+class DockerConfig:
+    """How the workspace's unattended Docker maintenance may treat this stack.
+
+    Read by devkit's `docker-maint.py stop-idle`, which runs from the devkit
+    checkout rather than from this repo -- the field lives here to give it a schema,
+    a neutral default, and a place the contract test can verify the spelling.
+
+    `auto_stop` is opt-in on purpose: False keeps the nightly pass away from this
+    project's stack, and a collector-style project -- one whose containers do
+    scheduled work with no client connected, which no connection check can tell
+    apart from idle -- must never set it.
+    """
+
+    auto_stop: bool = False
+
+
+@dataclass(frozen=True)
 class Config:
     """Shape of the project the harness scripts operate on."""
 
@@ -121,6 +138,7 @@ class Config:
     frontend: FrontendConfig = field(default_factory=FrontendConfig)
     python: PythonConfig = field(default_factory=PythonConfig)
     bash: BashConfig = field(default_factory=BashConfig)
+    docker: DockerConfig = field(default_factory=DockerConfig)
 
     def env(self, suffix: str) -> str:
         """The prefixed control-env name, e.g. env("SKIP_STOP_VERIFY")."""
@@ -197,6 +215,12 @@ def _bash_from(raw: dict[str, Any], default: BashConfig) -> BashConfig:
     )
 
 
+def _docker_from(raw: dict[str, Any], default: DockerConfig) -> DockerConfig:
+    # `is True` rather than `bool(...)`: this key licenses stopping a stack, so a
+    # typo ("yes", 1) must read as the safe default, not as truthy.
+    return replace(default, auto_stop=raw.get("auto_stop", default.auto_stop) is True)
+
+
 def from_dict(data: dict[str, Any]) -> Config:
     """Build a Config from an already-parsed manifest dict. Pure; never raises."""
     default = Config()
@@ -206,6 +230,7 @@ def from_dict(data: dict[str, Any]) -> Config:
     fe_raw = data.get("frontend", {}) if isinstance(data.get("frontend"), dict) else {}
     py_raw = data.get("python", {}) if isinstance(data.get("python"), dict) else {}
     bash_raw = data.get("bash", {}) if isinstance(data.get("bash"), dict) else {}
+    docker_raw = data.get("docker", {}) if isinstance(data.get("docker"), dict) else {}
     return Config(
         env_prefix=str(project.get("env_prefix", default.env_prefix)),
         app_dir=str(paths.get("app", default.app_dir)),
@@ -215,6 +240,7 @@ def from_dict(data: dict[str, Any]) -> Config:
         frontend=_frontend_from(fe_raw, default.frontend),
         python=_python_from(py_raw, default.python),
         bash=_bash_from(bash_raw, default.bash),
+        docker=_docker_from(docker_raw, default.docker),
     )
 
 

@@ -3,6 +3,7 @@
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -1215,6 +1216,30 @@ def test_regenerate_drops_the_bash_cap_the_stale_artifact_still_carried(tmp_path
     rewritten = (root / sh.CODEX_HOOKS_FILE).read_text(encoding="utf-8")
     assert "enforce-capped-bash.py" not in rewritten
     assert sh.codex_hooks_stale(root) is False
+
+
+def test_a_generator_that_speaks_is_still_heard(tmp_path, monkeypatch, capsys):
+    """`regenerate_codex_hooks` spawns the generator with `CREATE_NO_WINDOW`, so a
+    scheduled upgrade pass does not flash a console window per project. That flag hands
+    the child a console of its own, and a child that captures nothing writes to *that* --
+    so the spawn has to capture and re-emit, or the generator's account of the rewrite
+    disappears from a `--pull` someone is reading.
+
+    Today's generator happens to be silent on the write path, which is exactly why this
+    is tested against a stub that is not: the property has to hold for the generator this
+    becomes, and a test written against the silent one would assert nothing.
+    """
+    speaks = "import sys; print('wrote the file'); print('and warned', file=sys.stderr)"
+
+    def generator(_root, *args):
+        # Exit 1 for the staleness probe, so the regeneration is actually attempted.
+        return [sys.executable, "-c", "raise SystemExit(1)" if "--check" in args else speaks]
+
+    monkeypatch.setattr(sh, "_codex_generator", generator)
+    assert sh.regenerate_codex_hooks(_codex_project(tmp_path)) is True
+    captured = capsys.readouterr()
+    assert "wrote the file" in captured.out
+    assert "and warned" in captured.err
 
 
 def test_regenerating_a_current_artifact_is_a_no_op(tmp_path):
