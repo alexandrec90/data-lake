@@ -69,6 +69,25 @@ DEVKIT_REPO = "https://github.com/alexandrec90/devkit"
 PR_GATE_FILE = ".github/workflows/pr-gate.yml"
 DEVKIT_SLUG = "alexandrec90/devkit"
 
+# Windows only, and load-bearing whenever this script runs unattended.
+#
+# A process with no console of its own -- `pythonw.exe`, which is how every scheduled
+# devkit job runs -- makes Windows allocate a **brand new console window** for each
+# console child it spawns. The nightly upgrade pass spawns this script exactly that way,
+# so an unflagged `git` here is a window flashing on the desktop for every command a pull
+# makes, times every project in the pass. That is what it did: the flag was added to the
+# jobs' own spawns and stopped at the process boundary, because a scheduled job's reach
+# is longer than the script the scheduler names.
+#
+# A child that carries the flag gets a console with **no window**, and its own
+# descendants inherit that console -- which is why flagging the outermost spawn in each
+# script is enough, and why the flag has to be on every script the scheduler can reach.
+# It is ignored for a GUI-subsystem child (`pythonw.exe` itself), so the flag on the
+# spawn that started this script bought nothing here.
+#
+# `getattr` supplies zero off Windows, where the flag does not exist.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 # Repo-relative paths of the shared harness files (source of truth = shared repo).
 # Every entry ships with its test; keep both in the manifest so a vendored copy is
 # verifiable in isolation. NB: `.devkit.toml` is intentionally absent -- it
@@ -210,6 +229,11 @@ MANIFEST: tuple[str, ...] = (
     ".github/workflows/scheduled-failure-issue.yml",
     "scripts/report-workflow-failure.py",
     "scripts/hooks/tests/test_report_workflow_failure.py",
+    # The auto-merge's retry half, and vendored for the same reason: an event handler that
+    # fires once per gate completion strands its PR permanently on any transient failure,
+    # and the repos where that goes unnoticed longest are the existing ones.
+    "scripts/merge-dependabot-prs.py",
+    "scripts/hooks/tests/test_merge_dependabot_prs.py",
     # The rest of the CI surface -- `dependabot.yml`, the gate, the nightly -- cannot
     # be vendored for the reason above, and `templates/` cannot keep them honest
     # either: a one-shot copy has no way to notice that a project never received a
@@ -281,6 +305,7 @@ def git_head(path: Path) -> str | None:
             capture_output=True,
             text=True,
             timeout=10,
+            creationflags=NO_WINDOW,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -295,6 +320,7 @@ def _git_out(path: Path, *args: str) -> str | None:
             capture_output=True,
             text=True,
             timeout=10,
+            creationflags=NO_WINDOW,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -867,7 +893,12 @@ def codex_hooks_stale(root: Path) -> bool:
     if not (root / CODEX_HOOKS_FILE).is_file() or not (root / CODEX_GENERATOR).is_file():
         return False
     try:
-        result = subprocess.run(_codex_generator(root, "--check"), capture_output=True, text=True)
+        result = subprocess.run(
+            _codex_generator(root, "--check"),
+            capture_output=True,
+            text=True,
+            creationflags=NO_WINDOW,
+        )
     except OSError:
         return False
     return result.returncode == 1
@@ -882,7 +913,20 @@ def regenerate_codex_hooks(root: Path) -> bool:
     if not codex_hooks_stale(root):
         return False
     try:
-        return subprocess.run(_codex_generator(root)).returncode == 0
+        # Captured and re-emitted rather than left to inherit. `NO_WINDOW` binds a child
+        # that captures nothing to the console it was just given, so the flag alone
+        # silently takes whatever the generator says out of a `--pull` a human is
+        # reading. Both streams, and without asking what today's generator prints: that
+        # is the generator's business to change, and this is the only place it could be
+        # lost.
+        result = subprocess.run(
+            _codex_generator(root), capture_output=True, text=True, creationflags=NO_WINDOW
+        )
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+        return result.returncode == 0
     except OSError:
         return False
 

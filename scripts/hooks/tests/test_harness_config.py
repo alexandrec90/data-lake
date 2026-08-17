@@ -256,3 +256,26 @@ def test_cli_exits_zero_with_no_manifest_and_no_args(tmp_path):
         )
         assert run.returncode == 0, run.stderr
         assert run.stdout.strip() == ""
+
+
+# --- [docker]: the opt-in the workspace's stop-idle pass reads ------------------
+
+
+def test_docker_auto_stop_defaults_off():
+    """Opt-in: the key licenses stopping this project's stack unattended, so absence
+    -- of the key, the table, or the whole manifest -- must read as "keep it up"."""
+    assert cfg.Config().docker.auto_stop is False
+    assert cfg.from_dict({}).docker.auto_stop is False
+    assert cfg.from_dict({"docker": {}}).docker.auto_stop is False
+
+
+def test_docker_auto_stop_requires_the_literal_true():
+    """`1`, `"yes"` and `"true"` are typos, and a typo in a key that licenses stopping
+    a stack must land on the safe side."""
+    assert cfg.from_dict({"docker": {"auto_stop": True}}).docker.auto_stop is True
+    for junk in ("yes", "true", 1, [True], None):
+        assert cfg.from_dict({"docker": {"auto_stop": junk}}).docker.auto_stop is False
+
+
+def test_a_docker_table_of_the_wrong_shape_is_ignored():
+    assert cfg.from_dict({"docker": "auto_stop"}).docker.auto_stop is False

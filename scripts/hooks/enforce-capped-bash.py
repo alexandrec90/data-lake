@@ -64,6 +64,13 @@ does not resolve any of them:
     only where a shell would, which is also why the `;` in `pwd # a; ls -R /` stays
     inside the comment instead of starting a statement. And a `case` arm arrives as
     `case $x in a) pwd`: a header and a pattern in front of a command, and both peel.
+
+    The fifth neighbour was a header whose word list comes from a substitution --
+    `for f in $(git diff --name-only)` -- vetoed as unknowable output before the
+    control-flow check ever ran, though the substitution feeds the loop variable and
+    never the terminal. Control shapes are now judged before the veto, next to the
+    condition tests that moved there for the same reason; the loop's *body* still
+    arrives as its own statements and is judged on its own merits.
   - *Heredoc bodies.* Splitting on newlines turned every line of a `git commit -F -
     <<'EOF'` message into its own "statement", so the prose was evaluated as commands.
     `split_top_level` now consumes the body between the operator and its terminator.
@@ -360,11 +367,30 @@ HEREDOC_RE = re.compile(r"<<-?\s*(?P<quote>['\"]?)(?P<word>[A-Za-z_][\w.-]*)(?P=
 # what follows and contributes no output of its own. `until ! [ -f x ]` and `if ! test
 # -f x` are ordinary spellings of a poll and a guard, and both were blocked on the `!`
 # alone -- the peel loop stopped at it, so the condition behind it was never judged.
+#
+# CONTROL_ONLY and CONTROL_HEADER are consulted in `is_bounded` *before* the
+# command-substitution veto, and that placement is load-bearing rather than incidental.
+# Tested after it, as they were, the exemption was unreachable for any header carrying a
+# `$(` or a backtick -- so `for i in $(seq 1 60)` blocked while `while true` passed, for
+# two loops doing the same job. See `is_bounded`'s docstring for why a header's
+# substitution is not output.
 CONTROL_ONLY_RE = re.compile(
     r"(?:do|done|then|else|elif|fi|esac|;;|\{|\}|\(|\))(?:\s+\d*[<>]{1,2}&?\s*\S+)*\s*$"
 )
 CONTROL_HEADER_RE = re.compile(r"(?:for\s+\w+(?:\s+in\b.*)?|case\s+.*\sin)\s*$")
 CONTROL_PREFIX_RE = re.compile(r"^(?:do|then|else|elif|if|while|until|\{|!)\s+")
+
+# An environment-assignment prefix (`VAR=1 git commit ...`) sets a variable for one
+# command and emits nothing; the command behind it decides. It peels like a control
+# keyword, and was found the same way: `DEVKIT_SKIP_BRANCH_POLICY=1 git commit -F m` is
+# the branch policy's own documented bypass, the commit pair is exempt, and the prefix
+# broke the match -- so this gate blocked the exact spelling another gate's error
+# message tells the agent to type. Quoted values are consumed whole so a space inside
+# one is not a word boundary, and the exemptions stay intact behind it (`FOO=bar ls -R /`
+# still blocks, on the `ls`). A substitution in the value peels away with the prefix --
+# it feeds the variable, never the terminal, so the command behind it decides, the same
+# reasoning that exempts a substitution in a control-flow header.
+ENV_ASSIGNMENT_PREFIX_RE = re.compile(r"^[A-Za-z_]\w*=(?:'[^']*'|\"(?:\\.|[^\"\\])*\"|\S*)\s+")
 
 # A `case` arm reaches here as one fragment holding a header, a pattern and a command --
 # `case $x in a) pwd` -- because `;;` contains the `;` that `statements()` splits on.
@@ -578,6 +604,7 @@ def strip_control_prefix(statement: str) -> str:
     while True:
         peeled = CASE_ARM_RE.sub("", CASE_HEADER_RE.sub("", statement, count=1), count=1)
         peeled = CONTROL_PREFIX_RE.sub("", peeled, count=1)
+        peeled = ENV_ASSIGNMENT_PREFIX_RE.sub("", peeled, count=1)
         if peeled == statement:
             return statement
         statement = peeled
@@ -603,16 +630,27 @@ def is_quiet_grep(statement: str) -> bool:
 def is_bounded(statement: str) -> bool:
     """True when this statement's output is bounded by a small constant.
 
-    Two checks run *before* the command-substitution veto, and the order is the whole
+    Several checks run *before* the command-substitution veto, and the order is the whole
     point of them. The veto is a claim that a statement's output is unknowable because a
     substitution could print anything -- which is only true when the statement has a
-    path to the terminal at all. A condition test has none, and a redirect has taken it
-    away, so vetoing either is reasoning about output that cannot exist. Both shapes
-    were blocked that way (`until [ "$(...)" = healthy ]`, `gh run view --log > file`)
-    and neither could be spelled any other way.
+    path to the terminal at all. A condition test has none, a redirect has taken it
+    away, and shell control flow never had one, so vetoing any of them is reasoning about
+    output that cannot exist. Every one of those shapes was blocked that way
+    (`until [ "$(...)" = healthy ]`, `gh run view --log > file`, `for i in $(seq 1 60)`)
+    and none could be spelled any other way.
+
+    The control-flow pair was the last to move up here, and it is the case the rule above
+    reads past most easily, because the substitution is not the thing being *run*: in
+    `for i in $(seq 1 60)`, `seq`'s output is the loop's word list. The shell consumes it
+    to decide how many iterations there are and prints not one byte of it -- exactly as a
+    condition test consumes the substitution feeding it. What the loop *body* prints is a
+    separate statement and is still judged on its own, which is what keeps
+    `for f in $(ls); do cat $f; done` blocked, on the `cat`, where it belongs.
     """
     peeled = strip_control_prefix(statement.strip())
     if NO_STDOUT_RE.match(peeled) or BARE_NO_OUTPUT_RE.match(peeled):
+        return True
+    if CONTROL_ONLY_RE.match(peeled) or CONTROL_HEADER_RE.match(peeled):
         return True
     if is_quiet_grep(peeled):
         return True
@@ -622,7 +660,13 @@ def is_bounded(statement: str) -> bool:
     # redirect while still hiding a `>` that was only ever prose.
     if REDIRECT_RE.search(QUOTED_SPAN_RE.sub("q", peeled)):
         return True
-    if SUBSTITUTION_RE.search(SINGLE_QUOTED_SPAN_RE.sub(" ", statement)):
+    # Judged on the PEELED statement, not the raw one. A substitution sitting in the part
+    # that gets peeled off belongs to the control keyword, not to the command: in
+    # `case $(uname) in Linux) pwd`, `uname` picks the arm and `pwd` is what prints. Read
+    # raw, the `$(` vetoed a `pwd` -- the most bounded command there is -- and the block
+    # named a cause the author had no way to act on, since the substitution was in a
+    # header the remedy cannot wrap.
+    if SUBSTITUTION_RE.search(SINGLE_QUOTED_SPAN_RE.sub(" ", peeled)):
         return False
     statement = peeled
     if GIT_LOG_RE.match(statement):
@@ -639,8 +683,6 @@ def is_bounded(statement: str) -> bool:
         # many commands as it means verbose, and an unscoped check revoked the
         # long-standing `command -v gh` exemption two lines below.
         return not VERBOSE_FLAG_RE.search(statement)
-    if CONTROL_ONLY_RE.match(statement) or CONTROL_HEADER_RE.match(statement):
-        return True
     return any(pattern.match(statement) for pattern in BOUNDED_COMMANDS)
 
 

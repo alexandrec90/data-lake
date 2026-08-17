@@ -110,6 +110,7 @@ def _toml_schema() -> dict[str, frozenset[str]]:
         "frontend": fields(cfg.FrontendConfig),
         "python": fields(cfg.PythonConfig),
         "bash": fields(cfg.BashConfig),
+        "docker": fields(cfg.DockerConfig),
     }
 
 

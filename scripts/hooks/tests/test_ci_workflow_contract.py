@@ -8,8 +8,11 @@ to leave running unattended.
 Why a contract test rather than more vendoring. Some of the required files carry no
 per-project content and are therefore shipped whole: `dependabot-automerge.yml` and
 `scheduled-failure-issue.yml` are in `sync-devkit.py`'s MANIFEST and drift-checked
-byte-for-byte -- each waits on a workflow by a title every project shares, and neither
-names anything else about the repo it runs in. The rest cannot be. A
+byte-for-byte -- what each waits on is a title every project shares, and neither names
+anything else about the repo it runs in. That constraint is also the reporter's limit:
+`on.workflow_run` can only ever name `Nightly`, so its second, scheduled job enumerates
+the workflow directory instead of subscribing to a list it is not allowed to hold. The
+rest cannot be vendored at all. A
 `dependabot.yml` names the ecosystems this project actually has; a gate or a nightly
 names its services, its migrations and its frontend tier, and carameli's five-job gate
 is the standing proof that a shared one would have to delete real work or live
@@ -214,6 +217,30 @@ def test_dependabot_prs_have_something_that_merges_them():
     )
 
 
+def test_the_merge_job_is_gated_by_label_not_by_author():
+    """The `automerge` label is the whole authorization, for every PR author.
+
+    The merge job once required Dependabot as both the run's actor and the PR's
+    author, which silently excluded the routine PRs the label exists for -- devkit
+    upgrades, and anything a human labels instead of babysitting the gate. Only
+    write access can apply a label, so an author condition adds no safety the label
+    does not already carry; reintroducing one turns labelled PRs back into ones
+    that sit open behind a passed gate.
+    """
+    text = _read(WORKFLOWS_DIR / AUTOMERGE)
+    assert "workflow_run.actor" not in text, (
+        f"{AUTOMERGE}'s merge job conditions on the workflow_run actor again; the "
+        "`automerge` label is the authorization, and an actor condition makes the "
+        "job skip every labelled non-Dependabot PR."
+    )
+    assert "scripts/merge-dependabot-prs.py" in text, (
+        f"{AUTOMERGE} no longer delegates to scripts/merge-dependabot-prs.py -- that "
+        "script is where the `automerge`-label check lives (pinned by "
+        "test_merge_dependabot_prs.py), so without it every PR whose gate passes "
+        "merges itself."
+    )
+
+
 def test_dependency_update_prs_are_assigned_to_someone():
     """Otherwise they are visible in no aggregate view, in any repo.
 
@@ -296,6 +323,40 @@ def test_the_nightly_carries_the_title_the_failure_reporter_waits_on():
     )
 
 
+def test_the_failure_reporter_also_sweeps_on_its_own_schedule():
+    """The title above buys coverage for `Nightly` and for nothing else.
+
+    `on.workflow_run` selects by title, and a title list is precisely the per-project
+    value a vendored file may not carry -- so the reporter's event-driven half watches
+    one workflow, permanently. A project's *second* scheduled workflow is therefore
+    uncovered the moment it is added, and uncovered silently: it fails in an Actions tab,
+    files nothing, and the reporter that was supposed to carry it looks healthy because
+    the workflow it does watch is green.
+
+    That is not hypothetical. It is how a `Weekly Hardening` came to fail three
+    consecutive Sundays in one of the repos this harness ships to, with no issue, while
+    that repo's nightly tracker sat correctly closed.
+
+    The `schedule:` trigger is the sweep half, which enumerates every scheduled workflow
+    in this directory instead of subscribing to one. A copy that has lost it still
+    reports nightlies, so nothing here looks broken -- which is exactly why it is gated.
+    """
+    reporter = WORKFLOWS_DIR / FAILURE_REPORTER
+    assert reporter.is_file(), f".github/workflows/{FAILURE_REPORTER} is missing."
+    triggers = _triggers(_read(reporter))
+    assert "schedule" in triggers, (
+        f"{FAILURE_REPORTER} declares {sorted(triggers)} and no `schedule:`. Without it "
+        "only the workflow named in its `workflow_run` filter is ever reported on, and "
+        "every other scheduled workflow in this repo fails into silence. Run "
+        "`python scripts/sync-devkit.py --pull`."
+    )
+    assert "workflow_run" in triggers, (
+        f"{FAILURE_REPORTER} has no `workflow_run:` trigger, so a nightly failure waits "
+        "for the next sweep instead of filing immediately, and a fix does not close its "
+        "issue until then either."
+    )
+
+
 # --- the settings that make an unattended run safe -----------------------------
 
 
@@ -309,12 +370,18 @@ def test_every_workflow_declares_top_level_permissions():
         )
 
 
-def test_every_workflow_declares_concurrency_except_the_automerge_one():
+def test_every_workflow_declares_concurrency():
+    """No exemptions left, and the one that used to be here is worth recording.
+
+    `dependabot-automerge.yml` was exempt because its merge job is driven by
+    `workflow_run` completions and a shared group would drop one of two branches'
+    completions as superseded. That reasoning was about the *key*, not about concurrency
+    itself -- and when the file gained a `schedule:` for its retry sweep, the exemption
+    would have silently swallowed the requirement that a scheduled run be allowed to
+    finish. It keys on `github.event.workflow_run.head_branch || github.run_id` now, so
+    branches stay independent and anything without a branch gets a group of its own.
+    """
     for path in _workflows():
-        if path.name == AUTOMERGE:
-            # Deliberately omitted there: its merge job is driven by workflow_run
-            # completion events, and a concurrency group would drop one as superseded.
-            continue
         assert _top_level_block(_read(path), "concurrency") is not None, (
             f"{path.name}: no top-level `concurrency:` block, so redundant runs pile "
             "up on the same ref."

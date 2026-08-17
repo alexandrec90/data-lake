@@ -25,17 +25,48 @@ Deduplication is by exact issue title, one open issue per workflow name. The lab
 for filtering only -- never for lookup, because `gh issue list --label` fails outright on
 a repo that has never carried the label, which is every repo before its first failure.
 
+**Two modes, because one event cannot see the whole problem.**
+
+`report` is the original: a `workflow_run` completion arrives, and this reconciles that
+one workflow's tracker against it. It is immediate, and it is what closes an issue the
+moment a fix goes green. What it cannot be is *complete*. `on.workflow_run` selects the
+workflows it watches **by title**, and a title list is exactly the per-project value a
+vendored file may not carry -- so the file shipped watching `Nightly` and nothing else.
+In the workspace that produced it, one repo had since grown two more scheduled
+workflows, and one of those had failed three consecutive weeks with nothing filed: the
+reporter had never been told it existed. Every project is one `nightly.yml` sibling away
+from the same silence, and nothing goes red when it happens.
+
+`sweep` answers that by enumerating rather than subscribing. It reads the checked-out
+`.github/workflows/` for **every** file declaring a `schedule:` trigger and reconciles
+each against its latest run on the default branch, so a workflow added last week is
+covered the first time the sweep runs, with no list to update anywhere.
+
+Sweeping also reaches the failure the event-driven mode is structurally blind to: a
+workflow that is not failing because it is **not running**. GitHub disables scheduled
+workflows in a repository after 60 days without activity, and a disabled workflow emits
+no completion event -- so the reporter goes quiet at exactly the moment there is
+something to report, and that quiet is indistinguishable from health. The workflows API
+says so outright in `state`, so the sweep reads it rather than inferring staleness from
+run timestamps.
+
+Both modes converge on the same trackers -- same titles, same dedup -- so running both
+costs nothing and either alone still works.
+
 Vendored from devkit (`sync-devkit.py`'s MANIFEST) and byte-identical everywhere:
 nothing in it names a project. The repository, the workflow, the run and the owner all
-arrive as environment variables from the `workflow_run` event.
+arrive as environment variables; `sweep` additionally reads the workflow directory, which
+is at the same path in every repository GitHub will run.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
+from pathlib import Path
 
 LABEL = "ci-failure"
 LABEL_COLOR = "b60205"
@@ -212,10 +243,312 @@ def assign(issue: str, owner: str, run) -> str:
     return f"assigned to {owner}"
 
 
-def main(env: dict[str, str] | None = None, run=None) -> int:
-    env = dict(os.environ) if env is None else env
-    run = subprocess.run if run is None else run
+def apply(
+    action: str,
+    title: str,
+    issues: list[dict],
+    *,
+    body: str,
+    comment: str,
+    owner: str,
+    run,
+) -> str:
+    """Bring the tracker for `title` into line with `action`, returning a log line.
 
+    Shared by both modes so they cannot drift into filing two differently-shaped issues
+    about the same thing. `issues` is passed in rather than fetched here because the
+    sweep reconciles many workflows against a single listing.
+    """
+    existing = find_open_issue(issues, title)
+
+    if action == "close":
+        if existing is None:
+            return "passed, and nothing was open."
+        gh(["issue", "close", str(existing), "--reason", "completed", "--comment", comment], run)
+        return f"passed; closed #{existing}."
+
+    if existing is not None:
+        gh(["issue", "comment", str(existing), "--body", comment], run)
+        return f"still failing; commented on #{existing}."
+
+    ensure_label(run)
+    url = gh(["issue", "create", "--title", title, "--body", body, "--label", LABEL], run).strip()
+    return f"opened {url} ({assign(url, owner, run)})."
+
+
+# --- sweep mode: every scheduled workflow, not only the one that just finished ---
+
+DEFAULT_WORKFLOWS_DIR = ".github/workflows"
+
+SWEEP_MODE = "sweep"
+
+# The `state` the workflows API reports when GitHub turned a scheduled workflow off by
+# itself, after 60 days without repository activity. `disabled_manually` is deliberately
+# not here: that switch was flipped on purpose, and reporting it would file the same
+# issue about the same decision on every sweep, forever.
+STOPPED_STATE = "disabled_inactivity"
+
+# `on` is the YAML 1.1 boolean `true`, so a workflow may spell that key any of these
+# ways and GitHub accepts all of them. A file that writes `True:` is not hypothetical --
+# it is what a YAML library emits when it round-trips a workflow.
+_ON_KEY = re.compile(r"^(?:on|\"on\"|'on'|True|true):\s*(.*?)\s*$")
+_NAME_KEY = re.compile(r"^name:\s*(.*?)\s*$")
+_MAPPING_KEY = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*):")
+
+
+def _unquote(value: str) -> str:
+    return value.strip().strip("\"'")
+
+
+def _block_keys(lines: list[str]) -> set[str]:
+    """The mapping keys of one indented block, ignoring anything nested deeper.
+
+    Only keys at the block's *own* indent count, which is what stops `cron:` under
+    `schedule:` from being read as a trigger in its own right.
+    """
+    keys: set[str] = set()
+    depth: int | None = None
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            break
+        if depth is None:
+            depth = indent
+        if indent != depth:
+            continue
+        match = _MAPPING_KEY.match(line.strip())
+        if match:
+            keys.add(match.group(1))
+    return keys
+
+
+def workflow_triggers(text: str) -> set[str]:
+    """The event names under a workflow's `on:`.
+
+    Text parsing rather than PyYAML, for the same reason every hook here is stdlib-only:
+    this runs on the runner's bare Python, before any project install and often instead
+    of one. All three spellings that appear in real workflows are handled -- a block
+    mapping, an inline `[a, b]` list, and a bare `on: push`.
+    """
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        match = _ON_KEY.match(line)
+        if not match:
+            continue
+        inline = match.group(1)
+        if inline.startswith("["):
+            return {_unquote(part) for part in inline.strip("[]").split(",") if part.strip()}
+        if inline and not inline.startswith("#"):
+            return {_unquote(inline)}
+        return _block_keys(lines[index + 1 :])
+    return set()
+
+
+def workflow_title(text: str, fallback: str) -> str:
+    """A workflow's `name:`, or the fallback GitHub itself uses -- the file path.
+
+    The regex is anchored at column 0 so a job's or a step's `name:` cannot win: those
+    are indented, and the first one in a file is usually only a few lines below.
+    """
+    for line in text.splitlines():
+        match = _NAME_KEY.match(line)
+        if match:
+            return _unquote(match.group(1))
+    return fallback
+
+
+def scheduled_workflows(directory: Path) -> list[tuple[str, str]]:
+    """`(file name, title)` for every workflow in `directory` declaring a `schedule:`.
+
+    Sorted, so two sweeps read the same way and a diff between them is about what
+    changed. Anything not `.yml`/`.yaml` is skipped, which is also what excludes the
+    `*.yml.disabled` spelling projects use to park a workflow without deleting it --
+    GitHub does not run those either.
+    """
+    found: list[tuple[str, str]] = []
+    if not directory.is_dir():
+        return found
+    for path in sorted(directory.iterdir()):
+        if path.suffix not in (".yml", ".yaml") or not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if "schedule" not in workflow_triggers(text):
+            continue
+        found.append((path.name, workflow_title(text, path.name)))
+    return found
+
+
+def api_workflow_states(repo: str, run) -> dict[str, str]:
+    """File name -> `state`, for every workflow GitHub knows about in `repo`.
+
+    Keyed by file name rather than by title because a title is what the *file* says and
+    a state is what *GitHub* says -- and the whole point of reading this is the case
+    where those two have come apart.
+    """
+    raw = gh(
+        [
+            "api",
+            "--paginate",
+            f"repos/{repo}/actions/workflows",
+            "--jq",
+            ".workflows[] | [.path, .state] | @tsv",
+        ],
+        run,
+    )
+    states: dict[str, str] = {}
+    for line in raw.splitlines():
+        if "\t" not in line:
+            continue
+        path, state = line.split("\t", 1)
+        states[path.strip().rsplit("/", 1)[-1]] = state.strip()
+    return states
+
+
+def latest_run(repo: str, file_name: str, branch: str, run) -> dict | None:
+    """The most recent run of one workflow on `branch`, or None if it has never run there.
+
+    `exclude_pull_requests` keeps a workflow that is *also* wired to `pull_request` from
+    being judged on a PR's run, and the branch filter is what confines the verdict to the
+    unattended tier -- a scheduled run only ever happens on the default branch.
+    """
+    raw = gh(
+        [
+            "api",
+            f"repos/{repo}/actions/workflows/{file_name}/runs"
+            f"?branch={branch}&per_page=1&exclude_pull_requests=true",
+        ],
+        run,
+    )
+    runs = json.loads(raw or "{}").get("workflow_runs") or []
+    return runs[0] if runs else None
+
+
+def stopped_title(workflow: str) -> str:
+    """The tracker for a workflow that is not running at all.
+
+    A different title from `issue_title` on purpose: "failing" and "not running" are
+    different repairs, and one tracker flipping between them would lose the distinction
+    at exactly the moment the second is true.
+    """
+    return f"{workflow} workflow has stopped running"
+
+
+def stopped_body(workflow: str, repo: str) -> str:
+    return (
+        f"`{workflow}` is still in this repository, but GitHub has **disabled** it -- so "
+        "it is not running on its schedule, and it will report nothing at all, including "
+        "the failures it exists to catch.\n\n"
+        "GitHub disables scheduled workflows in a repository after 60 days without "
+        "activity. Nothing goes red when it happens: the workflow simply stops, and a "
+        "workflow that stopped looks exactly like a workflow that keeps passing.\n\n"
+        "Re-enable it from the Actions tab, or with:\n\n"
+        f"    gh workflow enable {workflow!r} --repo {repo}\n\n"
+        "---\n\n"
+        "Opened by the `sweep` mode of `scripts/report-workflow-failure.py`, which closes "
+        "it again once the workflow is active."
+    )
+
+
+def run_env(info: dict, title: str) -> dict[str, str]:
+    """The event mode's environment block, rebuilt from an API run object.
+
+    So the sweep files issues through `failure_body` and `recovery_comment` rather than
+    growing a second set: two report shapes for one condition is how a reader learns to
+    distrust both.
+    """
+    return {
+        "WORKFLOW": title,
+        "RUN_URL": info.get("html_url") or "(unknown)",
+        "RUN_ATTEMPT": str(info.get("run_attempt") or "(unknown)"),
+        "CONCLUSION": info.get("conclusion") or "(unknown)",
+        "HEAD_BRANCH": info.get("head_branch") or "(unknown)",
+        "HEAD_SHA": info.get("head_sha") or "(unknown)",
+        "TRIGGER": info.get("event") or "(unknown)",
+    }
+
+
+def sweep(env: dict[str, str], run) -> int:
+    repo = env.get("GH_REPO", "").strip()
+    branch = env.get("DEFAULT_BRANCH", "").strip()
+    if not repo or not branch:
+        print("sweep needs GH_REPO and DEFAULT_BRANCH -- refusing to guess.", file=sys.stderr)
+        return 1
+
+    directory = Path(env.get("WORKFLOWS_DIR") or DEFAULT_WORKFLOWS_DIR)
+    scheduled = scheduled_workflows(directory)
+    if not scheduled:
+        print(f"No workflow in {directory} declares a `schedule:` trigger; nothing to sweep.")
+        return 0
+
+    states = api_workflow_states(repo, run)
+    owner = env.get("OWNER", "")
+    # One listing for the whole sweep. Each workflow's title is distinct, so an issue
+    # opened for one cannot be missed when looking up the next; a workflow sharing
+    # another's `name:` would open a duplicate, which is the harmless direction.
+    issues = open_issues(run)
+
+    for file_name, title in scheduled:
+        if states.get(file_name) == STOPPED_STATE:
+            # Hoisted out of the f-string: a line break inside a replacement field is
+            # Python 3.12 syntax, and this file ships to consumers whose ruff still
+            # targets 3.11 -- where it is a lint-time syntax error that refuses the
+            # adopting commit.
+            stopped_outcome = apply(
+                "open",
+                stopped_title(title),
+                issues,
+                body=stopped_body(title, repo),
+                comment=f"`{title}` is still disabled.",
+                owner=owner,
+                run=run,
+            )
+            print(f"{title}: {stopped_outcome}")
+            continue
+
+        # Active again: retire the stopped tracker before judging any run, so a workflow
+        # that was re-enabled and then failed does not carry both issues at once.
+        outcome = apply(
+            "close",
+            stopped_title(title),
+            issues,
+            body="",
+            comment=f"`{title}` is running again, so this is closing itself.",
+            owner=owner,
+            run=run,
+        )
+        if "closed" in outcome:
+            print(f"{title}: re-enabled; {outcome}")
+
+        info = latest_run(repo, file_name, branch, run)
+        if info is None:
+            print(f"{title}: has never run on {branch}; nothing to judge.")
+            continue
+
+        conclusion = (info.get("conclusion") or "").strip()
+        action = decide(conclusion)
+        if action == "ignore":
+            print(f"{title}: last run on {branch} concluded {conclusion!r}; no verdict.")
+            continue
+
+        facts = run_env(info, title)
+        # Same 3.11 constraint as the stopped-workflow print above.
+        verdict_outcome = apply(
+            action,
+            issue_title(title),
+            issues,
+            body=failure_body(facts),
+            comment=recurrence_comment(facts) if action == "open" else recovery_comment(facts),
+            owner=owner,
+            run=run,
+        )
+        print(f"{title}: {verdict_outcome}")
+
+    return 0
+
+
+def report(env: dict[str, str], run) -> int:
     workflow = env.get("WORKFLOW", "").strip()
     if not workflow:
         print("WORKFLOW is empty -- nothing to track.", file=sys.stderr)
@@ -261,6 +594,20 @@ def main(env: dict[str, str] | None = None, run=None) -> int:
     ).strip()
     print(f"{workflow} failed; opened {url} ({assign(url, env.get('OWNER', ''), run)}).")
     return 0
+
+
+def main(env: dict[str, str] | None = None, run=None) -> int:
+    """Dispatch on `MODE`, defaulting to the event-driven report.
+
+    The default matters: a project whose vendored workflow predates the sweep passes no
+    `MODE` at all, and it must keep reporting exactly as it did rather than fail on an
+    unset variable.
+    """
+    env = dict(os.environ) if env is None else env
+    run = subprocess.run if run is None else run
+    if env.get("MODE", "").strip() == SWEEP_MODE:
+        return sweep(env, run)
+    return report(env, run)
 
 
 if __name__ == "__main__":

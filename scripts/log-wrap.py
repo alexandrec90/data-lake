@@ -64,6 +64,18 @@ ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 # Set on the child only when the caller has not, so `FORCE_COLOR=0` still wins.
 COLOR_ENV = {"FORCE_COLOR": "1", "PY_COLORS": "1"}
 
+# Windows only. This wrapper has two kinds of caller and the flag is for the unattended
+# one: a scheduled task runs it under `pythonw.exe`, which has no console, and Windows
+# answers that by allocating a brand new console **window** for every console child. The
+# wrapped command is a console program by definition, so without this the job it wraps
+# announces itself on the desktop -- which is the opposite of unattended.
+#
+# It costs the clicked caller nothing. `stream` pipes stdout and stderr either way, so
+# the child was never writing to a console of its own; what changes is only that Windows
+# stops creating one. The window-less console is inherited by the child's own children,
+# so a wrapped script does not have to know about any of this.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 def split_argv(argv: list[str]) -> tuple[str, list[str]] | None:
     """`(title, command)` from `<title...> -- <command...>`, or None when malformed.
@@ -236,6 +248,7 @@ def stream(command: list[str]) -> tuple[int, str]:
             encoding="utf-8",
             errors="replace",
             env=child_env(),
+            creationflags=NO_WINDOW,
         )
     except FileNotFoundError:
         # Windows cannot CreateProcess a batch launcher (npm, npx, vite) directly --
@@ -250,6 +263,7 @@ def stream(command: list[str]) -> tuple[int, str]:
             errors="replace",
             env=child_env(),
             shell=True,
+            creationflags=NO_WINDOW,
         )
     captured: list[str] = []
     assert process.stdout is not None  # noqa: S101 - PIPE above guarantees it
