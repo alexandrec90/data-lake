@@ -293,13 +293,34 @@ def test_the_nearest_project_wins(tmp_path):
 
 
 def test_a_linked_worktree_counts_as_a_project(tmp_path):
-    """`.git` is a *file* in a linked worktree -- which is exactly what an ephemeral box
-    is -- so requiring a directory would put every box outside every project and
-    silently switch the hook off for all agent work."""
+    """An ephemeral box is a linked worktree, and its files must still be linted.
+
+    The marker it is claimed by is the config, not the `.git` *file* a linked worktree
+    carries in place of a directory: a worktree checks out tracked files, and the ruff
+    config is one of them. Asserted with the `.git` file present so the box shape is the
+    one under test rather than a plain directory that happens to hold a config.
+    """
     box = tmp_path / "box"
     box.mkdir()
     (box / ".git").write_text("gitdir: ../devkit/.git/worktrees/box\n", encoding="utf-8")
+    (box / "ruff.toml").write_text("line-length = 100\n", encoding="utf-8")
     assert lint_fix.project_root_for(box / "x.py").resolve() == box.resolve()
+
+
+def test_a_checkout_that_configures_no_ruff_is_not_a_project(tmp_path):
+    """A repository is not a claim that anyone configured ruff for it.
+
+    `.git` used to be a marker, so every checkout an agent can reach was in scope --
+    including a reference checkout that ships no harness and is exempt from the rest of
+    it. A `.py` file edited there was reformatted in place under ruff's *defaults* and
+    could exit 2 on a finding those defaults could not fix, which is this hook applying
+    rules nobody chose for that tree. Requiring a config file is the whole exemption,
+    and it needs no list of which checkouts are excused.
+    """
+    reference = tmp_path / "reference-checkout"
+    (reference / "src").mkdir(parents=True)
+    (reference / ".git").mkdir()
+    assert lint_fix.project_root_for(reference / "src" / "x.py") is None
 
 
 def test_no_marker_anywhere_above_is_none(tmp_path):

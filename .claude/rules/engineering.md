@@ -47,74 +47,86 @@ logic itself didn't change.
 Instruction files — `CLAUDE.md`, `.claude/rules/*`, `.claude/skills/*` — are covered by
 this same mandate. See `.claude/rules/authoring.md`.
 
-## Claude Code's Bash calls carry an output cap
+## Claude Code's Bash calls: a short blocklist, not a proof obligation
 
-In Claude Code, `scripts/hooks/enforce-capped-bash.py` is a PreToolUse gate: a Bash
-command whose output is not bounded is **blocked**, not trimmed. Route it through the
-wrapper —
+`scripts/hooks/enforce-capped-bash.py` is a PreToolUse gate, and it blocks exactly one
+thing: a statement whose output grows with the **repository** rather than with the
+command you wrote. That list is closed -- `ls`, `cat`, `find`, `tree`, `du`, `env`,
+`git status`, an uncounted `git log`, and a raw `git diff`/`git show`.
+
+**Everything else runs uncapped, and wrapping it is a mistake.** A `grep`, a `python -c`,
+a test run, a `curl`, a heredoc: issue them bare. A session that routes every call through
+the wrapper by reflex pays visible indirection for no second bound, and that has happened
+here at scale -- 42% of one month's Bash calls carried a wrapper they did not need.
+
+Any of three spellings takes a named command off the list:
+
+| Form | Trade |
+| --- | --- |
+| `<cmd> \| head -c N`, `\| tail -c N`, `\| wc -l` | shell-native; **masks the exit code** |
+| `<cmd> > <file>` | strongest bound -- the output never enters your context at all |
+| `python3 scripts/hooks/invoke-capped.py --command "<cmd>"` | keeps a head *and* a tail window, preserves the exit code |
+
+The wrapper runs the command through the platform shell -- **`cmd.exe` on Windows** -- so
+heredocs, single-quoted paths and escaped alternation do not survive it. Pipe into
+`head`/`tail` for those, and prefer it for test and lint runs, where the summary at the
+end is the part worth keeping.
+
+For `ls`, `cat` and `find` the better answer is usually not a cap at all: the Glob, Read
+and Grep tools cost no subprocess, no cap, and page rather than dump.
+
+**The unconditional bound is `BASH_MAX_OUTPUT_LENGTH`**, set in `.claude/settings.json`.
+It truncates bytes that already exist rather than predicting bytes that might, so it
+cannot false-positive and needs no grammar. A project generated before this was added
+should add the `env` entry to its own `settings.json`; that file is not vendored, so
+`sync-devkit.py --pull` will not do it for you.
+
+**Codex never sees this gate.** `scripts/sync-codex-hooks.py` omits it from
+`.codex/hooks.json`, and Codex's shell tool caps captured output before it reaches model
+context. Issue commands there directly -- including the nine.
+
+**This gate used to work the other way round**, and the reversal is worth knowing because
+the old design is the intuitive one. It required every call to *prove* it was bounded and
+blocked whatever it could not recognise -- which means modelling the shell, and 46% of
+every block it ever issued turned out to be its own false positive rather than a command
+anyone needed to change. So if this gate blocks something that is not one of the nine,
+that is a defect in it: **report it with the exact command**, per the feedback-loop
+guardrail at the foot of this file. Never rewrite a correct command to satisfy it.
+
+## Waiting on a CI gate: one blocking call, not a poll loop
+
+When you are asked to wait for a PR gate, the expensive part is not the `gh` command --
+it is that **every poll is a full API round trip that re-sends the whole conversation**.
+Measured over ~16k API calls in the workspace this rule was written for (2026-08): 307
+polling calls burned 36M billed input tokens, ~2.5% of all spend, at an average context
+of 117k tokens per poll. Polls land at the *end* of a session, where context is largest,
+so they are the most expensive place a call can go -- one late poll cost more than five
+whole sessions did.
+
+**Spell the wait as a single call that blocks**, backgrounded so the harness re-invokes
+you when it exits instead of holding a turn open:
 
 ```bash
-python3 scripts/hooks/invoke-capped.py --command "<the command>"
+gh pr checks <N> --watch --fail-fast      # with run_in_background: true
 ```
 
-which keeps a head *and* a tail window and preserves the exit code. Omit
-`--max-bytes`; it defaults to this project's `[bash] max_bytes`.
+`--watch` returns only once every check has settled, so N polls collapse into 1 call plus
+the completion notification. Backgrounding is the half that is easy to drop: a gate
+routinely outruns the Bash tool's ten-minute ceiling, and a foreground `--watch` that
+times out has become a poll loop again with the timeout as its interval.
 
-**Codex is the exception.** Its shell tool already caps captured output before it
-reaches model context, so `scripts/sync-codex-hooks.py` omits this Claude-only gate.
-Issue ordinary Codex shell commands directly; routing them through `invoke-capped.py`
-adds visible indirection without adding another output bound.
+Two things this does **not** condemn, because neither is waste:
 
-**A pipe into `head` or `tail` also counts**, in any of its spellings — `head -c N`,
-`tail -c N`, `head -N`, `tail -N`, and the `-n N` forms — as does redirecting stdout to
-a file, which bounds the output by sending it somewhere that is not your context at all.
-Those run in the harness's own shell rather than `cmd.exe`, so reach for one when the
-command needs POSIX syntax the wrapper would mangle; the cost is that the pipe masks the
-exit code, which is why the wrapper stays the default for test and lint runs.
+- **Diagnosing a failure.** `gh run view --log-failed` and the greps after it are the
+  work itself, not waiting. Where the volume warrants it, send them to a file and read
+  from there.
+- **Asking once.** A single `gh pr checks` is one call and often the right answer. The
+  waste begins at the *second* identical poll and compounds from there.
 
-Learn this here rather than from the gate. Until this paragraph existed, nothing in
-any instruction file mentioned the hook, so **the only way to find out it was running
-was to be blocked by it** — and each block spends a turn plus the ~1 KB of remedy text
-the block message has to carry precisely because it is a first introduction. That is a
-tax on every session, and it is worst in the skills that open with several commands in
-a row.
-
-Two things not to reach for when it fires:
-
-- **`is_capped` is not a style check to satisfy.** Bounded commands are already exempt
-  — `pwd`, `git rev-parse`, `--version` probes, the silent-on-success family
-  (`mkdir`, `rm`, `cp`, `sleep`), condition tests (`test`, `[`), `git log` given a
-  commit count, and shell control flow. If one of those is blocked, that is a defect in
-  the gate worth reporting, not a command to wrap. Report it rather than working around
-  it: over half of every block this gate had issued turned out to be one of four cap
-  spellings it simply did not recognise, and it stayed that way because being blocked
-  reads as a rule to obey rather than as a bug.
-- **`git commit` and `gh pr create` are exempt, and wrapping them anyway breaks them.**
-  Their message is authored, multi-line, and does not survive the wrapper's `cmd.exe`;
-  the `| head -c N` fallback masks the exit code, so a commit a pre-commit hook
-  rejected reads as a success. Issue those two bare.
-
-  **Put the message in a file whenever it is multi-line or contains backticks:**
-
-  ```bash
-  git commit -F <path>            # bare, not through the wrapper
-  gh pr create --body-file <path>
-  ```
-
-  Backticks are why, and the gate is right to insist. A backtick inside a
-  double-quoted `-m` is command substitution in any POSIX shell — the shell runs what
-  is between the backticks — so that spelling is blocked, while the same message in
-  single quotes is allowed. Commit messages here are prose *about code* and are
-  therefore full of backticked identifiers, which makes the blocked spelling the common
-  one rather than the exception. `-F` sidesteps quoting entirely.
-
-  Note what is **not** the problem: `-F -` with a heredoc passes the gate. It fails
-  later, on `cmd.exe`, and only if you route it through the wrapper. A file is the one
-  spelling that works in both places.
-- **`ls`, `cat` and `git status` are exempt on purpose — they are not.** Their output
-  grows with the tree, and the answer for them is the Read/Glob/Grep tools, which cost
-  no subprocess and no cap. Reach for the wrapper for test and lint runs, where the
-  summary at the end is the part worth keeping.
+When the gate will outlast anything useful you could do meanwhile, the cheapest correct
+move is to stop: report that the branch is pushed and the gate is running, and let the
+result arrive in a fresh session. The same report costs the session floor there, against
+six times as much at the tail of a long one.
 
 ## Scripts
 

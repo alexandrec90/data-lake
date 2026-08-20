@@ -1,98 +1,59 @@
 #!/usr/bin/env python3
-"""PreToolUse hook: blocks shell calls that lack an output byte-cap wrapper.
+"""PreToolUse hook: blocks the few shell commands whose output scales with the tree.
 
-An agent's context is the scarce resource, and one `ls -R` or unfiltered test run
-can spend a large slice of it on output nobody reads. This hook makes the cap
-mandatory rather than remembered: an uncapped Bash call is blocked with exit 2 and
-the reason is fed back into the turn, so the agent re-issues it wrapped.
+This gate used to work the other way round, and the inversion is the whole content of
+this file. It required every Bash call to *prove* it was bounded -- through the wrapper,
+a `head`/`tail` cap, a redirect, or membership in a growing list of exempt shapes -- and
+blocked everything it could not recognise. Recognising bounded shell is not a small
+problem: it is most of a shell parser plus a model of what every command prints, and the
+exempt tier grew to twenty-five regexes covering heredocs, brace groups, `case` arms,
+loop keywords, env-assignment prefixes, `git` global options, and the difference between
+a backtick inside single quotes and one inside double quotes.
 
-Claude's source configuration is Bash-native. The Codex hook generator adds
-``--shell powershell`` to its Windows override, which keeps this one policy while
-judging the syntax of the shell that will actually execute the command.
+It did not converge, and the transcripts say so rather than an opinion. Of the 305 blocks
+recoverable from this workspace's sessions, **139 -- 46% -- are allowed by the very next
+version of the gate**: they were not commands anyone needed to rewrite, they were this
+file's own bugs. Fourteen of its eighteen commits are titled some variant of "stop the
+gate blocking X". Each of those cost a turn plus the ~1 KB of remedy prose the block
+message had to carry, and the remedy was often one the shape could not take -- a heredoc,
+a loop and a brace group all fail to survive the wrapper's `cmd.exe`.
 
-Two forms pass, and **they do not run in the same shell** -- the block message says
-so, because that difference is the most common way the wrapper surprises a caller:
+A fix here also reaches a consuming project only when someone runs `sync-devkit.py
+--pull`, so a false positive keeps being *re*-reported for as long as the vendored copies
+lag. The report that prompted this rewrite was a `sed -n '1,30p'` block that had already
+been fixed upstream the day before.
 
-| Form | Shell | Exit code |
-| --- | --- | --- |
-| `invoke-capped.py --command "..."` | `/bin/sh`; **`cmd.exe` on Windows** | preserved |
-| `<command> \\| head -c N` | whatever the harness gives Bash | **masked** (`head`'s) |
+So the policy is now stated in the direction that is decidable. **Everything is allowed
+except a short list of commands whose output grows with the repository** -- `ls`, `cat`,
+`find`, `tree`, `du`, `env`, `git status`, an uncounted `git log`, and a raw
+`git diff`/`git show`. Those nine were 68 of the 166 blocks that were the old gate working
+as designed, which is to say that nearly everything it was ever right about, it was right
+about for one of nine reasons. The list is closed by policy: a command earns a place on it
+by being observed to flood a session, not by being suspected of it.
 
-The second row is a family, not one spelling, and reading it as one spelling was this
-gate's most expensive mistake. `tail -c N` is the same byte bound from the other end;
-`head -N` and `tail -N` are line bounds; a `> file` redirect is a bound too, and the
-strongest one, since the output never reaches the agent at all. Only `head -c N` was
-recognised for a long time, and the cost is measurable rather than theoretical --
-across this workspace's transcripts, **a little over half of every block this hook has
-ever issued was one of the other three**. `CAP_RE` and `REDIRECT_RE` carry the details
-and the one deliberate weakening (a line bound does not bound line length).
+What this gives up is real and worth naming: an unknown command that prints a megabyte is
+now allowed through. Two things carry that case instead of a block.
 
-**Every statement must be capped, not just one.** The check used to be a single
-`re.search` over the whole command string, so one capped segment laundered the rest:
-`find / -name x; echo done | head -c 10` matched the `head -c` and passed completely
-uncapped. The command is now split on top-level `;`, `&&`, `||` and newlines --
-quote-aware, so a separator inside `invoke-capped.py --command "a; b"` is not one --
-and each statement has to carry its own cap. Within a *pipeline* a cap anywhere
-suffices: everything downstream of `head -c N` can only receive N bytes.
+  * `BASH_MAX_OUTPUT_LENGTH` in `.claude/settings.json` is a native, unconditional bound
+    on every Bash result. It needs no grammar and cannot false-positive, because it
+    truncates bytes that already exist rather than predicting bytes that might.
+  * `invoke-capped.py` is still here and still the right tool for a test or lint run,
+    where a head *and* a tail window beats truncation from one end. It is now a thing to
+    reach for rather than a thing to be blocked into.
 
-**Commands whose output is bounded by a small constant are exempt** (`BOUNDED_COMMANDS`):
-`pwd`, `git rev-parse`, `rm`, `X --version` and friends. The criterion is deliberately
-strict -- bounded *regardless of repo or filesystem size* -- which is why `ls`, `cat` and
-`git status` are absent despite being the commands most often blocked. Their output scales
-with the tree, and the right answer for them is the Read/Glob/Grep tools, which is what
-the block message says.
+Failing **open** is therefore the design and not a gap in it. A blocklist that cannot
+parse a statement allows it, and the backstop above bounds the cost; the allow-list this
+replaced failed *closed* on everything it could not parse, which is precisely how a gate
+arrives at a 46% false-positive rate.
 
-**Three shapes used to be blocked that this gate was never meant to catch**, and each
-was worse than an ordinary false positive because the remedy the block message offers
-does not resolve any of them:
+Two pieces of the old parser are kept, because both prevent a block rather than cause one.
+`split_top_level` still drops heredoc bodies and comments -- otherwise a commit message
+mentioning `cat` is read as a command -- and it still holds a `{ ...; }` group together,
+so the cap in `{ pwd; cat big; } | head -c N` is seen to bind the `cat` inside it.
 
-  - *Shell control flow.* `statements()` splits on `;` and newlines, so a loop arrives
-    here shredded into fragments -- `do`, `done`, `fi` -- which can never carry a cap
-    and match no bounded command. Every loop and conditional was therefore blocked
-    unconditionally, and wrapping one is not an option: the wrapper runs through
-    `cmd.exe` on Windows, where bash loop syntax is a parse error. Control keywords are
-    now bounded on their own, and a keyword that introduces a command is peeled off so
-    the command behind it is judged instead (`do ls -R /` is still blocked, on the `ls`).
-
-    That fix was written against one spelling of a loop and left four neighbours of it
-    blocked, each with the same non-remedy on offer. A `!` between the keyword and the
-    condition (`until ! [ -f x ]`, `while ! test -f x`) inverts an exit code and prints
-    nothing, so it peels like any other keyword. A redirection *after* `done` binds the
-    loop's stdin or stderr rather than emitting anything, so `done < /dev/null` and
-    `done 2>/dev/null` are bounded exactly as bare `done` is. A trailing `# comment` is
-    not a command at all, and `split_top_level` now drops one -- to end of line, and
-    only where a shell would, which is also why the `;` in `pwd # a; ls -R /` stays
-    inside the comment instead of starting a statement. And a `case` arm arrives as
-    `case $x in a) pwd`: a header and a pattern in front of a command, and both peel.
-
-    The fifth neighbour was a header whose word list comes from a substitution --
-    `for f in $(git diff --name-only)` -- vetoed as unknowable output before the
-    control-flow check ever ran, though the substitution feeds the loop variable and
-    never the terminal. Control shapes are now judged before the veto, next to the
-    condition tests that moved there for the same reason; the loop's *body* still
-    arrives as its own statements and is judged on its own merits.
-  - *Heredoc bodies.* Splitting on newlines turned every line of a `git commit -F -
-    <<'EOF'` message into its own "statement", so the prose was evaluated as commands.
-    `split_top_level` now consumes the body between the operator and its terminator.
-  - *`rm`, `cp`, `mv`, `git add`.* Silent on success, exactly like the `mkdir`/`touch`
-    already exempt, and simply omitted. A setup chain -- `cd x && rm -rf out && mkdir
-    out && <capped run>` -- was blocked by the `rm` alone, and there is no way to cap a
-    command that prints nothing. `git add` is the same omission found later and from the
-    other end: it blocked the staging step of every commit, and the heredoc carrying the
-    message cannot go through the wrapper either.
-
-**And the commit itself, which that fix stopped one command short of** (`COMMIT_LIKE`).
-Exempting `git add` made the staging step legal and left `git commit` blocked, so every
-commit still cost a block message -- the single most repeated Bash call in the harness,
-in a flow (`/ship`) that runs it once per task.
-
-The cap size comes from `[bash]` in `.devkit.toml` (see `harness_config.py`),
-so a project can widen it without forking this file -- and the number quoted in the
-block message follows it, rather than drifting from what the wrapper actually does.
-
-Decision logic is exposed as pure functions (`decide`, `is_capped`, `statements`,
-`is_bounded`, `get_value`) so it can be unit-tested without spawning a subprocess. See
-`scripts/hooks/tests/test_enforce_capped_bash.py`.
+Decision logic is exposed as pure functions (`decide`, `offenders`, `noisy_reason`,
+`has_cap`, `statements`, `get_value`) so it can be unit-tested without spawning a
+subprocess. See `scripts/hooks/tests/test_enforce_capped_bash.py`.
 """
 
 from __future__ import annotations
@@ -117,367 +78,141 @@ CFG = harness_config.load(REPO_ROOT)
 # MUST write its reason to stderr.
 EXIT_BLOCK = 2
 
-# The vendored wrapper's path is fixed by the MANIFEST, so it is safe to match
-# literally; `head`/`tail` are the shell-native escape hatch for cases cmd.exe mangles.
+# The vendored wrapper's path is fixed by the MANIFEST, so it is safe to match literally.
 WRAPPER_RE = re.compile(r"scripts/hooks/invoke-capped\.py")
 
-# What counts as a cap on a pipeline segment. Four spellings, and for a long time only
-# the first passed -- which made this gate's single largest source of false positives
-# the very escape hatch its own block message recommends. Measured over the workspace's
-# transcripts, `head`/`tail` shapes were 40% of every block this hook has ever issued.
-#
-#   * `head -c N` -- the original, and the only one that used to pass.
-#   * `tail -c N` -- the identical byte bound, taken from the other end. Blocking it was
-#     a plain oversight, and a self-contradictory one: the block message tells the agent
-#     to keep the tail on a test or lint run because the summary at the end "is the part
-#     you actually need", and then blocked `pytest ... | tail -c 2500` for doing it.
-#   * `head -N` / `head -n N`, and the same two for `tail` -- a *line* bound rather than
-#     a byte bound. Weaker, and admitted deliberately. A line count is still bounded
-#     regardless of repo or filesystem size, which is this file's stated criterion, and
-#     it is the same bound the Read tool applies. What it does not bound is line
-#     *length*, so a 50-line cap on minified output can still be large. That residual is
-#     worth one certain turn saved per call, and the rewrite the block forced instead
-#     (`head -c`) truncates mid-line, which is strictly worse to read.
-#
-# `tail -n +5` is excluded on purpose -- "from line 5 to the end" is not a bound at all
-# -- and so is `tail -f`, which does not terminate. Both fall out of requiring a leading
-# `-` on the count rather than accepting any digits.
-CAP_RE = re.compile(r"^(?:head|tail)\s+(?:-c\s*\d+|-n\s*\d+|-\d+)(?=\s|$)")
+# What counts as a cap on a pipeline segment. Under an allow-list every missing spelling
+# here was a false positive, and finding them all took four commits; under a blocklist a
+# missing spelling only matters for the nine commands below, and `wc` joins the list for
+# free -- it consumes a stream and answers with three integers.
+CAP_RE = re.compile(r"^(?:head|tail)\s+(?:-c\s*\d+|-n\s*\d+|-\d+)(?=\s|$)|^wc(?:\s|$)")
 
-# Codex uses PowerShell on Windows. These are the native equivalents of the Bash
-# caps and bounded commands above. They stay separate rather than being mixed into
-# the Bash grammar: a token such as `Select-Object` has no output-bound meaning in
-# Bash, while `head -c` is not a PowerShell-native pipeline stage.
-POWERSHELL_SELECT_CAP_RE = re.compile(
-    r"^Select-Object\s+-(?:First|Last)\s+\d+(?=\s|$)", re.IGNORECASE
-)
-POWERSHELL_OUT_NULL_RE = re.compile(r"^Out-Null(?:\s|$)", re.IGNORECASE)
-POWERSHELL_ASSIGNMENT_RE = re.compile(r"^\$[A-Za-z_][\w:]*\s*=")
-POWERSHELL_SILENT_RE = re.compile(
-    r"^(?:Start-Sleep|Remove-Item|Copy-Item|Move-Item|Set-Content|Add-Content|"
-    r"Clear-Content|New-ItemProperty|Set-ItemProperty|Remove-ItemProperty)(?:\s|$)",
-    re.IGNORECASE,
-)
-POWERSHELL_FIXED_RE = re.compile(r"^(?:Test-Path)(?:\s|$)", re.IGNORECASE)
-POWERSHELL_CONTENT_CAP_RE = re.compile(
-    r"^Get-Content\b.*\s-(?:TotalCount|Tail)\s+\d+(?=\s|$)", re.IGNORECASE
-)
-POWERSHELL_GET_ITEM_RE = re.compile(r"^Get-Item(?:\s|$)", re.IGNORECASE)
-POWERSHELL_GET_ITEM_PROPERTY_RE = re.compile(
-    r"^\(\s*Get-Item\b.*\)\.[A-Za-z_]\w*\s*$", re.IGNORECASE
-)
-POWERSHELL_LENGTH_GUARD_RE = re.compile(
-    r"^if\s*\(\s*(?P<value>\$[A-Za-z_]\w*)\.Length\s+-gt\s+(?P<count>\d+)\s*\)"
-    r"\s*\{\s*(?P=value)\.Substring\(\s*0\s*,\s*(?P=count)\s*\)\s*\}"
-    r"\s*else\s*\{\s*(?P=value)\s*\}\s*$",
-    re.IGNORECASE | re.DOTALL,
-)
-
-# Redirection of stdout to a file, which bounds a statement by sending its output
-# somewhere that is not the agent's context at all -- the strongest bound there is.
-# `gh run view --log > <file>` was blocked despite printing nothing, and the remedy on
-# offer (cap the output) caps a stream that was never going to arrive.
-#
-# Written to match only a redirect of *stdout*: `2>&1` and `>&2` are file-descriptor
-# duplications and must not count, which is what the leading `(?:^|\s)` and the
-# `(?![>&])` do -- the first refuses a preceding fd digit, the second refuses `>&`.
-# `1>` and `&>` are spelled out because both do redirect stdout.
-#
-# What this deliberately does not bound is stderr, which still reaches the terminal. A
-# command noisy enough on stderr to matter is rare, and the same latitude is already
-# extended to every entry in `SILENT_ON_SUCCESS`.
+# Redirection of stdout to a file bounds a statement by sending its output somewhere that
+# is not the agent's context at all. Matches only *stdout*: `2>&1` and `>&2` duplicate a
+# descriptor and must not count, which is what the leading `(?:^|\s)` and the `(?![>&])`
+# do. `1>` and `&>` are spelled out because both do redirect stdout.
 REDIRECT_RE = re.compile(r"(?:^|\s)(?:1|&)?>>?\s*(?![>&])\S")
 
-# Statement separators, longest first so `&&` is never read as a bare `&`. A single
-# `&` is absent on purpose: backgrounding a command does not bound its output.
+# Statement separators, longest first so `&&` is never read as a bare `&`.
 STATEMENT_SEPARATORS = ("&&", "||", ";", "\n")
 
-# Command substitution makes any output claim void -- `echo $(find / -name x)` prints
-# whatever the substitution found -- so a statement containing one is never bounded.
-SUBSTITUTION_RE = re.compile(r"\$\(|`")
+# Quoted spans, blanked before flags are read. Without this the *message* decides:
+# `git commit -m "drop the --stat flag"` reads as carrying `--stat`.
+QUOTED_SPAN_RE = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"", re.DOTALL)
 
-# ...but only where the shell would actually expand it. Inside single quotes it would
-# not, and the difference is not academic: a commit message is prose, and prose about
-# this codebase is full of backticked identifiers. `git commit -m 'fix `foo`'` was
-# blocked as command substitution -- by its own subject, with a block message that
-# names no cause the author could act on.
+# A heredoc's body is data, not commands. Without this the `\n` split turns every line of
+# a commit message into a "statement", and a message that mentions `cat` blocks the commit.
 #
-# Double-quoted spans are deliberately left alone, because `$(...)` and backticks DO
-# expand inside them. That is the whole distinction, and it is the shell's, not ours.
-SINGLE_QUOTED_SPAN_RE = re.compile(r"'[^']*'", re.DOTALL)
+# This pattern does NOT rule out `<<<` on its own: it fails at the first `<` of a
+# here-string, the scan advances one character, and `<<'text'` then matches perfectly as a
+# heredoc named `text` -- swallowing every statement after it. `split_top_level` consumes
+# `<<<` whole before reaching here, which is the only reliable place for that distinction.
+HEREDOC_RE = re.compile(r"<<-?\s*(?P<quote>['\"]?)(?P<word>[A-Za-z_][\w.-]*)(?P=quote)")
 
-# `-v` / `--verbose` turns every silent-on-success command into per-file output that
-# scales with the tree: `rm -rv big/` and `mkdir -pv a/b/c` both print a line per entry.
-# Disqualifying the flag is cheaper and more honest than a per-command list of which
-# ones grew one, and it closes the same hole for the entries that were already exempt.
-#
-# Bundled short flags are matched (`-rv`, `-pv`), because that is how anyone actually
-# writes it -- requiring a standalone `-v` would have let the exact examples above
-# through. It is scoped to `SILENT_ON_SUCCESS` for the mirror-image reason: `-v` means
-# *version* to about as many commands as it means verbose, and an unscoped rule revoked
-# the long-standing `command -v gh` exemption.
-VERBOSE_FLAG_RE = re.compile(r"(?:^|\s)(?:-[A-Za-z]*v[A-Za-z]*|--verbose)(?=\s|$)")
+# Prefixes that emit nothing themselves and hand the terminal to the command behind them:
+# loop and conditional keywords, a `!` inverting an exit code, an env-assignment prefix,
+# and a `case` header with its pattern arm. Peeling them is what keeps `do cat big` and
+# `FOO=1 ls -R /` blocked. Under the old allow-list a missed peel was a false positive;
+# here it is a miss in the other direction, which the module docstring accepts by design.
+CONTROL_PREFIX_RE = re.compile(r"^(?:do|then|else|elif|if|while|until|\{|\(|!)\s+")
+ENV_ASSIGNMENT_PREFIX_RE = re.compile(r"^[A-Za-z_]\w*=(?:'[^']*'|\"(?:\\.|[^\"\\])*\"|\S*)\s+")
+CASE_HEADER_RE = re.compile(r"^case\s+\S+\s+in\s+")
 
-# Global options that sit between `git` and its subcommand, so the two git exemptions
-# below survive `git -C <path> add` as well as `git add`.
-#
-# That spelling is not exotic here -- it is what the workspace's own ephemeral-box flow
-# produces, because the box is never the session's working directory and `git -C <box>`
-# is the natural way to reach it. Without this the exemption silently did not apply, and
-# the failure is a bad one to leave standing: the block message *promises* the commit
-# pair is exempt, so being blocked on a commit reads as the gate being broken rather
-# than as the `-C` being the thing it did not recognise.
-#
-# `-c` and `-C` take a following value, which may be a quoted path with spaces; the
-# valued long forms (`--git-dir=`, `--work-tree=`) attach theirs with `=` and are
-# covered by the bare `--\S+` arm. None of this weakens the disqualifiers: they are
-# `search`es over the whole statement, so a flag cannot hide in the option position.
+# A brace group or subshell that is the *whole* statement, so its members can be judged
+# individually. Only reached when nothing binds the group -- a cap or a redirect written
+# after the closer is `has_cap`'s business, and it looks first. Anchoring at both ends is
+# what keeps `(a) b` and `${HOME}` out of it.
+GROUP_BODY_RE = re.compile(r"^[({]\s*(?P<body>.*?)\s*[)}]\s*$", re.DOTALL)
+CASE_ARM_RE = re.compile(r"""^[^()&|;'"]+(?:\|[^()&|;'"]+)*\)\s+""")
+
+# Global options between `git` and its subcommand, so the git entries below survive
+# `git -C <path> status` as well as `git status`. That spelling is the workspace's own:
+# an ephemeral box is never the session's working directory.
 _GIT_GLOBAL_OPTS = r"""(?:\s+(?:-[cC]\s+(?:"[^"]*"|'[^']*'|\S+)|--\S+))*"""
 
-# Commands with no output path at all when they succeed. Named rather than inlined into
-# `BOUNDED_COMMANDS` because `VERBOSE_FLAG_RE` has to be scoped to exactly this family.
+# The closed list. Each entry is a command observed to flood a session, paired with the
+# remedy that actually applies to it -- a block message that names one command and one
+# alternative is a fraction of the size of the general-purpose essay the allow-list had to
+# print, because it no longer has to explain a policy the agent has not violated.
 #
-# `git add` is here for the same reason `rm` and `cp` are, and was found the same way:
-# it prints nothing on success, so there is no output to cap and no legal spelling of
-# the command that satisfies the gate. It blocked the staging step of every commit --
-# `git add -A && git commit -F - <<'EOF' ... ` fails on the `git add` alone, and the
-# heredoc that follows cannot be handed to the wrapper either.
-#
-# `sleep` joins them for the same reason and was found the same way: a poll loop splits
-# into `until <test>` / `do sleep 2` / `done`, and once the control keywords became
-# bounded the `sleep` was the last fragment in the line still able to block it.
-#
-# `set`, `shopt`, `trap`, `kill` and `read` were the fragments still able to block it
-# after that. They are shell *bookkeeping* -- they change an option, arm a handler,
-# signal a pid, consume a line of stdin -- and none of them has an output path when it
-# succeeds. `set -euo pipefail` heads a poll loop about as often as the loop keyword
-# does, and it was blocked by itself. Each still requires an argument, which is not
-# incidental: bare `set` dumps every shell variable and function, so the `\s` is the
-# only thing between that spelling and an exemption it must never have.
-#
-# The three git subcommands beside `add` move a checkout around and answer with a fixed
-# confirmation -- "Switched to branch 'x'", or nothing. Bounded by a small constant, not
-# by the tree, which is the membership test.
-SILENT_ON_SUCCESS = re.compile(
-    r"(?:cd|export|unset|mkdir|rmdir|touch|rm|cp|mv|ln|chmod|sleep"
-    r"|set|shopt|trap|kill|read|git" + _GIT_GLOBAL_OPTS + r"\s+(?:add|checkout|switch|restore))\s"
+# `grep`, `rg`, `sed`, `awk` and `python -c` are deliberately absent although each can
+# print without limit. Their output is bounded by an argument the caller chose rather than
+# by the tree, they were 35 of the old gate's blocks with no flood among them, and every
+# one of them has a legitimate quiet spelling the gate would have to learn. That is the
+# allow-list's failure mode in miniature, and the native output cap covers the tail risk.
+NOISY_COMMANDS = (
+    (re.compile(r"ls(?:\s|$)"), "`ls` grows with the directory -- prefer the Glob tool"),
+    (re.compile(r"cat\s"), "`cat` prints a whole file -- prefer the Read tool, which pages"),
+    (re.compile(r"(?:find|tree)\s"), "`find`/`tree` walk the tree -- prefer the Glob tool"),
+    (re.compile(r"du(?:\s|$)"), "`du` walks the tree"),
+    (re.compile(r"(?:env|printenv)(?:\s|$)"), "`env` prints the whole environment"),
+    (
+        re.compile(r"git" + _GIT_GLOBAL_OPTS + r"\s+status(?:\s|$)"),
+        "`git status` grows with the working tree",
+    ),
 )
 
-# The same commands in their argument-less spellings, which are legal shell and equally
-# silent: `cd` goes home, `wait` blocks on the background jobs, `read` consumes a line,
-# `:` does nothing at all. Kept apart from `SILENT_ON_SUCCESS` rather than relaxing its
-# trailing `\s`, because for `set` and `trap` the bare form is the one that *prints* --
-# a lone `set` is `env` for shell variables, and relaxing the two families together
-# would have exempted it.
-BARE_NO_OUTPUT_RE = re.compile(r"(?::|cd|wait|read)\s*$")
-
-# `grep -q` is the other half of a readiness poll -- `until grep -q ready logs/x.log` is
-# the shape, and it is the natural spelling once the thing being waited for is a line in
-# a file rather than the file itself. `-q` means *print nothing and answer in the exit
-# code*, so it is bounded for the same reason `test` is, and by a stronger constant than
-# anything else in this file: zero bytes. Without it the loop keyword being exempt bought
-# nothing, since the condition it introduces was still blocked.
-#
-# The flag is looked for outside quoted spans, so a `-q` inside the pattern is not read
-# as one, and a pipeline counts as quiet when its *last* stage is: everything upstream
-# of `| grep -q x` can only reach `grep`, exactly as for a `head -c` cap.
-GREP_RE = re.compile(r"(?:e|f|r)?grep(?:\s|$)")
-QUIET_FLAG_RE = re.compile(r"(?:^|\s)(?:-[A-Za-z]*q[A-Za-z]*|--quiet|--silent)(?=\s|$)")
-
-# `git log` is bounded exactly when it is told how many commits to print, which is how
-# it is almost always spelled here (`git log --oneline -5`). Bare `git log` scales with
-# history and stays blocked, and so does a counted log asked for patches -- one commit's
-# diff has no bound at all, so `-p` revokes the exemption the count would have earned.
+# `git log` is bounded exactly when it is told how many commits to print, and a counted log
+# asked for patches is not: one commit's diff has no bound, so `-p` revokes what the count
+# earned.
 GIT_LOG_RE = re.compile(r"git" + _GIT_GLOBAL_OPTS + r"\s+log(?:\s|$)")
 GIT_LOG_COUNT_RE = re.compile(r"(?:^|\s)(?:-\d+|-n\s*\d+|--max-count(?:=|\s+)\d+)(?=\s|$)")
 GIT_LOG_PATCH_RE = re.compile(r"(?:^|\s)(?:-p|-u|--patch)(?=\s|$)")
 
-# Condition tests, pulled out of `_BOUNDED_PATTERNS` because they have to be judged
-# *before* the command-substitution veto rather than after it. `test`, `[` and `[[`
-# have no stdout path at all, so a substitution inside one feeds the condition and
-# never the terminal: `until [ "$(docker inspect --format ... )" = healthy ]` is the
-# shape, it is how every readiness poll in this workspace is written, and the veto
-# blocked all of them on output that does not exist.
-NO_STDOUT_RE = re.compile(r"(?:test|\[\[?)\s")
-
-# Commands that carry an authored message and answer with a fixed-shape summary. They
-# are exempt for a stronger reason than the silent-on-success family above: there is no
-# spelling of them this gate would accept.
-#
-#   * The message is multi-line -- a heredoc, a `"..."` spanning newlines, or PowerShell's
-#     `@'...'@` -- and none of those survive the wrapper's `cmd.exe`.
-#   * So the only remaining escape is `| head -c N`, which **masks the exit code**. On a
-#     commit that is actively dangerous: a commit rejected by a pre-commit hook reports
-#     success, and the agent ships a branch with nothing on it. The vendored suite's own
-#     example of a "legal" commit (`test_git_add_before_a_heredoc_commit_is_allowed`)
-#     pipes through `head -c 500` and would swallow exactly that.
-#
-# What they print is bounded by the *change*, not by the tree: a header line, one stat
-# line, and a `create mode` line per newly added path for a commit; a single URL for
-# `gh pr create`. That is the same criterion that keeps `ls` and `git status` out.
-#
-# `gh pr edit` and `gh pr comment` are the same command wearing a later timestamp -- an
-# authored `--body-file`, one URL back -- and were left out only because `create` was
-# the one spelling in front of whoever wrote this. Correcting a PR body it had just
-# written is where the omission surfaced. `gh pr view` is deliberately NOT here: it
-# *prints* the body rather than supplying one, and a long PR description is exactly the
-# unbounded output this gate is for.
-COMMIT_LIKE = re.compile(
-    r"(?:git" + _GIT_GLOBAL_OPTS + r"\s+commit|gh\s+pr\s+(?:create|edit|comment))(?:\s|$)"
+# A raw diff is the largest single thing a repository can hand back, and `git show <sha>:
+# <path>` is `cat` wearing a git prefix. The summary flags are the spellings whose output
+# is bounded by the *change* rather than by the tree, and they are exempt: `--name-only`
+# heads most scripted uses here and blocking it would rebuild the false-positive tier one
+# flag at a time.
+GIT_DIFF_RE = re.compile(r"git" + _GIT_GLOBAL_OPTS + r"\s+(?:diff|show)(?:\s|$)")
+GIT_DIFF_SUMMARY_RE = re.compile(
+    r"(?:^|\s)--(?:stat|shortstat|numstat|name-only|name-status|quiet|exit-code)(?=[\s=]|$)"
 )
 
-# The two spellings of `git commit` that are `git status` wearing a different name:
-# `--dry-run` (with its `--short`/`--porcelain`/`--long` output modes) lists every
-# untracked path, and `-v` appends the full staged diff. `VERBOSE_FLAG_RE` covers `-v`.
-COMMIT_LIKE_DISQUALIFIERS = re.compile(r"(?:^|\s)--(?:dry-run|short|porcelain|long)(?=\s|$)")
-
-# Quoted spans, removed before those flags are looked for. Without this the *message*
-# decides: `git commit -m "Add a --verbose flag"` reads as a verbose commit and is
-# blocked, which is a false positive triggered by prose and impossible to diagnose from
-# the block message. Flags live outside the quotes; the message is entirely inside them.
-QUOTED_SPAN_RE = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"", re.DOTALL)
-
-# A heredoc's body is data, not commands. Without this the `\n` split turns every line
-# of a commit message into a "statement" that is neither bounded nor cappable, so the
-# whole call is blocked -- and a heredoc cannot be handed to the wrapper either, because
-# it does not survive `cmd.exe`.
-#
-# This pattern does NOT rule out `<<<` on its own, and assuming it did was a bug worth
-# recording: it fails at the first `<` of a here-string, the scan advances one character,
-# and then `<<'text'` matches perfectly as a heredoc named `text` -- swallowing every
-# statement that followed. `split_top_level` consumes `<<<` whole before ever reaching
-# here, which is the only reliable place to make that distinction.
-HEREDOC_RE = re.compile(r"<<-?\s*(?P<quote>['\"]?)(?P<word>[A-Za-z_][\w.-]*)(?P=quote)")
-
-# Shell control flow produces no output of its own. Three shapes, because they need
-# different treatment:
-#   * CONTROL_ONLY -- the whole statement is a keyword (`done`, `fi`). Bounded.
-#   * CONTROL_HEADER -- a `for`/`case` header, whose word list is data. Bounded.
-#   * CONTROL_PREFIX -- a keyword introducing a command (`do ls -R /`). Peeled off, and
-#     the command behind it is judged on its own merits, so the `ls` still blocks.
-#
-# CONTROL_ONLY carries an optional tail of redirections, because a loop's redirections
-# attach to its `done`: `while read -r l; do echo $l; done < paths.txt` is how the
-# construct is spelled, and the fragment that reached here was `done < paths.txt`. A
-# `<` moves stdin and `2>` moves stderr, so neither is covered by `REDIRECT_RE` -- which
-# is right, since neither *bounds* anything, but they do not emit anything either and the
-# keyword they trail is already bounded.
-#
-# `!` is a CONTROL_PREFIX for the same reason `until` is: it inverts the exit status of
-# what follows and contributes no output of its own. `until ! [ -f x ]` and `if ! test
-# -f x` are ordinary spellings of a poll and a guard, and both were blocked on the `!`
-# alone -- the peel loop stopped at it, so the condition behind it was never judged.
-#
-# CONTROL_ONLY and CONTROL_HEADER are consulted in `is_bounded` *before* the
-# command-substitution veto, and that placement is load-bearing rather than incidental.
-# Tested after it, as they were, the exemption was unreachable for any header carrying a
-# `$(` or a backtick -- so `for i in $(seq 1 60)` blocked while `while true` passed, for
-# two loops doing the same job. See `is_bounded`'s docstring for why a header's
-# substitution is not output.
-CONTROL_ONLY_RE = re.compile(
-    r"(?:do|done|then|else|elif|fi|esac|;;|\{|\}|\(|\))(?:\s+\d*[<>]{1,2}&?\s*\S+)*\s*$"
+# PowerShell equivalents, for the Codex override that passes `--shell powershell`. They
+# stay separate rather than being folded into the Bash grammar: `Select-Object` has no
+# output-bound meaning in Bash, and `head -c` is not a PowerShell pipeline stage.
+POWERSHELL_CAP_RE = re.compile(
+    r"^(?:Select-Object\s+-(?:First|Last)\s+\d+|Out-Null|Measure-Object)(?=\s|$)", re.IGNORECASE
 )
-CONTROL_HEADER_RE = re.compile(r"(?:for\s+\w+(?:\s+in\b.*)?|case\s+.*\sin)\s*$")
-CONTROL_PREFIX_RE = re.compile(r"^(?:do|then|else|elif|if|while|until|\{|!)\s+")
-
-# An environment-assignment prefix (`VAR=1 git commit ...`) sets a variable for one
-# command and emits nothing; the command behind it decides. It peels like a control
-# keyword, and was found the same way: `DEVKIT_SKIP_BRANCH_POLICY=1 git commit -F m` is
-# the branch policy's own documented bypass, the commit pair is exempt, and the prefix
-# broke the match -- so this gate blocked the exact spelling another gate's error
-# message tells the agent to type. Quoted values are consumed whole so a space inside
-# one is not a word boundary, and the exemptions stay intact behind it (`FOO=bar ls -R /`
-# still blocks, on the `ls`). A substitution in the value peels away with the prefix --
-# it feeds the variable, never the terminal, so the command behind it decides, the same
-# reasoning that exempts a substitution in a control-flow header.
-ENV_ASSIGNMENT_PREFIX_RE = re.compile(r"^[A-Za-z_]\w*=(?:'[^']*'|\"(?:\\.|[^\"\\])*\"|\S*)\s+")
-
-# A `case` arm reaches here as one fragment holding a header, a pattern and a command --
-# `case $x in a) pwd` -- because `;;` contains the `;` that `statements()` splits on.
-# Peeling both leaves `pwd` to be judged, which is the same trade CONTROL_PREFIX makes:
-# a pattern list emits nothing, and an arm whose body is `ls -R /` still blocks on the
-# `ls`. The pattern arm requires a `)` followed by whitespace and forbids `(` before it,
-# so a subshell (`(cd x && ls)`) and a substitution are not mistaken for one.
-#
-# Quote characters are excluded from the pattern for a sharper reason than tidiness: a
-# `)` inside a *message* would otherwise make an arm out of prose, and
-# `git commit -m "fix x) here"` would have been peeled down to `here"` and blocked --
-# the exact class of false positive `QUOTED_SPAN_RE` exists to prevent elsewhere.
-CASE_HEADER_RE = re.compile(r"^case\s+\S+\s+in\s+")
-CASE_ARM_RE = re.compile(r"""^[^()&|;'"]+(?:\|[^()&|;'"]+)*\)\s+""")
-
-# Commands whose output is bounded by a small constant no matter what arguments or
-# repository they are given. That is a much stronger claim than "usually short", and it
-# is the whole test for membership: `ls`, `cat`, `git status`, `git diff --stat` and
-# `git log` all scale with the tree or the history, so none of them are here.
-_BOUNDED_PATTERNS = (
-    # Fixed, one-line output regardless of flags.
-    r"(?:pwd|whoami|hostname|uptime|date|true|false)\b",
-    # Prints text that is already in the command, hence already in context.
-    r"(?:echo|printf)\s",
-    # One line: a path, or nothing.
-    r"(?:which|type)\s+\S+\s*$",
-    r"command\s+-v\s+\S+\s*$",
-    # git plumbing that answers with a single ref, hash, or count.
-    r"git\s+rev-parse\b",
-    r"git\s+branch\s+--show-current\s*$",
-    r"git\s+symbolic-ref\b",
-    r"git\s+describe\b",
-    r"git\s+rev-list\s+--count\b",
-    r"git\s+config\s+(?:--\S+\s+)*--get\b",
-    # One line: a URL, or a merge base's sha. `--is-ancestor` prints nothing and answers
-    # in the exit code, which is the spelling that reached here blocked.
-    r"git\s+remote\s+get-url\b",
-    r"git\s+merge-base\b",
-    # A syntax check: silent on success, one diagnostic on failure.
-    r"(?:ba|z)?sh\s+-n\s",
-    # Version probes. `--help` is deliberately excluded: help text is long.
-    r"\S+\s+(?:--version|-V)\s*$",
+POWERSHELL_NOISY_COMMANDS = (
+    (
+        re.compile(r"(?:Get-ChildItem|gci|dir)(?:\s|$)", re.IGNORECASE),
+        "`Get-ChildItem` grows with the directory -- prefer the Glob tool",
+    ),
+    (
+        re.compile(r"(?:Get-Content|gc|type)(?:\s|$)", re.IGNORECASE),
+        "`Get-Content` prints a whole file -- prefer the Read tool, which pages",
+    ),
+    (
+        re.compile(r"Get-ChildItem\b.*-Recurse", re.IGNORECASE),
+        "`-Recurse` walks the tree -- prefer the Glob tool",
+    ),
 )
+# `-TotalCount`/`-Tail` are `Get-Content`'s own caps and take it back off the list.
+POWERSHELL_CONTENT_CAP_RE = re.compile(r"-(?:TotalCount|Tail)\s+\d+(?=\s|$)", re.IGNORECASE)
 
-BOUNDED_COMMANDS = (SILENT_ON_SUCCESS, NO_STDOUT_RE, *(re.compile(p) for p in _BOUNDED_PATTERNS))
 
-
-def block_message(max_bytes: int, command_shell: str = "bash") -> str:
-    """The reason string fed back to the agent, quoting the configured cap."""
-    if command_shell == "powershell":
-        return (
-            "Blocked uncapped PowerShell command. Route output through the "
-            f"PowerShell-native byte-cap wrapper (default {max_bytes} bytes).\n"
-            "Suggested pattern: python3 scripts/hooks/invoke-capped.py --shell "
-            f"powershell --command '<your command>' --max-bytes {max_bytes}\n"
-            f"--max-bytes must be >= {harness_config.MIN_MAX_BYTES}.\n"
-            "Native caps such as `Select-Object -First N`, `Select-Object -Last N`, "
-            "`Get-Content -TotalCount N`, `Get-Content -Tail N`, `Out-Null`, and "
-            "stdout redirection are accepted. Every semicolon-separated statement "
-            "must be bounded. Raw Get-Content/Get-ChildItem/git status output still "
-            "scales with the file or tree and requires a cap."
-        )
+def block_message(reasons: list[str], max_bytes: int, command_shell: str = "bash") -> str:
+    """The reason string fed back to the agent: what is unbounded, and the way out."""
+    shell_flag = " --shell powershell" if command_shell == "powershell" else ""
+    bullets = "\n".join(f"  - {reason}" for reason in dict.fromkeys(reasons))
+    cap_forms = (
+        "`| Select-Object -First N` or `> file`"
+        if command_shell == "powershell"
+        else "`| head -c N`, `| tail -c N`, `| wc -l` or `> file`"
+    )
     return (
-        f"Blocked uncapped Bash command. Route output through a byte-cap wrapper "
-        f"(default {max_bytes} bytes).\n"
-        f"Suggested pattern: python3 scripts/hooks/invoke-capped.py "
+        "Blocked: this command's output grows with the repository, not with the "
+        "command.\n"
+        f"{bullets}\n"
+        f"Cap it ({cap_forms}), or route it through the wrapper, which keeps a head "
+        "*and* a tail window and preserves the exit code:\n"
+        f"  python3 scripts/hooks/invoke-capped.py{shell_flag} "
         f'--command "<your command>" --max-bytes {max_bytes}\n'
-        f"--max-bytes must be >= {harness_config.MIN_MAX_BYTES}; below that the "
-        "truncation marker crowds out the output it is meant to frame.\n"
-        "NB: the wrapper runs the command via the platform shell -- cmd.exe on "
-        "Windows -- so heredocs, single-quoted paths and escaped alternation do "
-        "not survive it. For a pattern search prefer the Grep/Glob tools; for a "
-        "command needing POSIX syntax pipe into head/tail instead, which runs in "
-        "the harness's own shell but masks the exit code.\n"
-        "Any of these count as a cap on a pipeline: `head -c N`, `tail -c N`, "
-        "`head -N`, `tail -N` (and their `-n N` spellings), or redirecting stdout "
-        "to a file. Prefer the wrapper for test and lint runs even so: it keeps a "
-        "head *and* a tail window and preserves the exit code.\n"
-        "Every statement needs its own cap: in `a; b | head -c N` only `b` is "
-        "capped. Exempt, and needing no wrapper: constant-size output (pwd, git "
-        "rev-parse, --version), commands silent on success (mkdir, rm, cp, sleep, "
-        "set, trap, kill), condition tests including a quiet `grep -q`, "
-        "`git log` given a commit count, the commit pair whose "
-        "message cannot survive the wrapper (git add/commit, gh pr "
-        "create/edit/comment), and "
-        "shell control flow. ls/cat/git status are NOT exempt because their "
-        "output grows with the tree -- use Read/Glob/Grep."
+        "Nothing else is gated. This is a short blocklist of tree-scaling commands, "
+        "not a requirement to prove every call is bounded -- so do not wrap commands "
+        "it did not name."
     )
 
 
@@ -499,24 +234,57 @@ def skip_heredoc_bodies(text: str, start: int, delimiters: list[str]) -> int:
     return index
 
 
+def is_brace_word(text: str, index: int) -> bool:
+    """True when the brace at `text[index]` stands as its own word, as a group's does.
+
+    This is the shell's own rule, and it is what keeps `${HOME}`, `awk '{print $1}'` and
+    `find -exec ls {} \\;` out of the group grammar.
+    """
+    before = text[index - 1] if index else " "
+    after = text[index + 1] if index + 1 < len(text) else " "
+    return before in " \t\n;|&" and after in " \t\n;|&)"
+
+
+def group_closer(text: str, index: int) -> str | None:
+    """The delimiter that would close a group opening at `text[index]`, or None.
+
+    `$(` opens one too, though it is a substitution rather than a subshell, and that is
+    not a detail: its `)` has to pop the substitution instead of whatever encloses it.
+    """
+    char = text[index]
+    if char == "(":
+        return ")"
+    if char == "{" and is_brace_word(text, index):
+        return "}"
+    return None
+
+
+def closes_group(text: str, index: int, expected: str) -> bool:
+    """True when `text[index]` closes an open group whose closer is `expected`."""
+    char = text[index]
+    if char != expected:
+        return False
+    return char == ")" or is_brace_word(text, index)
+
+
 def split_top_level(text: str, separators: tuple[str, ...]) -> list[str]:
     """Split `text` on `separators` that are outside quotes. Never raises.
 
-    Quote-awareness is the point: `invoke-capped.py --command "cd x; make"` is one
-    statement, and a naive split would treat the quoted `;` as a boundary and then
-    block a correctly-wrapped command. Not a shell parser -- it tracks single/double
-    quotes, backslash escapes and heredoc bodies, which is what the forms this gate
-    sees actually use.
+    Quote-awareness is the point: `invoke-capped.py --command "cd x; cat f"` is one
+    statement, and a naive split would find a `cat` in the quoted argument. Not a shell
+    parser -- it tracks single/double quotes, backslash escapes, comments, heredoc bodies
+    and balanced groups, which is what the forms this gate sees actually use.
 
-    Heredoc bodies are dropped rather than split. They are data, and the newline split
-    otherwise reads each line of a commit message as its own uncappable statement --
-    a shape with no legal spelling at all, since a heredoc cannot be handed to the
-    wrapper either.
+    Heredoc bodies are dropped rather than split; they are data, and the newline split
+    otherwise reads each line of a commit message as its own statement. A balanced
+    `{ ...; }` or `( ... )` comes back whole, because the cap in `{ a; b; } | head -c N`
+    binds the group rather than the `b`.
     """
     out: list[str] = []
     buf: list[str] = []
     quote: str | None = None
     pending_heredocs: list[str] = []
+    group_stack: list[str] = []
     i = 0
     while i < len(text):
         ch = text[i]
@@ -543,21 +311,19 @@ def split_top_level(text: str, separators: tuple[str, ...]) -> list[str]:
         if ch == "#" and (i == 0 or text[i - 1].isspace()):
             # A comment is not a command, and it runs to end of line -- so it also
             # swallows any separator inside it, which is why it is dropped here rather
-            # than per-statement afterwards: in `pwd # a; ls -R /` the shell never sees
-            # a second statement. Only a `#` that starts a word is one; `logs/x#2` and
-            # `curl http://h/p#frag` are ordinary arguments and are left alone.
+            # than per-statement afterwards. Only a `#` that starts a word is one;
+            # `logs/x#2` and `curl http://h/p#frag` are ordinary arguments.
             newline = text.find("\n", i)
             i = len(text) if newline == -1 else newline
             continue
         if text.startswith("<<<", i):
-            # A here-string feeds one word and has no body to skip. Consumed whole so
-            # the scan cannot re-enter at the second `<` and read `<<'word'` as a
-            # heredoc operator -- which swallowed every statement after it.
+            # A here-string feeds one word and has no body to skip. Consumed whole so the
+            # scan cannot re-enter at the second `<` and read `<<'word'` as a heredoc.
             buf.append("<<<")
             i += 3
             continue
-        # A heredoc operator only *declares* its delimiter here; the body starts after
-        # the end of the current line, which may still carry a `| head -c N`.
+        # A heredoc operator only *declares* its delimiter here; the body starts after the
+        # end of the current line, which may still carry a `| head -c N`.
         if ch == "<" and (heredoc := HEREDOC_RE.match(text, i)):
             pending_heredocs.append(heredoc.group("word"))
             buf.append(heredoc.group(0))
@@ -566,14 +332,28 @@ def split_top_level(text: str, separators: tuple[str, ...]) -> list[str]:
         if ch == "\n" and pending_heredocs:
             i = skip_heredoc_bodies(text, i + 1, pending_heredocs)
             pending_heredocs = []
-            # The newline itself was consumed with the body. Emit the boundary it
-            # represents when the caller treats newlines as separators; otherwise the
-            # statement simply continues, as it would for any other dropped text.
             if "\n" in separators:
                 out.append("".join(buf))
                 buf = []
             continue
-        hit = next((sep for sep in separators if text.startswith(sep, i)), None)
+        if group_stack and closes_group(text, i, group_stack[-1]):
+            group_stack.pop()
+            buf.append(ch)
+            i += 1
+            continue
+        if (closer := group_closer(text, i)) is not None:
+            group_stack.append(closer)
+            buf.append(ch)
+            i += 1
+            continue
+        # A closer with nothing open is ordinary text and is left alone: a `case` arm
+        # reaches this function as `a) cat f`, and treating its `)` as a group's would
+        # unbalance the scan for the rest of the command.
+        hit = (
+            next((sep for sep in separators if text.startswith(sep, i)), None)
+            if not group_stack
+            else None
+        )
         if hit is not None:
             out.append("".join(buf))
             buf = []
@@ -586,20 +366,15 @@ def split_top_level(text: str, separators: tuple[str, ...]) -> list[str]:
 
 
 def statements(command: str) -> list[str]:
-    """The command's top-level statements -- each of which needs its own cap."""
+    """The command's top-level statements -- each judged on its own."""
     return split_top_level(command, STATEMENT_SEPARATORS)
 
 
-def strip_control_prefix(statement: str) -> str:
-    """Peel leading control keywords, so `do rm -rf x` is judged as `rm -rf x`.
+def strip_prefixes(statement: str) -> str:
+    """Peel prefixes that emit nothing, so `do cat big` is judged as `cat big`.
 
-    Loops reach this function already split on `;`, so the keyword and the command it
-    introduces arrive in the same fragment. Judging the command behind the keyword is
-    what keeps the guarantee intact: `do ls -R /` still blocks, on the `ls`.
-
-    The loop runs to a fixed point because the prefixes stack: `until ! [ -f x ]` is two
-    of them, and peeling only the first leaves a `!` in front of a condition test that
-    would then match nothing.
+    The loop runs to a fixed point because the prefixes stack: `until ! test -f x` is two
+    of them, and a `case` arm arrives as a header plus a pattern in front of a command.
     """
     while True:
         peeled = CASE_ARM_RE.sub("", CASE_HEADER_RE.sub("", statement, count=1), count=1)
@@ -615,119 +390,88 @@ def strip_quoted(statement: str) -> str:
     return QUOTED_SPAN_RE.sub(" ", statement)
 
 
-def is_quiet_grep(statement: str) -> bool:
-    """True when the statement's output all ends in a `grep -q`, which prints nothing.
-
-    Judged on the *last* stage of the pipeline, because that is the only one whose
-    output can reach the terminal: in `docker ps | grep -q db-1` everything the first
-    stage prints is consumed by the second, exactly as a `head -c` cap consumes it.
-    """
-    segments = split_top_level(statement, ("|",))
-    last = segments[-1].strip() if segments else ""
-    return bool(GREP_RE.match(last)) and bool(QUIET_FLAG_RE.search(strip_quoted(last)))
-
-
-def is_bounded(statement: str) -> bool:
-    """True when this statement's output is bounded by a small constant.
-
-    Several checks run *before* the command-substitution veto, and the order is the whole
-    point of them. The veto is a claim that a statement's output is unknowable because a
-    substitution could print anything -- which is only true when the statement has a
-    path to the terminal at all. A condition test has none, a redirect has taken it
-    away, and shell control flow never had one, so vetoing any of them is reasoning about
-    output that cannot exist. Every one of those shapes was blocked that way
-    (`until [ "$(...)" = healthy ]`, `gh run view --log > file`, `for i in $(seq 1 60)`)
-    and none could be spelled any other way.
-
-    The control-flow pair was the last to move up here, and it is the case the rule above
-    reads past most easily, because the substitution is not the thing being *run*: in
-    `for i in $(seq 1 60)`, `seq`'s output is the loop's word list. The shell consumes it
-    to decide how many iterations there are and prints not one byte of it -- exactly as a
-    condition test consumes the substitution feeding it. What the loop *body* prints is a
-    separate statement and is still judged on its own, which is what keeps
-    `for f in $(ls); do cat $f; done` blocked, on the `cat`, where it belongs.
-    """
-    peeled = strip_control_prefix(statement.strip())
-    if NO_STDOUT_RE.match(peeled) or BARE_NO_OUTPUT_RE.match(peeled):
-        return True
-    if CONTROL_ONLY_RE.match(peeled) or CONTROL_HEADER_RE.match(peeled):
-        return True
-    if is_quiet_grep(peeled):
-        return True
-    # Quoted spans collapse to a word character rather than to a space, because a
-    # redirect target is very often quoted (`--log > "/tmp/run.log"`) and blanking it
-    # leaves a `>` with nothing after it to match. `q` keeps `> "x"` looking like a
-    # redirect while still hiding a `>` that was only ever prose.
-    if REDIRECT_RE.search(QUOTED_SPAN_RE.sub("q", peeled)):
-        return True
-    # Judged on the PEELED statement, not the raw one. A substitution sitting in the part
-    # that gets peeled off belongs to the control keyword, not to the command: in
-    # `case $(uname) in Linux) pwd`, `uname` picks the arm and `pwd` is what prints. Read
-    # raw, the `$(` vetoed a `pwd` -- the most bounded command there is -- and the block
-    # named a cause the author had no way to act on, since the substitution was in a
-    # header the remedy cannot wrap.
-    if SUBSTITUTION_RE.search(SINGLE_QUOTED_SPAN_RE.sub(" ", peeled)):
-        return False
-    statement = peeled
-    if GIT_LOG_RE.match(statement):
-        flags = strip_quoted(statement)
-        return bool(GIT_LOG_COUNT_RE.search(flags)) and not GIT_LOG_PATCH_RE.search(flags)
-    if COMMIT_LIKE.match(statement):
-        # Judged on the flags only: a `--dry-run` or `-v` anywhere in the *message* is
-        # prose, and unbounding a commit because of what it says about itself is a false
-        # positive with no visible cause.
-        flags = strip_quoted(statement)
-        return not (COMMIT_LIKE_DISQUALIFIERS.search(flags) or VERBOSE_FLAG_RE.search(flags))
-    if SILENT_ON_SUCCESS.match(statement):
-        # Scoped to this family, not applied globally: `-v` means *version* to about as
-        # many commands as it means verbose, and an unscoped check revoked the
-        # long-standing `command -v gh` exemption two lines below.
-        return not VERBOSE_FLAG_RE.search(statement)
-    return any(pattern.match(statement) for pattern in BOUNDED_COMMANDS)
-
-
 def has_cap(statement: str) -> bool:
-    """True when this one statement routes its output through a cap.
+    """True when this statement's output is bounded by a cap, a redirect, or the wrapper.
 
-    A cap anywhere in the pipeline counts, not just at the end: everything downstream
-    of it can only ever receive what it passed, so `cat big | head -c 100 | grep x` is
-    genuinely bounded and blocking it would be a false positive.
+    A cap anywhere in the pipeline counts, not just at the end: everything downstream of
+    it can only receive what it passed, so `cat big | head -c 100 | grep x` is genuinely
+    bounded. Quoted spans collapse to a word character rather than to a space before the
+    redirect check, because a redirect target is often quoted (`> "/tmp/run.log"`) and
+    blanking it leaves a `>` with nothing after it to match.
     """
     if WRAPPER_RE.search(statement):
         return True
-    return any(CAP_RE.match(segment) for segment in split_top_level(statement, ("|",)))
+    if REDIRECT_RE.search(QUOTED_SPAN_RE.sub("q", statement)):
+        return True
+    return any(CAP_RE.match(segment.strip()) for segment in split_top_level(statement, ("|",)))
 
 
 def has_powershell_cap(statement: str) -> bool:
-    """Whether a PowerShell pipeline contains a native global output bound."""
-    if WRAPPER_RE.search(statement):
+    """The PowerShell spellings of the same three bounds."""
+    if WRAPPER_RE.search(statement) or POWERSHELL_CONTENT_CAP_RE.search(statement):
         return True
-    segments = split_top_level(statement, ("|",))
+    if REDIRECT_RE.search(QUOTED_SPAN_RE.sub("q", statement)):
+        return True
     return any(
-        POWERSHELL_SELECT_CAP_RE.match(segment.strip())
-        or POWERSHELL_OUT_NULL_RE.match(segment.strip())
-        for segment in segments
+        POWERSHELL_CAP_RE.match(segment.strip()) for segment in split_top_level(statement, ("|",))
     )
 
 
-def is_powershell_bounded(statement: str) -> bool:
-    """True for PowerShell statements whose terminal output is constant-size."""
-    statement = statement.strip()
-    if POWERSHELL_ASSIGNMENT_RE.match(statement):
-        # PowerShell assignment captures the RHS; it does not emit it to the pipeline.
-        return True
-    if POWERSHELL_SILENT_RE.match(statement) or POWERSHELL_FIXED_RE.match(statement):
-        return True
-    if POWERSHELL_CONTENT_CAP_RE.match(statement):
-        return True
-    if POWERSHELL_LENGTH_GUARD_RE.match(statement):
-        return True
-    if (
-        POWERSHELL_GET_ITEM_RE.match(statement) or POWERSHELL_GET_ITEM_PROPERTY_RE.match(statement)
-    ) and not re.search(r"[*?\[]", statement):
-        # One result per authored literal path. Wildcards remain unbounded.
-        return True
-    return is_bounded(statement)
+def noisy_reason(statement: str, command_shell: str = "bash") -> str | None:
+    """Why this statement's output scales with the tree, or None if it does not.
+
+    Judged on the peeled statement and on the *first* command in the pipeline, since that
+    is the one producing the bytes; a downstream stage can only ever bound them, which is
+    `has_cap`'s question rather than this one's.
+
+    An unbound group is unpacked and judged member by member, because `split_top_level`
+    deliberately hands it over whole. Peeling its `{` like an ordinary control prefix
+    would leave only the first member facing the table, and `{ pwd; cat big; }` would pass
+    on the strength of the `pwd`. The recursion terminates because a group's body is
+    strictly shorter than the statement holding it, and it is only ever reached with
+    nothing binding the group -- `has_cap` has already looked at the tail.
+    """
+    text = statement.strip()
+    if group := GROUP_BODY_RE.match(text):
+        return next(
+            (
+                reason
+                for member in statements(group.group("body"))
+                if (reason := noisy_reason(member, command_shell=command_shell)) is not None
+            ),
+            None,
+        )
+    segments = split_top_level(strip_prefixes(text), ("|",))
+    head = strip_prefixes(segments[0].strip()) if segments else ""
+    if not head:
+        return None
+    table = POWERSHELL_NOISY_COMMANDS if command_shell == "powershell" else NOISY_COMMANDS
+    for pattern, reason in table:
+        if pattern.match(head):
+            return reason
+    if command_shell == "powershell":
+        return None
+    flags = strip_quoted(head)
+    if GIT_LOG_RE.match(head):
+        if not GIT_LOG_COUNT_RE.search(flags):
+            return "`git log` grows with the history -- give it a commit count (`-5`)"
+        if GIT_LOG_PATCH_RE.search(flags):
+            return "`git log -p` prints every commit's full diff, however few commits"
+        return None
+    if GIT_DIFF_RE.match(head) and not GIT_DIFF_SUMMARY_RE.search(flags):
+        return "a raw `git diff`/`git show` has no bound -- add `--stat` or `--name-only`"
+    return None
+
+
+def offenders(command: str, command_shell: str = "bash") -> list[str]:
+    """Every reason this command is blocked; empty when it is allowed."""
+    capped = has_powershell_cap if command_shell == "powershell" else has_cap
+    return [
+        reason
+        for statement in statements(command)
+        if not capped(statement)
+        and (reason := noisy_reason(statement, command_shell=command_shell)) is not None
+    ]
 
 
 def get_value(obj, *paths):
@@ -743,21 +487,6 @@ def get_value(obj, *paths):
         if ok and cur is not None:
             return str(cur)
     return None
-
-
-def is_capped(command: str, command_shell: str = "bash") -> bool:
-    """True when EVERY statement in the command is capped or bounded.
-
-    The `all` (rather than the `any` this once was) is the whole fix: a command is
-    only as bounded as its least-bounded statement, and the old `re.search` over the
-    joined string let `find / -name x; echo done | head -c 10` through.
-    """
-    parts = statements(command)
-    if not parts:
-        return False
-    if command_shell == "powershell":
-        return all(is_powershell_bounded(part) or has_powershell_cap(part) for part in parts)
-    return all(is_bounded(part) or has_cap(part) for part in parts)
 
 
 def decide(
@@ -789,15 +518,17 @@ def decide(
         payload, "tool_input.command", "toolInput.command", "input.command", "command"
     )
     if not command or not command.strip():
-        return (
-            EXIT_BLOCK,
-            "enforce-capped-bash: Bash tool call is missing command text; blocking by policy.",
-        )
-
-    if is_capped(command, command_shell=command_shell):
+        # An empty command prints nothing, and the payload shape is the harness's problem
+        # rather than the agent's. The allow-list blocked here because it could not prove
+        # boundedness; a blocklist has nothing to name, and a block message that names no
+        # command is one no agent can act on.
         return 0, ""
 
-    return EXIT_BLOCK, block_message(cap, command_shell=command_shell)
+    reasons = offenders(command, command_shell=command_shell)
+    if not reasons:
+        return 0, ""
+
+    return EXIT_BLOCK, block_message(reasons, cap, command_shell=command_shell)
 
 
 def main(argv: list[str] | None = None) -> int:

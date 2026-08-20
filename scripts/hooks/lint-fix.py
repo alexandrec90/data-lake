@@ -28,6 +28,18 @@ with that directory as the working directory, and skipped entirely when there is
 marker above it. A scratchpad stops being linted; a box starts being linted correctly,
 by its own config rather than the vendoring checkout's.
 
+**A marker is a ruff config, not a repository.** `.git` was one of them, which made the
+claim "this tree configured ruff" out of a fact that says nothing about ruff at all, and
+so caught every checkout an agent can reach — including a reference checkout that ships
+no harness and no Python config. There, this hook was the whole harness applying itself
+to a repo deliberately exempted from the rest of it: an edit to a `.py` file was
+reformatted in place under ruff's *defaults*, and any finding those defaults could not
+auto-fix exited 2 and blocked the turn. Nobody chose those rules for that tree, which is
+the exact failure the paragraph above is about, one directory further out. Requiring a
+config file states the claim honestly and needs no list of which checkouts are exempt —
+a tree that configures ruff opts in by carrying the config, and every other tree is left
+alone. Boxes are unaffected: a worktree checks out tracked files, and the config is one.
+
 Pure helpers (`parse_hook_input`, `extract_paths`, `is_lintable`, `find_ruff`,
 `project_root_for`) are unit-tested in `scripts/hooks/tests/test_lint_fix.py`.
 """
@@ -54,7 +66,7 @@ REPO_ROOT = (Path(__file__).parent / "../..").resolve()
 # worktree -- which is exactly what an ephemeral box is -- `.git` is a file pointing at
 # the primary's git dir, and requiring a directory would put every box back outside
 # every project.
-PROJECT_MARKERS = ("ruff.toml", ".ruff.toml", "pyproject.toml", ".git")
+PROJECT_MARKERS = ("ruff.toml", ".ruff.toml", "pyproject.toml")
 PATCH_PATH_RE = re.compile(
     r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*$",
     re.MULTILINE,
@@ -140,7 +152,9 @@ def project_root_for(target: Path) -> Path | None:
     Walks up from the file's own directory and returns the first ancestor carrying a
     `PROJECT_MARKERS` entry. None is the answer that matters: it means nothing here
     configured ruff for this file, so linting it can only apply someone else's rules,
-    and the honest thing is to leave it alone.
+    and the honest thing is to leave it alone. A repository marker (`.git`) would not
+    support that claim — every checkout has one, configured for ruff or not — so the
+    markers are ruff's own config files and nothing else.
 
     Nearest-first, so a file inside a box resolves to the box rather than to the
     workspace above it, and a nested sub-project wins over its parent -- the same order

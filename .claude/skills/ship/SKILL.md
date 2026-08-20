@@ -6,13 +6,18 @@ argument-hint: 'Optional PR title, or context such as which box/worktree to ship
 
 # Ship the current task
 
-> **Claude Code needs an output cap on every Bash command below.** Their output scales
-> with the repo, so `scripts/hooks/enforce-capped-bash.py` blocks each one issued bare.
-> In Claude Code, issue each as `python3 scripts/hooks/invoke-capped.py --command
-> "<the command>"`, which keeps a head *and* a tail window and preserves the exit code.
-> Pass no `--max-bytes`: it defaults to this project's `[bash] max_bytes`, and a number
-> written here would be one project's value baked into a file every project vendors
-> byte-for-byte.
+> **Three of the commands below are on Claude Code's Bash blocklist** -- `git status`,
+> a raw `git diff` and an uncounted `git log` all grow with the repo, so
+> `scripts/hooks/enforce-capped-bash.py` blocks those issued bare. Route each through
+> `python3 scripts/hooks/invoke-capped.py --command "<the command>"`, which keeps a head
+> *and* a tail window and preserves the exit code. Pass no `--max-bytes`: it defaults to
+> this project's `[bash] max_bytes`, and a number written here would be one project's
+> value baked into a file every project vendors byte-for-byte.
+>
+> **`git commit` and `gh pr create` are not on that list and must be issued bare.** Their
+> message is authored and multi-line, and it does not survive the wrapper's `cmd.exe`;
+> the `| head -c N` fallback masks the exit code, so a commit a pre-commit hook rejected
+> would read as a success. Nothing else in this skill needs a wrapper at all.
 >
 > **Codex runs the numbered commands directly.** Its shell runner already caps captured
 > output, and `scripts/sync-codex-hooks.py` omits the redundant gate. Adding the wrapper
