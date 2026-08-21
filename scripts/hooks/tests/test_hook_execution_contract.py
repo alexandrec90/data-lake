@@ -56,6 +56,7 @@ rule: the variable is prefixed per project.
 import ast
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -104,6 +105,7 @@ class Wired:
     matcher: str
     command: str
     script: Path | None
+    args: tuple[str, ...] = ()
 
     def __str__(self) -> str:
         name = self.script.name if self.script else "inline"
@@ -137,6 +139,38 @@ def script_from_command(command: str, root: Path) -> Path | None:
     return None
 
 
+def args_from_command(command: str, script: Path, root: Path) -> tuple[str, ...]:
+    """The arguments the settings file passes to `script`, in the order it passes them.
+
+    A hook is wired as a whole command line, and the flags on it are part of what the
+    project asked for: carameli wires `prune-logs.py --quiet`, whose entire purpose is
+    the silence `test_an_allowed_call_writes_no_loose_stdout` asserts. Running the
+    script bare exercises a configuration the runtime never runs -- and that test
+    reported the summary the script prints *when asked to be verbose* as a stray
+    `print()`, red on a consumer's first CI run after adopting v0.11.0 while devkit's
+    own suite stayed green (its one SessionStart hook is a shell script, so it is not
+    in `python_hooks()` at all). That asymmetry is the vendored tier's standing trap:
+    this file runs against every consumer's settings, not devkit's.
+
+    Tolerant of a command it cannot split -- an unbalanced quote is a defect in the
+    settings file, and the other tests here report it far better than a traceback out
+    of the parametrizer would.
+    """
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return ()
+    for index, token in enumerate(tokens):
+        if not token.endswith((".py", ".sh")):
+            continue
+        relative = token.split("}", 1)[-1].lstrip("/\\") if "}" in token else token
+        candidate = Path(relative)
+        resolved = candidate if candidate.is_absolute() else (root / relative)
+        if resolved.resolve() == script:
+            return tuple(tokens[index + 1 :])
+    return ()
+
+
 def wired_hooks(settings: dict, root: Path) -> list[Wired]:
     """Every hook command in a settings file, flattened across events and matchers.
 
@@ -150,12 +184,14 @@ def wired_hooks(settings: dict, root: Path) -> list[Wired]:
                 if entry.get("type") != "command":
                     continue
                 command = entry.get("command") or ""
+                script = script_from_command(command, root)
                 found.append(
                     Wired(
                         event=event,
                         matcher=group.get("matcher", ""),
                         command=command,
-                        script=script_from_command(command, root),
+                        script=script,
+                        args=args_from_command(command, script, root) if script else (),
                     )
                 )
     return found
@@ -241,14 +277,20 @@ def inert_env() -> dict[str, str]:
     return {**os.environ, f"{env_prefix()}_SKIP_STOP_VERIFY": "1"}
 
 
-def run_hook(script: Path, payload: str, timeout: float = HOOK_TIMEOUT):
+def run_hook(
+    script: Path,
+    payload: str,
+    timeout: float = HOOK_TIMEOUT,
+    args: tuple[str, ...] = (),
+):
     """Run one hook the way the runtime does: as a subprocess, JSON on stdin.
 
     Under `sys.executable`, not the interpreter the settings file names -- see
-    `script_from_command`. Never `check=True`: a non-zero code is the thing under test.
+    `script_from_command`. With the arguments the settings file passes -- see
+    `args_from_command`. Never `check=True`: a non-zero code is the thing under test.
     """
     return subprocess.run(
-        [sys.executable, str(script)],
+        [sys.executable, str(script), *args],
         input=payload,
         capture_output=True,
         text=True,
@@ -342,7 +384,7 @@ def test_hook_survives_degenerate_stdin(wired: Wired, payload: str):
     """
     assert wired.script is not None
     try:
-        result = run_hook(wired.script, payload)
+        result = run_hook(wired.script, payload, args=wired.args)
     except subprocess.TimeoutExpired:
         pytest.fail(
             f"{wired.script.name} did not exit within {HOOK_TIMEOUT}s on {payload!r}; "
@@ -369,7 +411,7 @@ def test_a_blocking_exit_always_carries_a_reason(wired: Wired):
     """
     assert wired.script is not None
     for payload in ("", "{}"):
-        result = run_hook(wired.script, payload)
+        result = run_hook(wired.script, payload, args=wired.args)
         if result.returncode == 2:
             assert result.stderr.strip(), (
                 f"{wired.script.name} blocked (exit 2) on {payload!r} with no stderr; "
@@ -388,7 +430,7 @@ def test_an_allowed_call_writes_no_loose_stdout(wired: Wired):
     is the most expensive kind of harmless bug.
     """
     assert wired.script is not None
-    result = run_hook(wired.script, "{}")
+    result = run_hook(wired.script, "{}", args=wired.args)
     if result.returncode != 0 or not result.stdout.strip():
         return
     try:
@@ -423,7 +465,7 @@ def test_the_bash_gate_blocks_with_two_and_says_why():
     if gate is None or gate.script is None:
         pytest.skip("project does not wire the capped-Bash gate")
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls -la"}})
-    result = run_hook(gate.script, payload)
+    result = run_hook(gate.script, payload, args=gate.args)
     assert result.returncode == 2, (
         f"the Bash gate exited {result.returncode} on an uncapped `ls -la`; anything "
         "but 2 is a non-blocking error and the command runs anyway"
@@ -437,7 +479,7 @@ def test_the_bash_gate_allows_a_capped_command():
     if gate is None or gate.script is None:
         pytest.skip("project does not wire the capped-Bash gate")
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "echo hello"}})
-    result = run_hook(gate.script, payload)
+    result = run_hook(gate.script, payload, args=gate.args)
     assert result.returncode == 0, (
         f"the Bash gate exited {result.returncode} on a command that produces no "
         f"repository-sized output:\n{result.stderr[:1000]}"
@@ -510,6 +552,91 @@ def test_script_from_command_returns_none_for_an_inline_command(tmp_path):
 def test_script_from_command_returns_none_when_the_file_is_absent(tmp_path):
     command = 'python3 "${CLAUDE_PROJECT_DIR:-.}/scripts/hooks/gone.py"'
     assert script_from_command(command, tmp_path) is None
+
+
+def test_run_hook_passes_the_wired_arguments_to_the_process(tmp_path):
+    """The failure this file shipped with, reduced to its two lines.
+
+    A hook wired with a flag that suppresses its output was run without the flag, so
+    the output it is *supposed* to produce unflagged was reported as a stray print.
+    Asserting the parser alone would not have caught it: `Wired.args` was right and
+    the subprocess still never saw them.
+    """
+    script = tmp_path / "chatty.py"
+    script.write_text(
+        "import sys\nif '--quiet' not in sys.argv[1:]:\n    print('[chatty] something happened')\n",
+        encoding="utf-8",
+    )
+    assert run_hook(script, "{}").stdout.strip() == "[chatty] something happened"
+    assert run_hook(script, "{}", args=("--quiet",)).stdout.strip() == ""
+
+
+def _wired_script(tmp_path):
+    target = tmp_path / "scripts" / "prune-logs.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("", encoding="utf-8")
+    return target.resolve()
+
+
+def test_args_from_command_keeps_the_flags_the_settings_file_passes(tmp_path):
+    """The regression: `--quiet` is why the hook is silent, so dropping it is a lie.
+
+    Run without it, carameli's `prune-logs.py` prints the summary it exists to print,
+    and `test_an_allowed_call_writes_no_loose_stdout` called that loose stdout.
+    """
+    target = _wired_script(tmp_path)
+    command = 'python3 "${CLAUDE_PROJECT_DIR:-.}/scripts/prune-logs.py" --quiet'
+    assert args_from_command(command, target, tmp_path) == ("--quiet",)
+
+
+def test_args_from_command_keeps_order_and_values(tmp_path):
+    target = _wired_script(tmp_path)
+    command = 'python3 "${CLAUDE_PROJECT_DIR:-.}/scripts/prune-logs.py" --keep 5 --quiet'
+    assert args_from_command(command, target, tmp_path) == ("--keep", "5", "--quiet")
+
+
+def test_args_from_command_is_empty_for_a_bare_invocation(tmp_path):
+    target = _wired_script(tmp_path)
+    command = 'python3 "${CLAUDE_PROJECT_DIR:-.}/scripts/prune-logs.py"'
+    assert args_from_command(command, target, tmp_path) == ()
+
+
+def test_args_from_command_ignores_arguments_before_the_script(tmp_path):
+    """`python3 -u thing.py --quiet` passes `-u` to the interpreter, not to the hook."""
+    target = _wired_script(tmp_path)
+    command = 'python3 -u "${CLAUDE_PROJECT_DIR:-.}/scripts/prune-logs.py" --quiet'
+    assert args_from_command(command, target, tmp_path) == ("--quiet",)
+
+
+def test_args_from_command_tolerates_an_unbalanced_quote(tmp_path):
+    """A settings file this malformed is reported by the other tests, not by a crash."""
+    target = _wired_script(tmp_path)
+    assert args_from_command('python3 "scripts/prune-logs.py --quiet', target, tmp_path) == ()
+
+
+def test_wired_hooks_records_the_arguments_on_each_entry(tmp_path):
+    target = _wired_script(tmp_path)
+    found = wired_hooks(
+        {
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": (
+                                    'python3 "${CLAUDE_PROJECT_DIR:-.}'
+                                    '/scripts/prune-logs.py" --quiet'
+                                ),
+                            }
+                        ]
+                    }
+                ]
+            }
+        },
+        tmp_path,
+    )
+    assert [(w.script, w.args) for w in found] == [(target, ("--quiet",))]
 
 
 def test_wired_hooks_flattens_events_and_skips_non_command_entries(tmp_path):

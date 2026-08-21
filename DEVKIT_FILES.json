@@ -1,5 +1,5 @@
 {
-  "devkit_tag": "v0.11.0",
+  "devkit_tag": "v0.11.1",
   "files": {
     ".claude/hooks/session-start.sh": "de052fbeca615c448055f76c85e50db0896229c7724021a9916752dd44671dda",
     ".claude/rules/authoring.md": "55def2e448d71f9f85ab414e7dc58c52713bd5194e80ea5fd57a88eb444c1a1b",
@@ -21,7 +21,7 @@
     "scripts/hooks/tests/test_codex_session_start.py": "62498e3980ed68a7836fb1f74001afaf019f5893a88d2443e50712c135faabae",
     "scripts/hooks/tests/test_enforce_capped_bash.py": "9fc6d843b7b45768f3d7198758ea46886136ea00d0fee44f5ca54579ac31f368",
     "scripts/hooks/tests/test_harness_config.py": "d372e3631e1c077a9e86b5cd4cc56bb03cdea64d3557ae97505d319edb600418",
-    "scripts/hooks/tests/test_hook_execution_contract.py": "556d878b6fc77e3041834fd362c9bb36bedc226601d190d467b0cab34c0dffbd",
+    "scripts/hooks/tests/test_hook_execution_contract.py": "0169aa64dc7c58646ebaf882d390f2aee277fb71af6d22c7e2ec951b24d311ca",
     "scripts/hooks/tests/test_invoke_capped.py": "ce50d6a670ab0e0a65d12ca1e2cf878064e587993a5136488efc43e93deb3a4d",
     "scripts/hooks/tests/test_lint_fix.py": "f01346d06a2ba8e0b778ed680082c9b899394100982dca473da6c6e023f34ae1",
     "scripts/hooks/tests/test_log_wrap.py": "fa98109ff5a5d75595dd4b4e8edc790ea9e05745aadfd60b59436e4fa82bf6f3",
