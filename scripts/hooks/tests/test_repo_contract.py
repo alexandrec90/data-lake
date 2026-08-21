@@ -34,6 +34,7 @@ import ast
 import dataclasses
 import inspect
 import json
+from collections.abc import Mapping
 import re
 from pathlib import Path
 
@@ -273,6 +274,65 @@ def test_frontend_paths_exist_when_the_tier_is_on():
         pytest.skip("project has no frontend tier")
     assert (REPO_ROOT / CFG.frontend.dir).is_dir(), f"[frontend] dir = {CFG.frontend.dir!r}"
     assert (REPO_ROOT / CFG.frontend.src).is_dir(), f"[frontend] src = {CFG.frontend.src!r}"
+
+
+def undefined_npm_scripts(commands: dict[str, list[str]], scripts: Mapping[str, str]) -> list[str]:
+    """Labels whose command is `npm run <name>` for a name `scripts` does not define.
+
+    Only the `run` form is checked: a command that is not `npm run` names a binary, and
+    whether that resolves is npm's business rather than the manifest's.
+    """
+    return [
+        label
+        for label, command in commands.items()
+        if len(command) == 2 and command[0] == "run" and command[1] not in scripts
+    ]
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (["run", "lint:types"], []),
+        (["run", "typecheck"], ["[frontend] typecheck_cmd"]),
+        # Not `npm run`, so not this check's business either way.
+        (["exec", "tsc", "--noEmit"], []),
+        (["run"], []),
+    ],
+)
+def test_undefined_npm_scripts_flags_only_the_run_form(command, expected):
+    scripts = {"lint:types": "tsc --noEmit", "test:run": "vitest run"}
+    assert undefined_npm_scripts({"[frontend] typecheck_cmd": command}, scripts) == expected
+
+
+@consumes_harness
+def test_frontend_commands_name_scripts_that_exist():
+    """`npm run <name>` for a name `package.json` does not define is a failing tier.
+
+    Both frontend commands are `["run", <script>]` handed to npm, and npm answers an
+    undefined script with `Missing script` and a non-zero exit. So a renamed script does
+    not disable the tier quietly the way a stale `[paths]` prefix does -- it fails every
+    diff that selects it, with a message about npm rather than about the manifest, and
+    the manifest is where the fix is. Carameli's `typecheck_cmd` named `typecheck` for
+    long enough to be copied into its `CLAUDE.md` as a caveat; the script is `lint:types`.
+    """
+    if not CFG.frontend.enabled:
+        pytest.skip("project has no frontend tier")
+    manifest = REPO_ROOT / CFG.frontend.dir / "package.json"
+    if not manifest.exists():
+        pytest.skip(f"no {manifest.relative_to(REPO_ROOT)}")
+
+    scripts = json.loads(manifest.read_text(encoding="utf-8")).get("scripts", {})
+    missing = undefined_npm_scripts(
+        {
+            "[frontend] test_cmd": list(CFG.frontend.test_cmd),
+            "[frontend] typecheck_cmd": list(CFG.frontend.typecheck_cmd),
+        },
+        scripts,
+    )
+    assert not missing, (
+        f"{', '.join(missing)} names an npm script package.json does not define "
+        f"(defined: {sorted(scripts)})"
+    )
 
 
 # --- generated Codex handlers -------------------------------------------------
