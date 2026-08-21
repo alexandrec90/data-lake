@@ -102,9 +102,21 @@ class PythonConfig:
     pip-tools locks, else `pyproject.toml`), because a lockfile cannot drift from
     reality the way a manifest field can. Set `install_command` only for a project
     that fits none of those shapes; it then wins over detection.
+
+    `version` is an override for the same reason. A lockfile pins packages, not the
+    interpreter that resolves them, so `worktree.py provision` built every box's `.venv`
+    from whatever interpreter happened to be running it -- the workstation default, not
+    the version the project is pinned to in its `FROM python:` tag, its compiled locks,
+    its type-checker config and CI. The box came out announcing itself provisioned with a
+    venv the container does not match, and the mismatch surfaced later as an install or a
+    type-check failure that reads as a broken branch rather than as the wrong interpreter.
+    Provisioning now reads an exact pin out of `.python-version` or a `FROM python:` tag
+    when this field is empty, so set it only where those disagree with what the box should
+    run, or where the pin lives somewhere else entirely (`"3.12"`, or a full `"3.12.7"`).
     """
 
     install_command: str = ""
+    version: str = ""
 
 
 @dataclass(frozen=True)
@@ -125,6 +137,29 @@ class DockerConfig:
 
 
 @dataclass(frozen=True)
+class WorktreeConfig:
+    """Extra `.env` assignments an ephemeral box must make for itself.
+
+    A box already gets its own port lease, but a setting *derived* from a port is
+    still the source checkout's after seeding, and nothing notices until a browser
+    does. carameli's `CORS_ORIGINS` is the case that found this: the box publishes
+    its frontend on its own port, the seeded `.env` still names the primary's, and
+    the app then refuses every request its own frontend makes -- as a CORS error in
+    the console, which reads as an application bug rather than as a box that was
+    provisioned half-configured.
+
+    Ports are the only thing devkit knows generically, so this is a template map
+    rather than a fixed key: `${NAME}` expands against the managed env devkit
+    already writes -- `COMPOSE_PROJECT_NAME` and one `<SERVICE>_HOST_PORT` per
+    service in the port registry. A template naming something else is left out
+    rather than written half-expanded, because a `.env` line containing a literal
+    `${...}` is a value compose would pass through to the app verbatim.
+    """
+
+    env: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class Config:
     """Shape of the project the harness scripts operate on."""
 
@@ -139,6 +174,7 @@ class Config:
     python: PythonConfig = field(default_factory=PythonConfig)
     bash: BashConfig = field(default_factory=BashConfig)
     docker: DockerConfig = field(default_factory=DockerConfig)
+    worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
 
     def env(self, suffix: str) -> str:
         """The prefixed control-env name, e.g. env("SKIP_STOP_VERIFY")."""
@@ -189,7 +225,9 @@ def _frontend_from(raw: dict[str, Any], default: FrontendConfig) -> FrontendConf
 
 def _python_from(raw: dict[str, Any], default: PythonConfig) -> PythonConfig:
     return replace(
-        default, install_command=str(raw.get("install_command", default.install_command))
+        default,
+        install_command=str(raw.get("install_command", default.install_command)),
+        version=str(raw.get("version", default.version)),
     )
 
 
@@ -221,6 +259,16 @@ def _docker_from(raw: dict[str, Any], default: DockerConfig) -> DockerConfig:
     return replace(default, auto_stop=raw.get("auto_stop", default.auto_stop) is True)
 
 
+def _worktree_from(raw: dict[str, Any], default: WorktreeConfig) -> WorktreeConfig:
+    env = raw.get("env")
+    if not isinstance(env, dict):
+        return replace(default, env=dict(default.env))
+    # Both halves coerced to str: TOML gives an int for `PORT = 5176`, and a
+    # non-string value reaching the `.env` writer would be a template that never
+    # matches and a key that renders as `PORT=5176` only by luck of repr.
+    return replace(default, env={str(k): str(v) for k, v in env.items()})
+
+
 def from_dict(data: dict[str, Any]) -> Config:
     """Build a Config from an already-parsed manifest dict. Pure; never raises."""
     default = Config()
@@ -231,6 +279,7 @@ def from_dict(data: dict[str, Any]) -> Config:
     py_raw = data.get("python", {}) if isinstance(data.get("python"), dict) else {}
     bash_raw = data.get("bash", {}) if isinstance(data.get("bash"), dict) else {}
     docker_raw = data.get("docker", {}) if isinstance(data.get("docker"), dict) else {}
+    wt_raw = data.get("worktree", {}) if isinstance(data.get("worktree"), dict) else {}
     return Config(
         env_prefix=str(project.get("env_prefix", default.env_prefix)),
         app_dir=str(paths.get("app", default.app_dir)),
@@ -241,6 +290,7 @@ def from_dict(data: dict[str, Any]) -> Config:
         python=_python_from(py_raw, default.python),
         bash=_bash_from(bash_raw, default.bash),
         docker=_docker_from(docker_raw, default.docker),
+        worktree=_worktree_from(wt_raw, default.worktree),
     )
 
 
@@ -260,6 +310,79 @@ def load(root: Path) -> Config:
     with contextlib.suppress(OSError, ValueError), manifest.open("rb") as fh:
         return from_dict(tomllib.load(fh))
     return Config()
+
+
+def harness_version(root: Path) -> str:
+    """The vendored harness's provenance, for a hook to stamp on what it tells an agent.
+
+    Returns the short `DEVKIT_VERSION` SHA in a consuming project, `"source"` in devkit
+    itself (which has no such file because it *is* the upstream), and `""` when neither
+    can be determined -- callers omit the stamp rather than print a placeholder.
+
+    Why a hook message should carry this at all. A vendored gate is a **copy**, and it
+    is routinely months of fixes behind the repo it came from: at the time of writing
+    every consumer in this workspace is pinned at the v0.10.2 merge while nine
+    subsequent PRs -- two of them fixes to this very gate's false positives -- sit
+    upstream. An agent that trips over one of those has no way to tell "devkit is
+    wrong" from "this copy of devkit is old", so it reports the block as a defect, a
+    human relays it upstream, and it is closed as already-fixed. The version is the one
+    fact that distinguishes the two cases, it costs one file read, and the agent cannot
+    obtain it any other way without spending a turn.
+
+    Never raises: this is called from hooks, on the path where they are already
+    reporting something else.
+    """
+    with contextlib.suppress(OSError, ValueError):
+        stamp = (root / "DEVKIT_VERSION").read_text(encoding="utf-8").strip()
+        # The file holds a SHA by contract (see `sync-devkit.stale_pin`). Trim it to
+        # the length a human pastes into `git show`, and refuse anything that is not
+        # one rather than echoing arbitrary file content into an agent's context.
+        first = stamp.split()[0] if stamp.split() else ""
+        if first and len(first) >= 7 and all(c in "0123456789abcdef" for c in first.lower()):
+            return first[:12]
+    if is_devkit_source(root):
+        # devkit vendors *out* of itself and so carries no stamp. Saying "source" is
+        # more useful than saying nothing: it tells the agent this copy cannot be
+        # behind, so a defect here is genuinely a defect and worth reporting.
+        return "source"
+    return ""
+
+
+def is_devkit_source(root: Path) -> bool:
+    """Whether `root` is devkit itself rather than a project that vendored it.
+
+    Read from `pyproject.toml`'s project name, **not** from the directory name: devkit
+    develops itself in ephemeral boxes under `.worktrees/devkit--<slug>/`, so the
+    directory is `devkit` in exactly the checkout where nobody is working. The name
+    is the fallback for a repo with no parseable `pyproject.toml`.
+    """
+    with contextlib.suppress(OSError, ValueError, KeyError, TypeError, ImportError):
+        import tomllib  # stdlib 3.11+; guarded for older shims
+
+        with (root / "pyproject.toml").open("rb") as fh:
+            return bool(tomllib.load(fh)["project"]["name"] == "devkit")
+    return root.name == "devkit"
+
+
+def provenance(root: Path) -> str:
+    """The one-line footer a hook appends when it tells an agent something is wrong.
+
+    Deliberately terse. It fires on every block -- 150-odd times a month in this
+    workspace -- so it has to be worth its bytes on the calls where nothing is wrong
+    with the harness at all. What earns them is the second clause: it names the check
+    that settles "already fixed upstream?" without the agent having to know
+    `sync-devkit.py` exists.
+    """
+    version = harness_version(root)
+    if not version:
+        return ""
+    if version == "source":
+        return "(devkit harness: this repo is the source, so this behaviour is current.)"
+    return (
+        f"(devkit harness {version} -- a vendored copy, which may be behind. If this "
+        f"looks wrong, check for an upstream fix before reporting it: "
+        f"python scripts/sync-devkit.py --check)"
+    )
 
 
 def lookup(cfg: Config, dotted: str) -> str:

@@ -1291,3 +1291,41 @@ def test_check_passes_once_the_codex_artifact_is_regenerated(tmp_path, monkeypat
     monkeypatch.setattr(sh, "MANIFEST", ("scripts/hooks/x.py",))
 
     assert sh.main(["--check", "--src", str(src)]) == 0
+
+
+# --- the interpreter the generator is spawned with --------------------------
+# `NO_WINDOW` above is necessary and not sufficient, and the gap is invisible until a
+# scheduled job hits it: Windows **ignores** `CREATE_NO_WINDOW` for a GUI-subsystem
+# child, so spawning `sys.executable` from a job -- where it is `pythonw.exe` -- leaves
+# the child with no console at all, and Windows then allocates a fresh visible one for
+# each of *its* children. This script is exactly that hop: a nightly upgrade pass spawns
+# it per project, and it spawns `git` and the codex generator in turn. The flag on the
+# spawn that started it bought nothing; `console_python` is what makes the flag on the
+# spawns below apply to anything.
+
+
+def test_the_generator_is_spawned_with_a_console_interpreter(tmp_path, monkeypatch):
+    console = tmp_path / "python.exe"
+    gui = tmp_path / "pythonw.exe"
+    for path in (console, gui):
+        path.write_text("", encoding="utf-8")
+    monkeypatch.setattr(sh.sys, "executable", str(gui))
+    assert sh.console_python() == str(console)
+    assert sh._codex_generator(Path("/repo"))[0] == str(console)
+
+
+def test_a_console_interpreter_is_left_alone(tmp_path, monkeypatch):
+    """Every interactive caller, every POSIX machine, and this test run."""
+    console = tmp_path / "python.exe"
+    console.write_text("", encoding="utf-8")
+    monkeypatch.setattr(sh.sys, "executable", str(console))
+    assert sh.console_python() == str(console)
+
+
+def test_a_missing_console_twin_falls_back_rather_than_raising(tmp_path, monkeypatch):
+    """An embedded install can ship `pythonw.exe` alone. Raising here would fail a
+    `--pull` over a window that may not even appear."""
+    gui = tmp_path / "pythonw.exe"
+    gui.write_text("", encoding="utf-8")
+    monkeypatch.setattr(sh.sys, "executable", str(gui))
+    assert sh.console_python() == str(gui)
