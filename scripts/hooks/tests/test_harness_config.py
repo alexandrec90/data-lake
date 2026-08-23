@@ -346,6 +346,37 @@ def test_the_default_worktree_env_is_not_shared_between_configs():
     assert cfg.Config().worktree.env == {}
 
 
+def test_ui_services_default_to_none_which_means_no_ui_only_mode():
+    """Absence is the opt-out: a project that never declared a UI tier cannot have a
+    UI-only preview cut for it, rather than getting one that starts nothing."""
+    assert cfg.Config().worktree.ui_services == ()
+    assert cfg.from_dict({"worktree": {}}).worktree.ui_services == ()
+
+
+def test_ui_services_are_read_as_a_string_tuple():
+    raw = {"worktree": {"ui_services": ["frontend", "storybook"]}}
+    assert cfg.from_dict(raw).worktree.ui_services == ("frontend", "storybook")
+
+
+def test_ui_services_of_the_wrong_shape_fall_back_to_the_default():
+    for junk in ("frontend", {"a": 1}, 5, None):
+        assert cfg.from_dict({"worktree": {"ui_services": junk}}).worktree.ui_services == ()
+
+
+def test_ui_env_is_carried_through_verbatim_and_coerced_like_env():
+    """Same contract as `env`: templates expand downstream, values become strings."""
+    raw = {"worktree": {"ui_env": {"VITE_PROXY_TARGET": "http://host:${APP_HOST_PORT}", "N": 1}}}
+    assert cfg.from_dict(raw).worktree.ui_env == {
+        "VITE_PROXY_TARGET": "http://host:${APP_HOST_PORT}",
+        "N": "1",
+    }
+
+
+def test_ui_env_of_the_wrong_shape_falls_back_to_the_default():
+    for junk in ("VITE_X", ["a"], 5, None):
+        assert cfg.from_dict({"worktree": {"ui_env": junk}}).worktree.ui_env == {}
+
+
 # --- harness provenance -------------------------------------------------------
 #
 # What a hook stamps on the messages it sends an agent. The failure this exists to

@@ -131,6 +131,13 @@ MANIFEST: tuple[str, ...] = (
     # Config loader (the per-project seam) + the Stop dispatcher it drives.
     "scripts/hooks/harness_config.py",
     "scripts/hooks/tests/test_harness_config.py",
+    # The untested-symbol ratchet: gates *this* project's public callables against
+    # its own `.devkit-untested.txt`, which is deliberately not vendored -- the debt
+    # list is a fact about one repo. Scope comes from `[test_contract]` in the
+    # manifest, so the scanner never names a path. `--pull` seeds the baseline, which
+    # is what keeps adoption from turning a consumer's PR gate red.
+    "scripts/hooks/untested_symbols.py",
+    "scripts/hooks/tests/test_untested_symbols.py",
     "scripts/hooks/stop.py",
     "scripts/hooks/tests/test_stop.py",
     # Auto-fix-on-edit PostToolUse hook (repo-relative ruff path fix).
@@ -144,6 +151,16 @@ MANIFEST: tuple[str, ...] = (
     "scripts/hooks/tests/test_enforce_capped_bash.py",
     "scripts/hooks/invoke-capped.py",
     "scripts/hooks/tests/test_invoke_capped.py",
+    # The harness-events ledger: the stdlib-only append helper every gate above uses
+    # to leave a central record of a block on this machine's devkit checkout (via
+    # $DEVKIT_DIR; silent no-op without one), and the CLI that gives an agent's own
+    # defect report the same destination. Vendored together because a writer without
+    # the helper is an ImportError inside a PreToolUse hook -- which exits non-2 and
+    # silently disables the gate it lives in.
+    "scripts/hooks/harness_events.py",
+    "scripts/hooks/tests/test_harness_events.py",
+    "scripts/hooks/report-harness-defect.py",
+    "scripts/hooks/tests/test_report_harness_defect.py",
     # The task-layer failure artifact. Vendored rather than templated because nothing
     # in it varies: it resolves `logs/` from the cwd the task set, and the task label
     # it is given names the file. `notify-wrap.py` is its sibling and stays a template
@@ -956,6 +973,59 @@ def regenerate_codex_hooks(root: Path) -> bool:
         return False
 
 
+# Not in MANIFEST, and it never will be: the file's content is a fact about one repo.
+# The name is shared so a pull can tell "already adopted" from "adopting now".
+UNTESTED_BASELINE_FILE = ".devkit-untested.txt"
+
+
+def seed_untested_baseline(root: Path) -> int | None:
+    """Record this project's existing untested symbols on adoption. `None` if not.
+
+    The ratchet's baseline is the debt a repo already has, and until it exists every
+    public callable in the project reads as new debt. Seeding it here is what makes
+    adopting the gate a no-op instead of a red PR gate on the pull that delivers it —
+    and it has to be *here* rather than a step someone runs afterwards, because the
+    someone is the thing that does not happen.
+
+    The scanner refuses to overwrite, so this is safe to call on every pull: a project
+    that has already adopted keeps its list, and new untested code cannot be laundered
+    into it. Out-of-process for the same reason `regenerate_codex_hooks` is: the file
+    was copied in a moment ago, and running it as a subprocess means a broken one fails
+    visibly here rather than at this script's import.
+    """
+    script = root / "scripts/hooks/untested_symbols.py"
+    if not script.is_file() or (root / UNTESTED_BASELINE_FILE).exists():
+        return None
+    try:
+        result = subprocess.run(
+            # `console_python()`, not `sys.executable`: an upgrade sweep runs this from
+            # a scheduled job under `pythonw.exe`, where a GUI-subsystem child ignores
+            # CREATE_NO_WINDOW and Windows gives its children visible consoles instead.
+            [console_python(), str(script), "--seed"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            creationflags=NO_WINDOW,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return len(read_untested_baseline(root))
+
+
+def read_untested_baseline(root: Path) -> list[str]:
+    """The recorded gaps, so a pull can report how much debt it just wrote down."""
+    path = root / UNTESTED_BASELINE_FILE
+    if not path.is_file():
+        return []
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
 def remove_retired(root: Path) -> list[str]:
     """Delete only reviewed retired files, never project-owned sibling state."""
     removed = retired_present(root)
@@ -1169,6 +1239,8 @@ def main(argv: list[str] | None = None) -> int:
         # those settings, so regenerating first would bake back in whatever the prune
         # is about to remove.
         codex_regenerated = regenerate_codex_hooks(REPO_ROOT) if args.pull else False
+        # After the copy, because it runs the scanner this pull just delivered.
+        seeded = seed_untested_baseline(REPO_ROOT) if args.pull else None
         blocks_written, blocks_failed = sync_blocks(from_root, to_root, BLOCK_MANIFEST)
         verb = "pulled" if args.pull else "pushed"
         print(
@@ -1190,6 +1262,14 @@ def main(argv: list[str] | None = None) -> int:
             # Named, because it is the one file the pull rewrote that was never copied
             # from the source: it is generated here, from this project's own settings.
             print(f"  (regenerated from {SETTINGS_FILE}) {CODEX_HOOKS_FILE}")
+        if seeded is not None:
+            # Only on the pull that adopts the gate. Named because it is a claim about
+            # this repo that nobody wrote by hand, and because the number is the debt
+            # the project is now expected to burn down rather than add to.
+            print(
+                f"  (adopted the untested-symbol ratchet) {UNTESTED_BASELINE_FILE}: "
+                f"{seeded} symbol(s) with no test naming them"
+            )
         if args.pull:
             # The SHA, always: DEVKIT_VERSION records the upstream *commit*, and
             # the vendored `test_harness_version_records_a_commit` asserts exactly

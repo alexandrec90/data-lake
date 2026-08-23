@@ -69,6 +69,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import harness_config
 
+# Guarded: the ledger is diagnostics, and a consumer whose pull went sideways must not
+# lose (or crash) the gate over it. `record` itself never raises by contract.
+try:
+    import harness_events
+except ImportError:  # pragma: no cover - a partially vendored consumer
+    harness_events = None  # type: ignore[assignment]
+
 REPO_ROOT = (Path(__file__).parent / "../..").resolve()
 CFG = harness_config.load(REPO_ROOT)
 
@@ -558,15 +565,47 @@ def decide(
     return EXIT_BLOCK, block_message(reasons, cap, command_shell=command_shell, stamp=stamp)
 
 
+def record_block(raw: str) -> None:
+    """One harness-events ledger line per block, so a false positive is diagnosable
+    from `logs/harness-events.log` in the devkit checkout rather than from the chat of
+    whichever session it hit. Best-effort: `harness_events.record` resolves the ledger
+    through `$DEVKIT_DIR` and no-ops (never raises) on a machine without one.
+    """
+    if harness_events is None:
+        return
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return
+    harness_events.record(
+        "capped-bash-block",
+        (
+            ("project", REPO_ROOT.name),
+            ("session", get_value(payload, "session_id", "sessionId") or ""),
+            ("version", harness_config.harness_version(REPO_ROOT)),
+            (
+                "command",
+                get_value(
+                    payload, "tool_input.command", "toolInput.command", "input.command", "command"
+                )
+                or "",
+            ),
+        ),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shell", choices=("bash", "powershell"), default="bash")
     args = parser.parse_args(argv)
+    raw = sys.stdin.read()
     exit_code, message = decide(
-        sys.stdin.read(),
+        raw,
         command_shell=args.shell,
         stamp=harness_config.provenance(REPO_ROOT),
     )
+    if exit_code == EXIT_BLOCK:
+        record_block(raw)
     if message:
         # stderr, not stdout: only stderr is surfaced for a blocking hook.
         print(message, file=sys.stderr)

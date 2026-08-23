@@ -53,6 +53,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+# scripts/hooks/ on path for the sibling, stdlib-only ledger helper; guarded because
+# this hook is best-effort throughout, and a consumer whose pull went sideways must
+# not have every edit blocked by an ImportError in its diagnostics.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import harness_config
+    import harness_events
+except ImportError:  # pragma: no cover - a partially vendored consumer
+    harness_events = None  # type: ignore[assignment]
+
 ALLOWED_TOOLS = {"Edit", "Write", "MultiEdit", "apply_patch", "create_file"}
 REPO_ROOT = (Path(__file__).parent / "../..").resolve()
 
@@ -239,9 +249,30 @@ def main() -> int:
             failures.append(f"ruff found issues in {path} that need a manual fix:\n{detail}")
 
     if failures:
+        record_block(paths, failures)
         print("\n".join(failures), file=sys.stderr)
         return 2
     return 0
+
+
+def record_block(paths: list[str], failures: list[str]) -> None:
+    """One harness-events ledger line per blocking run, so a false-positive finding --
+    the S603/T201-on-a-scratch-file class this hook has already shipped -- is
+    diagnosable from `logs/harness-events.log` in the devkit checkout rather than from
+    the chat of whichever session it blocked. Best-effort: `harness_events.record`
+    resolves the ledger through `$DEVKIT_DIR` and no-ops (never raises) without one.
+    """
+    if harness_events is None:
+        return
+    harness_events.record(
+        "lint-fix-block",
+        (
+            ("project", REPO_ROOT.name),
+            ("version", harness_config.harness_version(REPO_ROOT)),
+            ("files", ";".join(paths)),
+            ("detail", failures[0]),
+        ),
+    )
 
 
 def _read_stdin() -> str:

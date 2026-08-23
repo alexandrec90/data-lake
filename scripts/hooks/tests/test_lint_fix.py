@@ -351,3 +351,53 @@ def test_ruff_arg_relativises_despite_lowercase_drive():
 def test_ruff_arg_absolute_when_outside_project(tmp_path):
     outside = tmp_path / "x.py"
     assert lint_fix.ruff_arg(outside, lint_fix.REPO_ROOT) == str(outside)
+
+
+# --- record_block: the harness-events ledger line behind every blocking run ---
+
+
+def ledger_lines(base: Path) -> list[str]:
+    path = base / "logs" / "harness-events.log"
+    if not path.exists():
+        return []
+    return path.read_text(encoding="utf-8").splitlines()
+
+
+def test_record_block_writes_files_and_first_detail(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVKIT_DIR", str(tmp_path))
+    lint_fix.record_block(["a.py", "b.py"], ["F821 undefined name", "second"])
+    (line,) = ledger_lines(tmp_path)
+    assert "\tevent=lint-fix-block\t" in line
+    assert "\tfiles=a.py;b.py\t" in line
+    assert line.endswith("\tdetail=F821 undefined name")
+    assert "\tproject=" in line
+    assert "\tversion=" in line
+
+
+def test_record_block_without_the_ledger_module_is_a_noop(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVKIT_DIR", str(tmp_path))
+    monkeypatch.setattr(lint_fix, "harness_events", None)
+    lint_fix.record_block(["a.py"], ["boom"])
+    assert ledger_lines(tmp_path) == []
+
+
+def test_main_records_when_it_blocks(monkeypatch, tmp_path, capsys):
+    ledger_root = tmp_path / "devkit"
+    ledger_root.mkdir()
+    monkeypatch.setenv("DEVKIT_DIR", str(ledger_root))
+    f = _project(tmp_path / "proj") / "x.py"
+    f.write_text("x = 1\n")
+    monkeypatch.setattr(lint_fix, "_read_stdin", lambda: _payload(str(f)))
+    monkeypatch.setattr(lint_fix, "find_ruff", lambda root: "ruff")
+
+    def fake_run(ruff, *args, **kw):
+        if args[0] == "check" and "--fix" not in args:
+            return result(returncode=1, stdout="x.py:1:1: F821 undefined name\n")
+        return result(returncode=0)
+
+    monkeypatch.setattr(lint_fix, "_run", fake_run)
+    assert lint_fix.main() == 2
+    (line,) = ledger_lines(ledger_root)
+    assert "\tevent=lint-fix-block\t" in line
+    assert "F821" in line
+    capsys.readouterr()

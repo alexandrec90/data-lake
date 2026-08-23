@@ -409,3 +409,54 @@ def test_the_powershell_message_names_native_caps_only():
     assert "Select-Object -First N" in msg
     assert "head -c" not in msg
     assert "--shell powershell" in msg
+
+
+# --- record_block: the harness-events ledger line behind every block ---
+
+
+def ledger_lines(base):
+    path = base / "logs" / "harness-events.log"
+    if not path.exists():
+        return []
+    return path.read_text(encoding="utf-8").splitlines()
+
+
+def test_record_block_writes_session_and_command(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVKIT_DIR", str(tmp_path))
+    body = {"tool_name": "Bash", "session_id": "s1", "tool_input": {"command": "ls -la"}}
+    hook.record_block(json.dumps(body))
+    (line,) = ledger_lines(tmp_path)
+    assert "\tevent=capped-bash-block\t" in line
+    assert "\tsession=s1\t" in line
+    assert line.endswith("\tcommand=ls -la")
+    assert "\tproject=" in line
+    assert "\tversion=" in line
+
+
+def test_record_block_on_malformed_payload_is_a_silent_noop(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVKIT_DIR", str(tmp_path))
+    hook.record_block("not json")
+    assert ledger_lines(tmp_path) == []
+
+
+def test_record_block_without_the_ledger_module_is_a_noop(tmp_path, monkeypatch):
+    """A partially vendored consumer imports the gate without harness_events; a block
+    must still block, with no ledger and no crash."""
+    monkeypatch.setenv("DEVKIT_DIR", str(tmp_path))
+    monkeypatch.setattr(hook, "harness_events", None)
+    hook.record_block(payload("Bash", "ls -la"))
+    assert ledger_lines(tmp_path) == []
+
+
+def test_main_records_only_when_it_blocks(tmp_path, monkeypatch, capsys):
+    import io
+
+    monkeypatch.setenv("DEVKIT_DIR", str(tmp_path))
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload("Bash", "ls -la")))
+    assert hook.main([]) == hook.EXIT_BLOCK
+    assert len(ledger_lines(tmp_path)) == 1
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload("Bash", "ls | wc -l")))
+    assert hook.main([]) == 0
+    assert len(ledger_lines(tmp_path)) == 1
+    capsys.readouterr()

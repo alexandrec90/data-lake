@@ -137,6 +137,25 @@ class DockerConfig:
 
 
 @dataclass(frozen=True)
+class TestContractConfig:
+    """Which of this project's code the untested-symbol ratchet scans.
+
+    `sources` defaults to the app directory plus `scripts/`, which is every project's
+    own code and nothing it vendored. A project that keeps code elsewhere -- a second
+    package, a `lib/` -- names those directories here rather than accepting a gate that
+    silently covers half of it. `exclude` is for subtrees inside those directories that
+    are genuinely not this project's to test: generated clients, a vendored library.
+
+    Both are prefixes matched against the repo-relative POSIX path, so `scripts/hooks/`
+    excludes the vendored tier wholesale and `scripts/hooks/harness_config.py` excludes
+    one file.
+    """
+
+    sources: tuple[str, ...] = ()
+    exclude: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class WorktreeConfig:
     """Extra `.env` assignments an ephemeral box must make for itself.
 
@@ -154,9 +173,24 @@ class WorktreeConfig:
     service in the port registry. A template naming something else is left out
     rather than written half-expanded, because a `.env` line containing a literal
     `${...}` is a value compose would pass through to the app verbatim.
+
+    `ui_services` is what makes a UI-only preview possible: the compose services
+    that make up this project's UI tier (usually just `["frontend"]`). Empty --
+    the default -- means the project has not declared one and `worktree.py
+    preview --ui` refuses, because devkit cannot guess which of a stack's
+    services is the frontend. `ui_env` is `env`'s sibling for that mode only:
+    the same template map, applied on top of `env`, for values that are only
+    right when the backend is the *static checkout's* stack rather than the
+    box's own (a dev-proxy target, an API base URL). In a UI-only box the
+    managed env the templates expand against mixes two slots -- the box's own
+    ports for `ui_services`, the source checkout's for everything else -- so a
+    template like `http://localhost:${APP_HOST_PORT}` lands on the backend that
+    is actually running.
     """
 
     env: dict[str, str] = field(default_factory=dict)
+    ui_services: tuple[str, ...] = ()
+    ui_env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -175,6 +209,7 @@ class Config:
     bash: BashConfig = field(default_factory=BashConfig)
     docker: DockerConfig = field(default_factory=DockerConfig)
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
+    test_contract: TestContractConfig = field(default_factory=TestContractConfig)
 
     def env(self, suffix: str) -> str:
         """The prefixed control-env name, e.g. env("SKIP_STOP_VERIFY")."""
@@ -259,14 +294,30 @@ def _docker_from(raw: dict[str, Any], default: DockerConfig) -> DockerConfig:
     return replace(default, auto_stop=raw.get("auto_stop", default.auto_stop) is True)
 
 
-def _worktree_from(raw: dict[str, Any], default: WorktreeConfig) -> WorktreeConfig:
-    env = raw.get("env")
-    if not isinstance(env, dict):
-        return replace(default, env=dict(default.env))
+def _test_contract_from(raw: dict[str, Any], default: TestContractConfig) -> TestContractConfig:
+    return replace(
+        default,
+        sources=_as_str_tuple(raw.get("sources"), default.sources),
+        exclude=_as_str_tuple(raw.get("exclude"), default.exclude),
+    )
+
+
+def _env_map(value: Any, fallback: dict[str, str]) -> dict[str, str]:
     # Both halves coerced to str: TOML gives an int for `PORT = 5176`, and a
     # non-string value reaching the `.env` writer would be a template that never
     # matches and a key that renders as `PORT=5176` only by luck of repr.
-    return replace(default, env={str(k): str(v) for k, v in env.items()})
+    if not isinstance(value, dict):
+        return dict(fallback)
+    return {str(k): str(v) for k, v in value.items()}
+
+
+def _worktree_from(raw: dict[str, Any], default: WorktreeConfig) -> WorktreeConfig:
+    return replace(
+        default,
+        env=_env_map(raw.get("env"), default.env),
+        ui_services=_as_str_tuple(raw.get("ui_services"), default.ui_services),
+        ui_env=_env_map(raw.get("ui_env"), default.ui_env),
+    )
 
 
 def from_dict(data: dict[str, Any]) -> Config:
@@ -280,6 +331,7 @@ def from_dict(data: dict[str, Any]) -> Config:
     bash_raw = data.get("bash", {}) if isinstance(data.get("bash"), dict) else {}
     docker_raw = data.get("docker", {}) if isinstance(data.get("docker"), dict) else {}
     wt_raw = data.get("worktree", {}) if isinstance(data.get("worktree"), dict) else {}
+    tc_raw = data.get("test_contract", {}) if isinstance(data.get("test_contract"), dict) else {}
     return Config(
         env_prefix=str(project.get("env_prefix", default.env_prefix)),
         app_dir=str(paths.get("app", default.app_dir)),
@@ -291,6 +343,7 @@ def from_dict(data: dict[str, Any]) -> Config:
         bash=_bash_from(bash_raw, default.bash),
         docker=_docker_from(docker_raw, default.docker),
         worktree=_worktree_from(wt_raw, default.worktree),
+        test_contract=_test_contract_from(tc_raw, default.test_contract),
     )
 
 

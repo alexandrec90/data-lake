@@ -12,8 +12,10 @@ requires an empty-on-success artifact to prevent.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import time
 
 import pytest
 from conftest import REPO_ROOT, load_module
@@ -129,10 +131,82 @@ def test_the_artifact_lands_under_logs_in_the_cwd(tmp_path):
 
 
 def test_a_pass_clears_what_the_last_failure_left(tmp_path):
-    """The whole reason the artifact is written on success too."""
-    lw.write_artifact(tmp_path, "ship-sweep", "an old failure\n")
+    """The whole reason the artifact is written on success too.
+
+    `_aged` because the retraction is now decided by comparing the file's mtime against
+    this run's start, and a file written microseconds earlier is not reliably *older*:
+    Windows dates a file from the tick-based system clock, which drifts either side of
+    the precise one `time.time()` reads. An hour makes the intended case -- a failure
+    left by an earlier run -- the one the test actually sets up.
+    """
+    _aged(lw.write_artifact(tmp_path, "ship-sweep", "an old failure\n"), 3600)
     assert lw.main(["Ship: Sweep", "--", "x"], run=lambda _c: (0, "fine"), root=tmp_path) == 0
     assert (tmp_path / "logs" / "ship-sweep.log").read_text(encoding="utf-8") == ""
+
+
+# --- two instances of one task, one artifact ----------------------------------
+#
+# A task may now run several instances at once (`runOptions.instanceLimit`), so the
+# single artifact has two writers and the losing order is not the obvious one: an empty
+# body is a *retraction*, so a short pass finishing after a long run already failed
+# would delete a failure nobody has read.
+
+
+def _aged(path, seconds):
+    """Backdate `path`'s mtime, so "written before this run started" is not a race."""
+    os.utime(path, (path.stat().st_atime, path.stat().st_mtime - seconds))
+
+
+def test_a_pass_does_not_retract_a_failure_written_after_it_started(tmp_path):
+    started = time.time() - 60
+    path = lw.write_artifact(tmp_path, "preview", "the other instance failed\n")
+    assert lw.write_artifact(tmp_path, "preview", "", since=started) == path
+    assert path.read_text(encoding="utf-8") == "the other instance failed\n"
+
+
+def test_a_pass_still_clears_a_report_older_than_this_run(tmp_path):
+    """The single-instance behaviour is the common case and must not regress: a task
+    that passes retracts the failure it left last time."""
+    path = lw.write_artifact(tmp_path, "preview", "yesterday's failure\n")
+    _aged(path, 3600)
+    assert lw.write_artifact(tmp_path, "preview", "", since=time.time()) == path
+    assert path.read_text(encoding="utf-8") == ""
+
+
+def test_a_failure_is_never_held_back_by_a_newer_file(tmp_path):
+    """Only the retraction is skipped. The last failure to finish is the one worth
+    keeping, and the other instance's terminal still holds its own."""
+    path = lw.write_artifact(tmp_path, "preview", "the other instance failed\n")
+    assert lw.write_artifact(tmp_path, "preview", "this one failed too\n", since=time.time() - 60)
+    assert path.read_text(encoding="utf-8") == "this one failed too\n"
+
+
+def test_without_a_start_time_the_artifact_is_always_overwritten(tmp_path):
+    """`since` defaults to 0 -- an unknown start time cannot rule anything out, so the
+    caller that does not pass one gets exactly the old behaviour."""
+    path = lw.write_artifact(tmp_path, "preview", "a failure\n")
+    assert lw.write_artifact(tmp_path, "preview", "") == path
+    assert path.read_text(encoding="utf-8") == ""
+
+
+def test_a_wrapped_pass_dates_itself_from_before_the_command_ran(tmp_path):
+    """`main` has to take the timestamp *before* the command, not after: a run that
+    fails while this one is working is the case being protected, and a stamp taken at
+    the end is after it."""
+    path = tmp_path / "logs" / "t.log"
+
+    def run(_command):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # A file's mtime is taken from the system clock, which on Windows advances on a
+        # ~15ms tick, while `time.time()` does not -- so a file written in the same tick
+        # as the stamp can be dated *before* it. Spending a few ticks here is what makes
+        # "written after main started" true of the timestamps and not just of the order.
+        time.sleep(0.05)
+        path.write_text("a concurrent failure\n", encoding="utf-8")
+        return 0, "fine"
+
+    assert lw.main(["T", "--", "x"], run=run, root=tmp_path) == 0
+    assert path.read_text(encoding="utf-8") == "a concurrent failure\n"
 
 
 def test_an_unwritable_logs_directory_does_not_change_the_exit_code(tmp_path):
