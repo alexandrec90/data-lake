@@ -21,6 +21,12 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+# Duplicated as a literal in devkit's `scripts/worktree-guard.py`, which reads it. The
+# two cannot share a constant: this file is vendored into every project and that one is
+# devkit's alone, so an import either way would break in whichever tree lacks the other.
+# devkit's `tests/test_worktree_guard.py` asserts the two spellings match, which is the
+# only place both files exist.
+ADAPTER_ENV = "DEVKIT_HOOK_ADAPTER"
 MAX_REASON_BYTES = 4000
 CONTINUATION_EVENTS = frozenset({"PostToolUse", "SubagentStop", "Stop", "UserPromptSubmit"})
 COMMON_STOP_EVENTS = frozenset({"PreCompact", "PostCompact"})
@@ -81,6 +87,14 @@ def run_hook(
     env = os.environ.copy()
     env["CLAUDE_PROJECT_DIR"] = str(repo_root)
     env["PYTHONUTF8"] = "1"
+    # Announce the adapter, because `CLAUDE_PROJECT_DIR` above makes a hook look like it
+    # is running under Claude Code when it is not. The response shapes are not the same
+    # in both directions: a rc-0 hook's stdout is passed through verbatim below, so a
+    # hook emitting a Claude-only member -- `updatedInput`, which re-aims a tool's
+    # arguments -- gets it silently dropped by Codex and the unmodified call proceeds.
+    # `worktree-guard.py` reads this to fall back to a plain block; anything else that
+    # grows a Claude-specific response has the same seam to read.
+    env[ADAPTER_ENV] = "codex"
     try:
         result = subprocess.run(
             command,

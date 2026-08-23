@@ -121,6 +121,26 @@ def test_success_preserves_output_and_sets_project_dir(monkeypatch, tmp_path):
     assert captured["input"] == '{"prompt":"x"}'
 
 
+def test_the_adapter_announces_itself_to_the_hooks_it_runs(monkeypatch, tmp_path):
+    """`CLAUDE_PROJECT_DIR` above makes a hook look like it is running under Claude
+    Code, and the two response contracts are not the same in both directions: a rc-0
+    hook's stdout is passed through verbatim, so a Claude-only member is silently
+    dropped and the unmodified call proceeds. A hook that would be unsafe under that
+    needs a way to tell, and only this process knows."""
+    captured = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs)
+        return _completed(0, stdout="", stderr="")
+
+    monkeypatch.setattr(hook.subprocess, "run", fake_run)
+    monkeypatch.delenv(hook.ADAPTER_ENV, raising=False)
+
+    hook.run_hook("PreToolUse", ["python3", "guard.py"], "{}", repo_root=tmp_path)
+
+    assert captured["env"][hook.ADAPTER_ENV] == "codex"
+
+
 def test_session_start_success_suppresses_operational_output(monkeypatch, tmp_path):
     monkeypatch.setattr(
         hook.subprocess,

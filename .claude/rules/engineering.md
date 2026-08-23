@@ -288,6 +288,17 @@ there — flag it in your report with the file, the line, and a proposed edit.
 turn and leaves the next agent to hit the same wall; the instruction files only improve
 if the failures they cause are reported as defects in them.
 
+Give the flag a durable copy too:
+
+```bash
+python scripts/hooks/report-harness-defect.py --message "<what went wrong>" --command "<the exact command, when one triggered it>"
+```
+
+appends it to this machine's central harness-events ledger, where a devkit-scoped
+session reads it without being handed your chat. It complements the flag in your reply
+rather than replacing it — the user still has to see it — and on a machine with no
+`$DEVKIT_DIR` it says so and exits 0.
+
 ### Reporting a *harness* defect: check the copy's age first
 
 The hook scripts are a **vendored copy**, and every consuming project is routinely

@@ -1329,3 +1329,103 @@ def test_a_missing_console_twin_falls_back_rather_than_raising(tmp_path, monkeyp
     gui.write_text("", encoding="utf-8")
     monkeypatch.setattr(sh.sys, "executable", str(gui))
     assert sh.console_python() == str(gui)
+
+
+# --- adopting the untested-symbol ratchet ------------------------------------
+# The baseline is per-project debt and is never vendored, so a pull that delivered
+# the gate without writing one would turn the consumer's next PR gate red on every
+# public callable it has. Seeding here is the whole reason that is not what happens.
+
+SCANNER = "scripts/hooks/untested_symbols.py"
+CONFIG_MODULE = "scripts/hooks/harness_config.py"
+
+
+def _ratchet_project(root: Path, source: str = "def alpha():\n    pass\n") -> Path:
+    """A project with the real scanner vendored, since `--seed` runs it for real.
+
+    Written as UTF-8 explicitly: these two are prose-heavy and the default encoding on
+    a Windows console is not UTF-8, so `_seed` would hand the subprocess a file its own
+    interpreter cannot parse — a failure that reads as the seeder being broken.
+    """
+    for rel in (SCANNER, CONFIG_MODULE):
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text((sh.REPO_ROOT / rel).read_text(encoding="utf-8"), encoding="utf-8")
+    # `sources` narrowed to the project's own tree: the vendored hooks above are code
+    # devkit answers for, and a consumer's debt list is not the place to record it.
+    _seed(root, ".devkit.toml", '[paths]\napp = "src/"\n\n[test_contract]\nsources = ["src"]\n')
+    _seed(root, "src/acme.py", source)
+    return root
+
+
+def test_seeding_records_the_debt_the_project_already_has(tmp_path):
+    root = _ratchet_project(tmp_path)
+    assert sh.seed_untested_baseline(root) == 1
+    assert "src/acme.py::alpha" in sh.read_untested_baseline(root)
+
+
+def test_seeding_is_skipped_when_the_project_has_already_adopted(tmp_path):
+    """Called on every pull, so this is the common case. Re-seeding would launder
+    whatever went untested since adoption into the debt list."""
+    root = _ratchet_project(tmp_path)
+    _seed(root, sh.UNTESTED_BASELINE_FILE, "")
+    assert sh.seed_untested_baseline(root) is None
+    assert sh.read_untested_baseline(root) == []
+
+
+def test_seeding_is_skipped_when_the_scanner_was_not_vendored(tmp_path):
+    """A `--pull` from a devkit old enough not to ship it, or a partial manifest."""
+    _seed(tmp_path, ".devkit.toml", "")
+    assert sh.seed_untested_baseline(tmp_path) is None
+    assert not (tmp_path / sh.UNTESTED_BASELINE_FILE).exists()
+
+
+def test_a_scanner_that_fails_leaves_no_half_written_baseline(tmp_path):
+    """Best-effort, like every other post-copy step: a pull must not die on it."""
+    root = _ratchet_project(tmp_path)
+    _seed(root, SCANNER, "raise SystemExit(3)\n")
+    assert sh.seed_untested_baseline(root) is None
+
+
+def test_the_baseline_reader_drops_comments_and_blank_lines(tmp_path):
+    _seed(tmp_path, sh.UNTESTED_BASELINE_FILE, "# header\n\nsrc/acme.py::alpha\n")
+    assert sh.read_untested_baseline(tmp_path) == ["src/acme.py::alpha"]
+
+
+def test_the_baseline_of_a_project_that_never_adopted_reads_empty(tmp_path):
+    assert sh.read_untested_baseline(tmp_path) == []
+
+
+def test_the_baseline_is_not_vendored(tmp_path):
+    """It is one repo's debt. Vendoring it would ship devkit's list into every
+    consumer and mark their untested code as covered."""
+    assert sh.UNTESTED_BASELINE_FILE not in sh.MANIFEST
+
+
+def test_pull_adopts_the_ratchet_and_says_so(tmp_path, monkeypatch, capsys):
+    """End to end, because the ordering is the part that can go wrong: seeding runs the
+    scanner the same pull just copied in, so it has to happen after the copy."""
+    src, dst = tmp_path / "shared", tmp_path / "proj"
+    _seed(src, "scripts/x.py", "v1")
+    _ratchet_project(dst)
+    monkeypatch.setattr(sh, "REPO_ROOT", dst)
+    monkeypatch.setattr(sh, "MANIFEST", ("scripts/x.py",))
+    monkeypatch.setattr(sh, "git_head", lambda p: "abc1234")
+    assert sh.main(["--pull", "--src", str(src), "--allow-untagged"]) == 0
+    assert "untested-symbol ratchet" in capsys.readouterr().out
+    assert sh.read_untested_baseline(dst) == ["src/acme.py::alpha"]
+
+
+def test_a_second_pull_does_not_say_it_again(tmp_path, monkeypatch, capsys):
+    """Adoption happens once. Reporting it on every pull would read as the debt being
+    rewritten each time, which is the one thing the seeder must never do."""
+    src, dst = tmp_path / "shared", tmp_path / "proj"
+    _seed(src, "scripts/x.py", "v1")
+    _ratchet_project(dst)
+    monkeypatch.setattr(sh, "REPO_ROOT", dst)
+    monkeypatch.setattr(sh, "MANIFEST", ("scripts/x.py",))
+    monkeypatch.setattr(sh, "git_head", lambda p: "abc1234")
+    sh.main(["--pull", "--src", str(src), "--allow-untagged"])
+    capsys.readouterr()
+    assert sh.main(["--pull", "--src", str(src), "--allow-untagged"]) == 0
+    assert "untested-symbol ratchet" not in capsys.readouterr().out
