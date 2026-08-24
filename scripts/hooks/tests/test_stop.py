@@ -9,6 +9,7 @@ config seam exists to prevent.
 """
 
 import io
+import json
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -310,14 +311,16 @@ def test_parse_host_port_variants():
 
 
 def test_run_checks_skips_missing_tool(monkeypatch):
-    monkeypatch.setattr(hook, "_command_for", lambda name: None)
+    monkeypatch.setattr(hook, "_command_for", lambda name, root=None: None)
     assert hook.run_checks([hook.CHECK_FRONTEND]) == []
 
 
 def test_run_checks_collects_failures(monkeypatch):
     import subprocess as sp
 
-    monkeypatch.setattr(hook, "_command_for", lambda name: (["true"], hook.REPO_ROOT, None))
+    monkeypatch.setattr(
+        hook, "_command_for", lambda name, root=None: (["true"], hook.REPO_ROOT, None)
+    )
     monkeypatch.setattr(
         hook.subprocess,
         "run",
@@ -333,7 +336,9 @@ def test_run_checks_oserror_is_skip_not_failure(monkeypatch):
     def boom(*a, **k):
         raise OSError("no such tool")
 
-    monkeypatch.setattr(hook, "_command_for", lambda name: (["nope"], hook.REPO_ROOT, None))
+    monkeypatch.setattr(
+        hook, "_command_for", lambda name, root=None: (["nope"], hook.REPO_ROOT, None)
+    )
     monkeypatch.setattr(hook.subprocess, "run", boom)
     assert hook.run_checks([hook.CHECK_LINT]) == []
 
@@ -375,24 +380,26 @@ def sandboxed_verify(monkeypatch, tmp_path):
 
 
 def test_verify_skips_when_opted_out(monkeypatch):
-    monkeypatch.setattr(hook, "run_checks", lambda names: [("lint", None, "x")])
+    monkeypatch.setattr(hook, "run_checks", lambda names, root=None: [("lint", None, "x")])
     assert hook.verify("{}", {hook.SKIP_VERIFY_ENV: "1"}) == 0
 
 
 def test_verify_returns_two_on_failure(monkeypatch, sandboxed_verify):
     monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [])
-    monkeypatch.setattr(hook, "run_checks", lambda names: [("lint", "logs/lint-errors.log", "")])
+    monkeypatch.setattr(
+        hook, "run_checks", lambda names, root=None: [("lint", "logs/lint-errors.log", "")]
+    )
     assert hook.verify("{}", {}) == 2
 
 
 def test_verify_returns_two_when_db_tests_fail(monkeypatch, sandboxed_verify):
-    monkeypatch.setattr(hook, "run_checks", lambda names: [])
+    monkeypatch.setattr(hook, "run_checks", lambda names, root=None: [])
     monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [("tests", None, "F app/x")])
     assert hook.verify("{}", {}) == 2
 
 
 def test_verify_returns_zero_when_clean(monkeypatch, sandboxed_verify):
-    monkeypatch.setattr(hook, "run_checks", lambda names: [])
+    monkeypatch.setattr(hook, "run_checks", lambda names, root=None: [])
     monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [])
     assert hook.verify("{}", {}) == 0
 
@@ -405,14 +412,16 @@ def test_verify_still_runs_the_checks_on_a_continuation_stop(monkeypatch, sandbo
     looking green. The flag now only decides whether the round counter restarts.
     """
     ran = []
-    monkeypatch.setattr(hook, "run_checks", lambda names: ran.append(names) or [])
+    monkeypatch.setattr(hook, "run_checks", lambda names, root=None: ran.append(names) or [])
     monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [])
     assert hook.verify('{"stop_hook_active": true}', {}) == 0
     assert ran, "a continuation stop must still verify -- otherwise a fix is never checked"
 
 
 def test_verify_blocks_repeatedly_then_stands_down(monkeypatch, sandboxed_verify):
-    monkeypatch.setattr(hook, "run_checks", lambda names: [("lint", None, "still broken")])
+    monkeypatch.setattr(
+        hook, "run_checks", lambda names, root=None: [("lint", None, "still broken")]
+    )
     monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [])
 
     # First failing stop of a chain blocks and records round 1.
@@ -435,7 +444,7 @@ def test_verify_blocks_repeatedly_then_stands_down(monkeypatch, sandboxed_verify
 
 def test_verify_clears_the_counter_once_green(monkeypatch, sandboxed_verify):
     sandboxed_verify["value"] = 2
-    monkeypatch.setattr(hook, "run_checks", lambda names: [])
+    monkeypatch.setattr(hook, "run_checks", lambda names, root=None: [])
     monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [])
     assert hook.verify("{}", {}) == 0
     assert sandboxed_verify["value"] == 0, "the next failure must start from a full budget"
@@ -449,7 +458,7 @@ def test_verify_verifies_committed_work(monkeypatch, tmp_path):
     monkeypatch.setattr(hook, "write_verify_artifact", lambda failures, repo_root=None: None)
     monkeypatch.setattr(hook, "read_rounds", lambda *a, **k: 0)
     monkeypatch.setattr(hook, "write_rounds", lambda *a, **k: None)
-    monkeypatch.setattr(hook, "run_checks", lambda names: seen.append(names) or [])
+    monkeypatch.setattr(hook, "run_checks", lambda names, root=None: seen.append(names) or [])
     monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [])
     assert hook.verify("{}", {}) == 0
     assert seen and hook.CHECK_LINT in seen[0], (
@@ -903,3 +912,228 @@ def test_run_host_tests_delegates_to_the_db_tier_when_a_db_is_configured(monkeyp
     )
     hook.run_host_tests(["app/main.py"], {}, tmp_path)
     assert seen == [(["app/main.py"], tmp_path)], "the DB tier owns infra gating, not this"
+
+
+# --- Which tree the gate verifies ------------------------------------------
+#
+# The reported defect: a session whose every edit was routed into an ephemeral box had
+# its Stop gate verify the *static checkout* instead, because `CLAUDE_PROJECT_DIR` — and
+# so `REPO_ROOT` — names the checkout. It blocked twice on two failures belonging to the
+# branch that checkout was parked on, work the session had never touched and could not
+# fix. Every test below is written against tmp_path and the payload, never against this
+# machine's layout, so it passes in a consumer that has no box tier at all.
+
+
+def _lease_workspace(tmp_path, project="proj", box="proj--task-0824", **lease):
+    """A checkout with a workspace lease file beside it. Returns (repo_root, box_path)."""
+    repo_root = tmp_path / project
+    repo_root.mkdir()
+    box_path = tmp_path / hook.BOXES_DIR_NAME / box
+    (box_path / ".git").mkdir(parents=True)
+    entry = {"project": project, "kind": "task", "session": "s" * 36, "branch": "agent/x"}
+    entry.update(lease)
+    (tmp_path / hook.BOXES_DIR_NAME / hook.LEASE_FILE_NAME).write_text(
+        json.dumps({"boxes": {box: entry}}), encoding="utf-8"
+    )
+    return repo_root, box_path
+
+
+class TestSessionId:
+    def test_reads_the_payload_field(self):
+        assert hook.session_id('{"session_id": "abc123"}') == "abc123"
+
+    def test_whitespace_is_stripped(self):
+        assert hook.session_id('{"session_id": "  abc  "}') == "abc"
+
+    def test_absent_field_is_empty(self):
+        assert hook.session_id('{"stop_hook_active": true}') == ""
+
+    def test_unparseable_payload_is_empty(self):
+        assert hook.session_id("") == ""
+        assert hook.session_id("not json") == ""
+        assert hook.session_id("[1, 2]") == ""
+
+    def test_a_non_string_id_is_empty(self):
+        assert hook.session_id('{"session_id": 7}') == ""
+
+
+class TestSessionsMatch:
+    """Mirrors `worktree.sessions_match`; a box cut by hand carries an abbreviated id."""
+
+    def test_exact(self):
+        # Spelled as a real session id rather than a bare hex run: detect-secrets reads
+        # an undashed one as a high-entropy string and fails the commit.
+        full = "250c0cdc-f240-4813-9105-8a9503778a59"
+        assert hook.sessions_match(full, full)
+
+    def test_an_abbreviation_still_names_its_session(self):
+        full = "250c0cdc-f240-4813-9105-8a9503778a59"
+        assert hook.sessions_match("250c0cdc", full)
+        assert hook.sessions_match(full, "250c0cdc")
+
+    def test_too_short_a_prefix_is_not_a_match(self):
+        short = "a" * (hook.SESSION_PREFIX_MIN - 1)
+        assert not hook.sessions_match(short, short + "bbbbbbbb")
+
+    def test_an_unowned_lease_matches_nobody(self):
+        assert not hook.sessions_match("", "abcdefgh")
+        assert not hook.sessions_match("abcdefgh", "")
+
+
+class TestSessionBox:
+    def test_finds_the_box_this_session_holds(self, tmp_path):
+        repo_root, box_path = _lease_workspace(tmp_path, session="a" * 36)
+        assert hook.session_box("a" * 36, repo_root) == box_path
+
+    def test_an_abbreviated_lease_still_matches(self, tmp_path):
+        repo_root, box_path = _lease_workspace(tmp_path, session="abcdefgh")
+        assert hook.session_box("abcdefgh-1111-2222", repo_root) == box_path
+
+    def test_another_sessions_box_is_not_this_ones(self, tmp_path):
+        repo_root, _box = _lease_workspace(tmp_path, session="a" * 36)
+        assert hook.session_box("b" * 36, repo_root) is None
+
+    def test_a_box_for_another_project_is_ignored(self, tmp_path):
+        _lease_workspace(tmp_path, project="proj", session="a" * 36)
+        (tmp_path / "other").mkdir()
+        assert hook.session_box("a" * 36, tmp_path / "other") is None
+
+    def test_a_preview_box_is_never_verified(self, tmp_path):
+        """A preview is a throwaway copy of somebody else's branch, brought up to be
+        looked at. Verifying it blocks this session on a tree it cannot fix."""
+        repo_root, _box = _lease_workspace(tmp_path, kind="preview", session="a" * 36)
+        assert hook.session_box("a" * 36, repo_root) is None
+
+    def test_a_reaped_box_falls_back(self, tmp_path):
+        """`reconcile` destroys boxes under disk pressure; the lease can outlive one."""
+        repo_root, box_path = _lease_workspace(tmp_path, session="a" * 36)
+        (box_path / ".git").rmdir()
+        assert hook.session_box("a" * 36, repo_root) is None
+
+    def test_no_lease_file_is_the_ordinary_case(self, tmp_path):
+        """Every consuming project, every CI runner, every fresh clone."""
+        repo_root = tmp_path / "proj"
+        repo_root.mkdir()
+        assert hook.session_box("a" * 36, repo_root) is None
+
+    def test_unreadable_json_never_raises(self, tmp_path):
+        repo_root, _box = _lease_workspace(tmp_path, session="a" * 36)
+        (tmp_path / hook.BOXES_DIR_NAME / hook.LEASE_FILE_NAME).write_text(
+            "{ truncated", encoding="utf-8"
+        )
+        assert hook.session_box("a" * 36, repo_root) is None
+
+    def test_a_malformed_entry_is_skipped_not_fatal(self, tmp_path):
+        repo_root, _box = _lease_workspace(tmp_path, session="a" * 36)
+        (tmp_path / hook.BOXES_DIR_NAME / hook.LEASE_FILE_NAME).write_text(
+            json.dumps({"boxes": {"junk": "not a mapping"}}), encoding="utf-8"
+        )
+        assert hook.session_box("a" * 36, repo_root) is None
+
+    def test_no_session_id_means_no_lookup(self, tmp_path):
+        repo_root, _box = _lease_workspace(tmp_path, session="a" * 36)
+        assert hook.session_box("", repo_root) is None
+
+
+class TestVerifyRoot:
+    def test_the_session_box_wins(self, tmp_path):
+        repo_root, box_path = _lease_workspace(tmp_path, session="a" * 36)
+        payload = json.dumps({"session_id": "a" * 36})
+        assert hook.verify_root(payload, repo_root) == box_path
+
+    def test_no_box_is_the_checkout_exactly_as_before(self, tmp_path):
+        repo_root = tmp_path / "proj"
+        repo_root.mkdir()
+        payload = json.dumps({"session_id": "a" * 36})
+        assert hook.verify_root(payload, repo_root) == repo_root
+
+    def test_an_empty_payload_is_the_checkout(self, tmp_path):
+        repo_root, _box = _lease_workspace(tmp_path, session="a" * 36)
+        assert hook.verify_root("", repo_root) == repo_root
+
+
+class TestChecksFollowTheRoot:
+    """The behaviour that matters: the commands run against the tree that was resolved."""
+
+    def test_a_box_root_re_roots_every_project_owned_script(self, tmp_path):
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "lint-all.py").write_text("", encoding="utf-8")
+        argv, cwd, _artifact = hook._command_for(hook.CHECK_LINT, tmp_path)
+        assert cwd == tmp_path
+        assert str(hook.LINT_ALL) not in argv
+        assert str(tmp_path / "scripts" / "lint-all.py") in argv
+
+    def test_the_default_root_is_unchanged(self, tmp_path, monkeypatch):
+        """The constants stay the single spelling, and stay monkeypatchable."""
+        script = tmp_path / "lint-all.py"
+        script.write_text("", encoding="utf-8")
+        monkeypatch.setattr(hook, "LINT_ALL", script)
+        argv, cwd, _artifact = hook._command_for(hook.CHECK_LINT)
+        assert cwd == hook.REPO_ROOT
+        assert str(script) in argv
+
+    def test_the_lock_tier_reads_the_boxs_copy(self, tmp_path):
+        """Absent there, absent for this run -- the box is what holds the change."""
+        assert hook._command_for(hook.CHECK_LOCKS, tmp_path) is None
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "check-lock-markers.py").write_text("", encoding="utf-8")
+        spec = hook._command_for(hook.CHECK_LOCKS, tmp_path)
+        assert spec is not None and spec[1] == tmp_path
+
+    def test_the_test_runner_follows_the_root(self, tmp_path):
+        (tmp_path / "scripts").mkdir()
+        runner = tmp_path / "scripts" / "run-tests.py"
+        runner.write_text("", encoding="utf-8")
+        argv, artifact = hook.test_runner_argv(["tests/test_x.py"], tmp_path)
+        assert str(runner) in argv
+        assert artifact == hook.TEST_ARTIFACT
+
+    def test_run_checks_passes_the_root_down(self, monkeypatch, tmp_path):
+        seen: list[Path | None] = []
+        monkeypatch.setattr(hook, "_command_for", lambda name, root=None: seen.append(root) or None)
+        hook.run_checks([hook.CHECK_LINT], tmp_path)
+        assert seen == [tmp_path]
+
+
+def test_verify_checks_the_session_box_not_the_checkout(monkeypatch, tmp_path):
+    """The regression test for the report: revert `verify_root` out of `verify` and the
+    roots below are `REPO_ROOT`, which is the checkout the session never wrote to."""
+    repo_root, box_path = _lease_workspace(tmp_path, session="a" * 36)
+    monkeypatch.setattr(hook, "REPO_ROOT", repo_root)
+    monkeypatch.setattr(hook, "verify_enabled", lambda env: True)
+    seen: dict[str, object] = {}
+
+    def _note(key, value, result=None):
+        seen[key] = value
+        return result
+
+    monkeypatch.setattr(hook, "_git_status_porcelain", lambda root: _note("status", root, ""))
+    monkeypatch.setattr(hook, "_git_branch_diff", lambda root: "")
+    monkeypatch.setattr(hook, "run_checks", lambda names, root=None: _note("checks", root, []))
+    monkeypatch.setattr(
+        hook, "run_host_tests", lambda paths, env, root=None: _note("tests", root, [])
+    )
+    monkeypatch.setattr(
+        hook, "write_verify_artifact", lambda failures, root=None: _note("artifact", root)
+    )
+    monkeypatch.setattr(hook, "write_rounds", lambda value, root=None: _note("rounds", root))
+
+    assert hook.verify(json.dumps({"session_id": "a" * 36}), {}) == 0
+    assert seen["status"] == box_path
+    assert seen["checks"] == box_path
+    assert seen["tests"] == box_path
+    assert seen["artifact"] == box_path
+    assert seen["rounds"] == box_path
+
+
+def test_a_blocked_stop_says_which_tree_it_checked(capsys, tmp_path):
+    """Artifact paths are relative to the tree that was checked. Without the line, the
+    agent opens the checkout's stale `logs/stop-verify.log` and sees another run."""
+    hook._print_verify_failures([("lint", None, "boom")], blocking=True, root=tmp_path)
+    err = capsys.readouterr().err
+    assert str(tmp_path) in err and "box" in err
+
+
+def test_an_ordinary_stop_says_nothing_about_boxes(capsys):
+    hook._print_verify_failures([("lint", None, "boom")], blocking=True)
+    assert "box" not in capsys.readouterr().err

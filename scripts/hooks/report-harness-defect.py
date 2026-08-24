@@ -50,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     path = harness_events.record(
         "agent-report",
         (
-            ("project", REPO_ROOT.name),
+            ("project", harness_events.project_name(REPO_ROOT)),
             ("version", harness_config.harness_version(REPO_ROOT)),
             ("command", args.command),
             ("message", args.message),

@@ -25,6 +25,14 @@ strongest verification happened before a commit and none happened after, which i
 backwards: the committed branch is exactly what CI will see. `changed_paths` is now
 unioned with `git diff --name-only origin/<default>...HEAD`.
 
+**And the tree is the session's, not this file's.** `CLAUDE_PROJECT_DIR` points the hook
+at the static checkout, so a session whose edits were all routed into an ephemeral box
+had its Stop gate verify a tree it never touched — blocking twice, in one recorded case,
+on failures belonging to the branch that checkout happened to be parked on. `verify_root`
+reads the workspace lease file and verifies the box this session holds; with no lease
+file, no entry, or no box tier at all — which is every consuming project — it is
+`REPO_ROOT` exactly as before.
+
 **It runs up to `MAX_VERIFY_ROUNDS` rounds, blocking on all but the last.**
 `stop_hook_active` is a boolean, so honouring it alone meant verification ran on the
 first stop only: the agent was told what was broken, "fixed" it, stopped again, and the
@@ -41,7 +49,8 @@ env_prefix`), gated on relevant files changing, and skips cleanly when tooling/i
 absent.
 
 `skin_changed` and the verification helpers (`stop_hook_active`, `verify_enabled`,
-`changed_paths`, `committed_paths`, `all_changed`, `blocked_rounds`, `should_block`,
+`session_id`, `sessions_match`, `session_box`, `verify_root`, `changed_paths`,
+`committed_paths`, `all_changed`, `blocked_rounds`, `should_block`,
 `select_checks`, `run_checks`) are pure and unit-tested
 (`scripts/hooks/tests/test_stop.py`); each external step is its own importable,
 independently tested script.
@@ -249,6 +258,123 @@ def stop_hook_active(raw_stdin: str) -> bool:
 def verify_enabled(env: Mapping[str, str]) -> bool:
     """False when the operator has opted out of pre-stop verification."""
     return env.get(SKIP_VERIFY_ENV) != "1"
+
+
+# --- Which tree this stop verifies -----------------------------------------
+#
+# `REPO_ROOT` is where *this file* lives, and for a whole class of session that is not
+# where the work is. Claude Code resolves the hook command through `CLAUDE_PROJECT_DIR`,
+# which is the session's static checkout, so an agent whose every edit was routed into an
+# ephemeral box got a Stop gate pointed at a checkout it never touched: it verified
+# whatever branch that checkout happened to be parked on, and blocked on failures
+# belonging to somebody else's work. That is not a hypothetical -- a session whose PR gate
+# was fully green was blocked twice by two failures on the checkout's `release/…` branch,
+# with no edit of its own anywhere in the tree being checked.
+#
+# The box tier is a *workspace* facility rather than a project one, so the lookup below is
+# the stdlib-only half of it: read the lease file, match on the session id, take the
+# directory. `worktree.py` owns these names, and a hook cannot import it -- hooks run
+# before a venv exists and from a checkout that has no workspace scripts at all. The
+# duplication is the same trade `harness_events.BOX_NAME_SEP` makes, for the same reason.
+#
+# **Absence is the ordinary case, not an error.** Every consuming project has no
+# `.worktrees/` at all; so does a CI runner, a fresh clone, and any session working
+# directly in its checkout. All of them fall through to `REPO_ROOT` and behave exactly as
+# they did before this existed.
+BOXES_DIR_NAME = ".worktrees"
+LEASE_FILE_NAME = "leases.json"
+# `worktree.SESSION_PREFIX_MIN`: a box cut by hand carries `--session <first 8 hex>`, and
+# the abbreviation has to keep naming the session that abbreviated it.
+SESSION_PREFIX_MIN = 8
+# Only a task box holds a session's work. A `preview` box is a throwaway copy of somebody
+# else's branch, brought up to be looked at in a browser -- verifying it would block this
+# session on a tree it did not write and cannot fix.
+BOX_KIND_TASK = "task"
+
+
+def session_id(raw_stdin: str) -> str:
+    """The session id from the hook payload, or '' when there is none to read."""
+    try:
+        payload = json.loads(raw_stdin)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    value = payload.get("session_id")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def sessions_match(recorded: str, session: str) -> bool:
+    """Does a lease's session id name this session?
+
+    Exact, or either id a prefix of the other with the shorter side at least
+    `SESSION_PREFIX_MIN` characters. Mirrors `worktree.sessions_match` -- see the note
+    above for why this is a copy rather than an import.
+    """
+    if not recorded or not session:
+        return False
+    if recorded == session:
+        return True
+    short, long = sorted((recorded, session), key=len)
+    return len(short) >= SESSION_PREFIX_MIN and long.startswith(short)
+
+
+def session_box(session: str, repo_root: Path = REPO_ROOT) -> Path | None:
+    """The ephemeral box holding this session's work for `repo_root`, or None.
+
+    Best-effort by contract, in every direction: no lease file, unreadable JSON, an
+    entry whose directory has since been reaped, no session id on the payload -- each
+    returns None, and the caller verifies the checkout as before. A Stop gate must never
+    fail *because* of this lookup; the worst it may do is decline to improve on the
+    default.
+    """
+    if not session:
+        return None
+    project = repo_root.name
+    try:
+        raw = (repo_root.parent / BOXES_DIR_NAME / LEASE_FILE_NAME).read_text(encoding="utf-8")
+        boxes = json.loads(raw).get("boxes", {})
+        if not isinstance(boxes, dict):
+            return None
+        for name, lease in boxes.items():
+            if not isinstance(lease, dict):
+                continue
+            if lease.get("project") != project:
+                continue
+            if lease.get("kind", BOX_KIND_TASK) != BOX_KIND_TASK:
+                continue
+            if not sessions_match(str(lease.get("session", "")), session):
+                continue
+            path = repo_root.parent / BOXES_DIR_NAME / name
+            # A husk -- a box whose `git worktree remove` died partway -- is a directory
+            # with no `.git`, and every check below would run against a tree git has
+            # stopped tracking. Fall back to the checkout instead.
+            if (path / ".git").exists():
+                return path
+    except (OSError, ValueError, AttributeError):
+        return None
+    return None
+
+
+def verify_root(raw_stdin: str, repo_root: Path = REPO_ROOT) -> Path:
+    """The tree this stop should verify: the session's box when it has one."""
+    return session_box(session_id(raw_stdin), repo_root) or repo_root
+
+
+def _repo_script(root: Path, default: Path) -> Path:
+    """`default`, re-rooted at `root` when that is a different tree.
+
+    The module constants stay the single spelling of each script's location -- and stay
+    monkeypatchable, which is how the "this project has no such script" tiers are
+    tested. When the tree being verified is a box, the same relative path inside it is
+    what the checks must run, because the box is the copy holding the change.
+    """
+    if root == REPO_ROOT:
+        return default
+    try:
+        return root / default.relative_to(REPO_ROOT)
+    except ValueError:
+        return default
 
 
 def changed_paths(porcelain: str) -> list[str]:
@@ -531,7 +657,7 @@ def host_db_env(repo_root: Path = REPO_ROOT) -> dict[str, str] | None:
     return env
 
 
-def test_runner_argv(targets: list[str]) -> tuple[list[str], str | None]:
+def test_runner_argv(targets: list[str], root: Path | None = None) -> tuple[list[str], str | None]:
     """(argv, artifact) for the application test tier.
 
     Prefers the project's own `run-tests.py`: it writes `logs/test-failures.log` with
@@ -543,9 +669,11 @@ def test_runner_argv(targets: list[str]) -> tuple[list[str], str | None]:
     `sys.executable -m pytest` -- which is that same interpreter, so the venv is
     preserved through the extra hop.
     """
-    if RUN_TESTS.exists():
-        return [verify_python(), str(RUN_TESTS), *targets], TEST_ARTIFACT
-    return [verify_python(), "-m", "pytest", *targets, "-q"], None
+    base = REPO_ROOT if root is None else root
+    runner = _repo_script(base, RUN_TESTS)
+    if runner.exists():
+        return [verify_python(base), str(runner), *targets], TEST_ARTIFACT
+    return [verify_python(base), "-m", "pytest", *targets, "-q"], None
 
 
 def _pytest_failures(
@@ -558,7 +686,7 @@ def _pytest_failures(
     captured and reported. An OS error is a skip: verification never blocks the agent
     over a local tooling gap.
     """
-    argv, artifact = test_runner_argv(targets)
+    argv, artifact = test_runner_argv(targets, repo_root)
     try:
         result = subprocess.run(
             argv,
@@ -643,8 +771,10 @@ def run_db_tests(
         _compose_stop(started, repo_root)
 
 
-def _command_for(name: str) -> tuple[list[str], Path, str | None] | None:
+def _command_for(name: str, root: Path | None = None) -> tuple[list[str], Path, str | None] | None:
     """(argv, cwd, artifact_path) for a check, or None when its tool is absent.
+
+    `root` is the tree to check -- `verify_root`'s answer, defaulting to this checkout.
 
     "Absent" includes a *script* that this project does not have. Returning an argv
     for a missing script does not skip the check -- the interpreter exits 2 with
@@ -657,8 +787,11 @@ def _command_for(name: str) -> tuple[list[str], Path, str | None] | None:
     is what lets CI hold a project to it: `scripts/hooks/tests/test_repo_contract.py`
     fails when a script this project's own config makes reachable is missing.
     """
+    base = REPO_ROOT if root is None else root
+    lint_all = _repo_script(base, LINT_ALL)
+    lock_markers = _repo_script(base, CHECK_LOCK_MARKERS)
     if name == CHECK_LINT:
-        if not LINT_ALL.exists():
+        if not lint_all.exists():
             return None
         # --no-secrets is part of the contract between this hook and lint-all.py: a
         # project whose lint runner has a detect-secrets pass skips it here (it is the
@@ -667,27 +800,27 @@ def _command_for(name: str) -> tuple[list[str], Path, str | None] | None:
         # way lint-all.py must *parse* it -- argparse rejecting it exits 2, which reads
         # as a permanent lint failure on every single Stop.
         return (
-            [verify_python(), str(LINT_ALL), "--changed", "--no-secrets"],
-            REPO_ROOT,
+            [verify_python(base), str(lint_all), "--changed", "--no-secrets"],
+            base,
             "logs/lint-errors.log",
         )
     if name == CHECK_SCRIPT_TESTS:
-        return ([verify_python(), "-m", "pytest", "scripts/hooks/tests/", "-q"], REPO_ROOT, None)
+        return ([verify_python(base), "-m", "pytest", "scripts/hooks/tests/", "-q"], base, None)
     if name == CHECK_LOCKS:
         # Optional tier: the script is project-owned (its sentinels name that
         # project's lockfiles), so a project without one simply has no tier.
-        if not CHECK_LOCK_MARKERS.exists():
+        if not lock_markers.exists():
             return None
-        return ([verify_python(), str(CHECK_LOCK_MARKERS)], REPO_ROOT, None)
+        return ([verify_python(base), str(lock_markers)], base, None)
     if name == CHECK_FRONTEND:
         npm = shutil.which("npm")
         if not npm:
             return None
-        return ([npm, *CFG.frontend.test_cmd], REPO_ROOT / CFG.frontend.dir, None)
+        return ([npm, *CFG.frontend.test_cmd], base / CFG.frontend.dir, None)
     return None
 
 
-def run_checks(names: list[str]) -> list[tuple[str, str | None, str]]:
+def run_checks(names: list[str], root: Path | None = None) -> list[tuple[str, str | None, str]]:
     """Run selected checks; return (name, artifact, tail) for each that failed.
 
     A missing tool or an OS error is a skip, never a failure: verification must
@@ -695,7 +828,7 @@ def run_checks(names: list[str]) -> list[tuple[str, str | None, str]]:
     """
     failures: list[tuple[str, str | None, str]] = []
     for name in names:
-        spec = _command_for(name)
+        spec = _command_for(name, root)
         if spec is None:
             continue
         argv, cwd, artifact = spec
@@ -741,7 +874,9 @@ def write_verify_artifact(
 
 
 def _print_verify_failures(
-    failures: list[tuple[str, str | None, str]], blocking: bool = True
+    failures: list[tuple[str, str | None, str]],
+    blocking: bool = True,
+    root: Path = REPO_ROOT,
 ) -> None:
     """Status line plus artifact paths -- never the failure text itself.
 
@@ -760,8 +895,12 @@ def _print_verify_failures(
     lines = [verdict]
     tiers = ", ".join(name for name, _artifact, _tail in failures)
     lines.append(f"  failed: {tiers}")
+    # Artifact paths are relative to the tree that was checked, and that is not always
+    # this one -- say which, or the agent opens the checkout's stale copy of the file.
+    if root != REPO_ROOT:
+        lines.append(f"  checked: {root} (this session's box)")
     for path in dict.fromkeys(
-        [VERIFY_ARTIFACT] + [a for _n, a, _t in failures if a and (REPO_ROOT / a).exists()]
+        [VERIFY_ARTIFACT] + [a for _n, a, _t in failures if a and (root / a).exists()]
     ):
         lines.append(f"  details: {path}")
     lines.append(
@@ -781,36 +920,40 @@ def verify(raw_stdin: str, env: Mapping[str, str]) -> int:
     """
     if not verify_enabled(env):
         return 0
-    paths = all_changed(_git_status_porcelain(REPO_ROOT), _git_branch_diff(REPO_ROOT))
+    # Not REPO_ROOT: the session's edits may all be in a box, and verifying the checkout
+    # instead means blocking this session on another branch's failures. See `verify_root`.
+    root = verify_root(raw_stdin, REPO_ROOT)
+    paths = all_changed(_git_status_porcelain(root), _git_branch_diff(root))
     # Infra-light tiers (lint, script-tests, locks, frontend) plus the application
     # test tier, which arranges its own db+redis reachability/autostart/teardown when
     # this project has a DB and just runs pytest when it does not.
-    failures = run_checks(select_checks(paths))
-    failures += run_host_tests(paths, env)
-    write_verify_artifact(failures)
+    failures = run_checks(select_checks(paths), root)
+    failures += run_host_tests(paths, env, root)
+    write_verify_artifact(failures, root)
     if not failures:
-        write_rounds(0)  # green: the next failure starts from a full budget.
+        write_rounds(0, root)  # green: the next failure starts from a full budget.
         return 0
 
-    rounds_used = blocked_rounds(read_rounds(), stop_hook_active(raw_stdin))
+    rounds_used = blocked_rounds(read_rounds(root), stop_hook_active(raw_stdin))
     if not should_block(rounds_used):
-        write_rounds(0)
-        _print_verify_failures(failures, blocking=False)
+        write_rounds(0, root)
+        _print_verify_failures(failures, blocking=False, root=root)
         return 0
-    write_rounds(rounds_used)
-    _print_verify_failures(failures, blocking=True)
+    write_rounds(rounds_used, root)
+    _print_verify_failures(failures, blocking=True, root=root)
     return 2
 
 
 def main() -> int:
     raw_stdin = _read_stdin()
 
-    if CFG.frontend.enabled and skin_changed(_git_skin_status(REPO_ROOT)):
+    root = verify_root(raw_stdin, REPO_ROOT)
+    if CFG.frontend.enabled and skin_changed(_git_skin_status(root)):
         npm = shutil.which("npm")
         if npm:
             subprocess.run(
                 [npm, *CFG.frontend.typecheck_cmd],
-                cwd=REPO_ROOT / CFG.frontend.dir,
+                cwd=root / CFG.frontend.dir,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )

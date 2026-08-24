@@ -45,18 +45,58 @@ LEDGER = Path("logs") / "harness-events.log"
 # recognise it, not to replay it. Grep the session transcript for the rest.
 VALUE_LIMIT = 300
 
+# Two fields are the exception, and the flat 300 cut exactly the half that mattered.
+#
+# `message` is an agent's *report*: a diagnosis followed by what it thinks the fix is.
+# The proposal is at the end by the nature of the sentence, so a uniform cap deleted the
+# actionable half of every report long enough to need one -- three of the four
+# agent-reports open on this machine on 2026-08-24 ended mid-word, and one lost its
+# entire recommendation ("... Slug the branc"). `detail` is a spawn exception, where
+# git's own reason is likewise the tail: five `guard-spawn-failed` rows recorded the
+# command that failed and truncated before saying why.
+#
+# The line format is one record per line with tabs between fields, so length costs
+# nothing but disk, and `clean` still collapses newlines. These are ceilings against a
+# pathological value reaching the file, not an editorial budget.
+FIELD_LIMITS = {"message": 4000, "detail": 2000}
 
-def clean(value: object) -> str:
+
+# `<project>--<slug>-<MMDD>` is `worktree.py`'s box-naming rule, and `project_of` there
+# owns it. This is the stdlib-only half a hook can reach: hooks run before the venv
+# exists, so importing that module is not available to them.
+BOX_NAME_SEP = "--"
+
+
+def project_name(root: Path) -> str:
+    """The project a checkout belongs to -- the repo name, never a box directory's.
+
+    Every writer used `root.name`, which for an agent session is usually an *ephemeral
+    box*: `devkit--guard-quoted-redirect-0823`. Grouping by project months later is the
+    ledger's whole purpose, and 28% of its rows named a project that does not exist and
+    never will -- twenty pseudo-projects in three days, one per box, none of them
+    greppable as the repo the work was actually in. The guard already recorded the real
+    name because it resolves a project to decide anything at all; the three writers that
+    had no such reason to know were the ones that got it wrong.
+    """
+    return root.name.split(BOX_NAME_SEP, 1)[0] or root.name
+
+
+def limit_for(key: str) -> int:
+    """How much of `key`'s value the ledger keeps. See `FIELD_LIMITS`."""
+    return FIELD_LIMITS.get(key, VALUE_LIMIT)
+
+
+def clean(value: object, limit: int = VALUE_LIMIT) -> str:
     """One field value, made safe for the line format: whitespace collapsed (tabs and
     newlines are the field and record separators), truncated, never empty."""
     text = " ".join(str(value).split()) or "-"
-    return text[:VALUE_LIMIT]
+    return text[:limit]
 
 
 def event_line(stamp: str, event: str, fields: tuple[tuple[str, object], ...]) -> str:
     """One ledger record. Pure, so the format is testable."""
     pairs = (("event", event), *fields)
-    return stamp + "\t" + "\t".join(f"{key}={clean(value)}" for key, value in pairs)
+    return stamp + "\t" + "\t".join(f"{key}={clean(value, limit_for(key))}" for key, value in pairs)
 
 
 def ledger_path(root: Path | None = None) -> Path | None:

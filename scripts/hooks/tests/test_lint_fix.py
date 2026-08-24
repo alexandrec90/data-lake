@@ -210,7 +210,62 @@ def test_main_relays_remaining_errors(monkeypatch, tmp_path, capsys):
     assert "F821" in err
     # Fixers ran before the reporting check, against the project-relative path.
     assert ("format", "x.py") in calls
-    assert ("check", "--fix", "x.py") in calls
+    assert ("check", "--fix", "--unfixable", "F401", "x.py") in calls
+
+
+def _ruff_argv(monkeypatch, tmp_path, source: str) -> list[tuple[str, ...]]:
+    """Every argv `main` hands ruff for a file holding `source`."""
+    f = _project(tmp_path) / "x.py"
+    f.write_text(source)
+    monkeypatch.setattr(lint_fix, "_read_stdin", lambda: _payload(str(f)))
+    monkeypatch.setattr(lint_fix, "find_ruff", lambda root: "ruff")
+    calls: list[tuple[str, ...]] = []
+
+    def record(ruff, *args, **kw):
+        calls.append(args)
+        return result(returncode=0)
+
+    monkeypatch.setattr(lint_fix, "_run", record)
+    lint_fix.main()
+    return calls
+
+
+def test_a_mid_edit_rule_is_neither_fixed_nor_reported(monkeypatch, tmp_path):
+    """`F401` judges a *finished* file, and this hook runs on a half-written one.
+
+    Adding `import os` and then, in the next edit, the function that uses it is the
+    normal order for an incremental change. `--fix` deleted the import between the two,
+    and the F821 it became surfaced an edit later pointing at the wrong edit. Reporting
+    it instead would block the edit that added the import, which is worse -- so it is
+    dropped from both runs and left to CI, which sees the file whole.
+
+    Reversion check: drop either flag and one of these two assertions fails.
+    """
+    rules = ",".join(lint_fix.MID_EDIT_RULES)
+    calls = _ruff_argv(monkeypatch, tmp_path, "x = 1\n")
+    fix = next(a for a in calls if a[0] == "check" and "--fix" in a)
+    report = next(a for a in calls if a[0] == "check" and "--fix" not in a)
+    assert ("--unfixable", rules) == fix[fix.index("--unfixable") : fix.index("--unfixable") + 2]
+    assert ("--ignore", rules) == report[report.index("--ignore") : report.index("--ignore") + 2]
+
+
+def test_ruff_itself_keeps_an_import_the_next_edit_will_use(tmp_path):
+    """The flag assertions above prove what was passed; this proves what ruff does with
+    it. Run against the real binary because the whole defect was a behaviour, and a test
+    that only inspects argv would pass against a flag ruff had renamed."""
+    ruff = lint_fix.find_ruff(Path(lint_fix.REPO_ROOT))
+    if not ruff:
+        pytest.skip("no ruff on this machine; the argv assertions above still gate the flags")
+    source = "import os\n"
+    f = tmp_path / "x.py"
+    f.write_text(source)
+    rules = ",".join(lint_fix.MID_EDIT_RULES)
+    subprocess.run(
+        [ruff, "check", "--fix", "--unfixable", rules, "--isolated", "--select", "F", str(f)],
+        capture_output=True,
+        check=False,
+    )
+    assert f.read_text() == source
 
 
 def test_main_missing_file_returns_zero(monkeypatch, tmp_path):
