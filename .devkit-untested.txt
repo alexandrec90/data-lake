@@ -21,7 +21,6 @@ scripts/hooks/enforce-capped-bash.py::split_top_level
 scripts/hooks/enforce-capped-bash.py::statements
 scripts/hooks/enforce-capped-bash.py::strip_prefixes
 scripts/hooks/enforce-capped-bash.py::strip_quoted
-scripts/hooks/harness_config.py::WorktreeConfig
 scripts/hooks/harness_config.py::is_devkit_source
 scripts/hooks/session-sync.py::main
 scripts/hooks/session-sync.py::run_git
