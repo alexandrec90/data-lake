@@ -77,6 +77,21 @@ REPO_ROOT = (Path(__file__).parent / "../..").resolve()
 # the primary's git dir, and requiring a directory would put every box back outside
 # every project.
 PROJECT_MARKERS = ("ruff.toml", ".ruff.toml", "pyproject.toml")
+
+# Rules whose verdict is a statement about a *finished* file, evaluated here against a
+# half-written one. `F401` is the whole list: adding `import os` and then, in the next
+# edit, the function that uses it is the normal order for an incremental change, and this
+# hook fires between the two -- so `--fix` deleted the import every time, and the F821 it
+# became surfaced an edit later, pointing at the second edit rather than at the deletion.
+# It has cost two sessions in the harness-events ledger (2026-08-22, 2026-08-23).
+#
+# Neither half of that can stay. Left fixable it is silently deleted; merely made
+# unfixable it would be *reported*, which for this hook means blocking the edit that
+# added the import -- worse, because it arrives immediately and reads as a rule against
+# writing imports. So it is dropped from both runs, and the claim it makes is left to the
+# place that can make it honestly: `lint-all.py`, the pre-commit gate and CI all see the
+# file whole. That is the same line this hook already draws around mypy and vulture.
+MID_EDIT_RULES = ("F401",)
 PATCH_PATH_RE = re.compile(
     r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*$",
     re.MULTILINE,
@@ -239,11 +254,14 @@ def main() -> int:
         file_arg = ruff_arg(target, root)
         # Deterministic auto-fixers first, silently: formatting and import sorting
         # should never reach the agent as "errors" — they just get applied.
+        mid_edit = ",".join(MID_EDIT_RULES)
         _run(ruff, "format", file_arg, cwd=root)
-        _run(ruff, "check", "--fix", file_arg, cwd=root)
+        _run(ruff, "check", "--fix", "--unfixable", mid_edit, file_arg, cwd=root)
 
         # Whatever remains is a genuine finding ruff can't fix on its own.
-        remaining = _run(ruff, "check", file_arg, "--output-format=concise", cwd=root)
+        remaining = _run(
+            ruff, "check", "--ignore", mid_edit, file_arg, "--output-format=concise", cwd=root
+        )
         if remaining.returncode != 0:
             detail = (remaining.stdout + remaining.stderr).strip()
             failures.append(f"ruff found issues in {path} that need a manual fix:\n{detail}")
