@@ -123,6 +123,26 @@ Two things this does **not** condemn, because neither is waste:
 - **Asking once.** A single `gh pr checks` is one call and often the right answer. The
   waste begins at the *second* identical poll and compounds from there.
 
+**"No checks reported" is not a gate that has not started; it can be a gate that will
+never start.** GitHub builds a `pull_request` run against the *merge* ref, and a PR that
+has gone `CONFLICTING` has no merge ref to build — so no workflow is queued for the head
+commit at all, and `--watch` waits on something nothing will ever produce. The PR page
+does not read that way: it keeps showing the last green gate, from an **older** commit,
+so devkit#180 sat for hours with zero check runs on its head commit and read as gated and
+passing. Ask the one question that distinguishes the two, once, before or instead of
+waiting:
+
+```bash
+gh pr view <N> --json mergeStateStatus,statusCheckRollup
+```
+
+`CONFLICTING` means merge `origin/<default>` and push — the gate starts on the next
+commit. `BLOCKED`/`UNSTABLE`/`CLEAN` mean the run exists and `--watch` is the right call.
+`UNKNOWN` means GitHub has not finished computing mergeability yet, which is the ordinary
+answer in the seconds after a push and says nothing either way — `--watch` covers it.
+That is one extra call at the front, against an unbounded wait plus the polls that follow
+when the wait is abandoned.
+
 When the gate will outlast anything useful you could do meanwhile, the cheapest correct
 move is to stop: report that the branch is pushed and the gate is running, and let the
 result arrive in a fresh session. The same report costs the session floor there, against

@@ -57,7 +57,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: alexandrec90/devkit
-          ref: v0.11.2
+          ref: v0.11.4
           path: .devkit-src
       - uses: actions/setup-python@v7
         with:

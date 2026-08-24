@@ -39,7 +39,16 @@ DEFAULT_BRANCH = "master"
 # and branches created directly by supported coding agents remain managed so adopting
 # the neutral name does not strand work or prevent cleanup.
 BRANCH_PREFIX = "agent/"
-MANAGED_BRANCH_PREFIXES = (BRANCH_PREFIX, "claude/", "codex/")
+# Branches an unattended job cuts, rather than a session working on this project's code.
+# A *sub-namespace* of `BRANCH_PREFIX` rather than a namespace beside it, and that is the
+# whole design: every check in the tier asks `is_managed_task_branch`, so `/ship`, the
+# sweep, `reap`, `reconcile` and the guard keep their answers unchanged, while the
+# provenance becomes readable to the callers that have to tell the two apart. The nightly
+# vendoring sweep cuts a branch in every consumer at once, none of it anyone's task, and
+# `preview-task.py` was offering all of them above the change someone had just asked to
+# look at.
+AUTOMATION_PREFIX = BRANCH_PREFIX + "auto/"
+MANAGED_BRANCH_PREFIXES = (AUTOMATION_PREFIX, BRANCH_PREFIX, "claude/", "codex/")
 SLUG_MAX_LEN = 40
 _SLUG_STRIP_RE = re.compile(r"[^a-z0-9]+")
 
@@ -177,8 +186,18 @@ def slug_from_prompt(text: str, max_len: int = SLUG_MAX_LEN) -> str:
 
 
 def managed_branch_prefix(branch: str) -> str:
-    """The managed task-branch prefix used by ``branch``, or ``""`` when absent."""
-    return next((prefix for prefix in MANAGED_BRANCH_PREFIXES if branch.startswith(prefix)), "")
+    """The managed task-branch prefix used by ``branch``, or ``""`` when absent.
+
+    The **longest** match, not the first one listed. `agent/auto/` and `agent/` both
+    prefix an automation branch, and every caller uses this to strip the prefix off a
+    topic -- so a first-match answer leaves `auto/` in whatever is built from that topic,
+    which for `worktree.box_name` is a path separator inside a directory name and a
+    `COMPOSE_PROJECT_NAME` compose refuses. Matching by length rather than by position
+    also keeps the tuple above an unordered set, which is what nobody editing it will
+    think to preserve.
+    """
+    matched = [prefix for prefix in MANAGED_BRANCH_PREFIXES if branch.startswith(prefix)]
+    return max(matched, key=len, default="")
 
 
 def is_managed_task_branch(branch: str) -> bool:
@@ -186,10 +205,30 @@ def is_managed_task_branch(branch: str) -> bool:
     return bool(managed_branch_prefix(branch))
 
 
-def branch_name(slug: str, existing: set[str], today: _dt.date | None = None) -> str:
-    """Unique `agent/<slug>-<mmdd>` name, disambiguated with -N against existing."""
+def is_automation_branch(branch: str) -> bool:
+    """Whether ``branch`` was cut by an unattended job rather than by an agent session.
+
+    The question a UI-review menu asks about a ref, and the reason `AUTOMATION_PREFIX`
+    is a namespace rather than a word inside the slug: `agent/auto-merge-label-0823` is
+    a task someone gave an agent, and no substring test can tell it from a job's own
+    branch. A path segment can.
+    """
+    return branch.startswith(AUTOMATION_PREFIX)
+
+
+def branch_name(
+    slug: str,
+    existing: set[str],
+    today: _dt.date | None = None,
+    prefix: str = BRANCH_PREFIX,
+) -> str:
+    """Unique `<prefix><slug>-<mmdd>` name, disambiguated with -N against existing.
+
+    `prefix` defaults to the session namespace, so the only callers that pass it are the
+    unattended jobs naming themselves `AUTOMATION_PREFIX`.
+    """
     today = today or _dt.date.today()
-    base = f"{BRANCH_PREFIX}{slug}-{today:%m%d}"
+    base = f"{prefix}{slug}-{today:%m%d}"
     if base not in existing:
         return base
     n = 2

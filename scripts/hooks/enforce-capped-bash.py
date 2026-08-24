@@ -580,7 +580,7 @@ def record_block(raw: str) -> None:
     harness_events.record(
         "capped-bash-block",
         (
-            ("project", REPO_ROOT.name),
+            ("project", harness_events.project_name(REPO_ROOT)),
             ("session", get_value(payload, "session_id", "sessionId") or ""),
             ("version", harness_config.harness_version(REPO_ROOT)),
             (

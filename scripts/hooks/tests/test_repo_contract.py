@@ -112,7 +112,13 @@ def _toml_schema() -> dict[str, frozenset[str]]:
         "python": fields(cfg.PythonConfig),
         "bash": fields(cfg.BashConfig),
         "docker": fields(cfg.DockerConfig),
+        "worktree": fields(cfg.WorktreeConfig),
     }
+
+
+def test_manifest_schema_covers_worktree_config() -> None:
+    fields = frozenset(f.name for f in dataclasses.fields(cfg.WorktreeConfig))
+    assert _toml_schema()["worktree"] == fields
 
 
 def test_manifest_has_no_unknown_keys():

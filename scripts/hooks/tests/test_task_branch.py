@@ -134,6 +134,26 @@ class TestBranchName:
         existing = {"agent/x-0722", "agent/x-0722-2", "agent/x-0722-3"}
         assert tb.branch_name("x", existing, today=dt.date(2026, 7, 22)) == "agent/x-0722-4"
 
+    def test_an_unattended_job_can_name_its_own_namespace(self):
+        """The seam the automation namespace is reached through: one caller passes a
+        prefix, and every session keeps the default."""
+        cut = tb.branch_name(
+            "devkit-upgrade-v0-11-2",
+            set(),
+            today=dt.date(2026, 8, 23),
+            prefix=tb.AUTOMATION_PREFIX,
+        )
+        assert cut == "agent/auto/devkit-upgrade-v0-11-2-0823"
+
+    def test_the_disambiguator_counts_within_the_namespace_it_was_given(self):
+        """A same-day rerun must collide with the automation branch, not with a session's
+        branch of the same topic -- the two are different refs and both may exist."""
+        existing = {"agent/auto/x-0722", "agent/x-0722"}
+        assert (
+            tb.branch_name("x", existing, today=dt.date(2026, 7, 22), prefix=tb.AUTOMATION_PREFIX)
+            == "agent/auto/x-0722-2"
+        )
+
 
 class TestManagedTaskBranch:
     def test_recognizes_neutral_and_compatible_agent_namespaces(self):
@@ -146,6 +166,28 @@ class TestManagedTaskBranch:
 
     def test_reports_the_prefix_for_safe_topic_extraction(self):
         assert tb.managed_branch_prefix("codex/fix-shipping-0813") == "codex/"
+
+    def test_an_automation_branch_stays_a_managed_task_branch(self):
+        """The whole reason the namespace nests inside `agent/`: `/ship`, the sweep,
+        `reap` and the guard all gate on this one predicate, and an unattended job's
+        branch has to ship exactly like any other."""
+        assert tb.is_managed_task_branch("agent/auto/devkit-upgrade-v0-11-2-0823")
+
+    def test_the_longest_prefix_wins(self):
+        """`agent/` also prefixes an automation branch, and every caller uses this answer
+        to *strip* the prefix off a topic. A first-match answer leaves `auto/` in the
+        topic, and `worktree.box_name` turns that into a directory separator inside a
+        box name and a `COMPOSE_PROJECT_NAME` compose rejects."""
+        branch = "agent/auto/devkit-upgrade-v0-11-2-0823"
+        assert tb.managed_branch_prefix(branch) == tb.AUTOMATION_PREFIX
+        assert "/" not in branch[len(tb.managed_branch_prefix(branch)) :]
+
+    def test_automation_is_a_namespace_not_a_word_in_the_slug(self):
+        """`auto-merge-label` is a task somebody gave an agent. No substring test can
+        tell it from a job's own branch, which is why the marker is a path segment."""
+        assert tb.is_automation_branch("agent/auto/devkit-upgrade-v0-11-2-0823")
+        assert not tb.is_automation_branch("agent/auto-merge-label-0823")
+        assert not tb.is_automation_branch("agent/automate-the-prune-0823")
 
 
 class TestWorktreeFile:
