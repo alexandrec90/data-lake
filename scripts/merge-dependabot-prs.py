@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Retry the Dependabot merges the event-driven job dropped.
+"""Retry automerge-labelled PRs the event-driven job dropped.
 
 **The failure this exists for.** `dependabot-automerge.yml`'s merge job is a one-shot
 reaction to a `workflow_run` completion: the gate goes green, the job fires once, and if
@@ -203,7 +203,7 @@ def candidates(env: dict[str, str], repo: str, run) -> tuple[list[dict], str]:
 
     Branch mode is the `workflow_run` path: the event names a branch, and only that
     branch's PR is in scope. Sweep mode is the scheduled retry, where every open
-    Dependabot PR is a candidate because there is no event to narrow it.
+    open PR is a candidate because there is no event to narrow it.
     """
     branch = env.get("HEAD_BRANCH", "").strip()
     if branch:
@@ -247,7 +247,7 @@ def main(env: dict[str, str] | None = None, run=None) -> int:
         merge_pr(repo, int(number), run)
         merged += 1
 
-    print(f"Considered {len(considered)} Dependabot PR(s) for {scope}; merged {merged}.")
+    print(f"Considered {len(considered)} automerge PR(s) for {scope}; merged {merged}.")
     return 0
 
 

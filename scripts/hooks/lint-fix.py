@@ -212,6 +212,14 @@ def _run(ruff: str, *args: str, cwd: Path = REPO_ROOT) -> subprocess.CompletedPr
         capture_output=True,
         check=False,
         text=True,
+        # UTF-8 rather than the platform codec: ruff's diagnostics carry box-drawing and
+        # curly quotes, and `text=True` alone decodes them through cp1252 on Windows,
+        # where an unmapped byte raises inside subprocess's reader thread. That would
+        # fail this hook -- which runs after *every* edit -- on the tool's output rather
+        # than on the file's contents. The full account is the codec note under
+        # `VERIFY_IMPORT` in stop.py, which is where this crashed a session first.
+        encoding="utf-8",
+        errors="replace",
     )
 
 
@@ -277,8 +285,8 @@ def record_block(paths: list[str], failures: list[str]) -> None:
     """One harness-events ledger line per blocking run, so a false-positive finding --
     the S603/T201-on-a-scratch-file class this hook has already shipped -- is
     diagnosable from `logs/harness-events.log` in the devkit checkout rather than from
-    the chat of whichever session it blocked. Best-effort: `harness_events.record`
-    resolves the ledger through `$DEVKIT_DIR` and no-ops (never raises) without one.
+    the chat of whichever session it blocked. Best-effort: `harness_events.ledger_path`
+    owns where that is, and `record` no-ops (never raises) when the answer is nowhere.
     """
     if harness_events is None:
         return
@@ -294,10 +302,20 @@ def record_block(paths: list[str], failures: list[str]) -> None:
 
 
 def _read_stdin() -> str:
-    """Best-effort read of the hook payload; '' when stdin is a tty or unreadable."""
+    """Best-effort read of the hook payload; '' when stdin is a tty or unreadable.
+
+    Decoded as UTF-8 rather than through the platform codec, for the reason
+    `worktree-guard.read_stdin` sets out: the harness writes UTF-8 JSON and Windows
+    decodes stdin as cp1252. What this hook takes from the payload is a file path, so
+    the cost is a non-ASCII path silently missing the formatter rather than a corrupted
+    edit -- a quiet skip, which is the shape of failure this repo treats as worst.
+    """
     try:
         if sys.stdin is None or sys.stdin.isatty():
             return ""
+        buffer = getattr(sys.stdin, "buffer", None)
+        if buffer is not None:
+            return buffer.read().decode("utf-8", errors="replace")
         return sys.stdin.read()
     except (OSError, ValueError):
         return ""

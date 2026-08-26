@@ -217,8 +217,20 @@ MANIFEST: tuple[str, ...] = (
     # while every emitted command points at a file the consumer never received.
     "scripts/hooks/codex-hook-adapter.py",
     "scripts/hooks/tests/test_codex_hook_adapter.py",
+    # Codex's *own* published output contract, extracted from the binary by devkit's
+    # `scripts/extract-codex-schema.py` (which is not vendored -- a consumer has no
+    # reason to re-derive it, and most CI runners have no Codex to read). The adapter
+    # loads this at runtime to decide which members of a hook's response Codex will
+    # actually carry, so a consumer that received the adapter without it degrades every
+    # translation check to "unknown-event" -- which passes, silently, forever.
+    "scripts/hooks/codex-hook-schema.json",
     "scripts/hooks/codex-session-start.py",
     "scripts/hooks/tests/test_codex_session_start.py",
+    # The gate on what those bridges produce, as opposed to on whether they were copied.
+    # It has no script of its own -- it reads the *consumer's* `.claude/settings.json`
+    # and the handlers it names -- which is exactly why it must be vendored: the wiring
+    # it judges exists only in the consuming project.
+    "scripts/hooks/tests/test_codex_translation.py",
     # --- The shared CI tier ---------------------------------------------------
     # Same argument again, applied to the two GitHub Actions files that carry no
     # project-specific content. Both used to ship only as `templates/` renders, which
