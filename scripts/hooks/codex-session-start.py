@@ -31,6 +31,11 @@ def run(
         capture_output=capture_output,
         check=False,
         text=True,
+        # UTF-8 with replacement, never the platform codec -- see the codec note under
+        # `VERIFY_IMPORT` in stop.py. A SessionStart hook that raises on a byte in a
+        # branch name starts no session.
+        encoding="utf-8",
+        errors="replace",
     )
 
 

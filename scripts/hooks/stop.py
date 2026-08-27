@@ -64,6 +64,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -106,6 +107,24 @@ TEST_ARTIFACT = "logs/test-failures.log"
 # the interaction, not of any project's shape.
 MAX_VERIFY_ROUNDS = 3
 
+# Seconds the whole verification tier gets, not one check. Every agent harness kills a
+# Stop hook that outruns its own ceiling, and a killed hook is the worst of the three
+# outcomes: it writes no artifact, prints nothing, and ends the session on "stop hook
+# failed" with no way to tell which tier hung -- so the agent learns only that the gate
+# is broken. A Codex session ended exactly 600s after its last message with
+# `logs/stop-verify.log` still empty, which is that shape. `run_checks` and
+# `_pytest_failures` spawned uncapped subprocesses, so a suite that waits on a prompt,
+# a port or a lock had no upper bound at all.
+#
+# One budget across the tiers rather than one per check, because a check cannot know
+# what the ones before it spent, and it is the *total* the harness measures. Well under
+# a 600s ceiling: a timeout has to be reportable, which means leaving room to write the
+# artifact and print.
+VERIFY_BUDGET_SECONDS = 420
+# The pre-verification frontend typecheck, whose output goes to DEVNULL, gets its own
+# smaller cap: it is a side effect, and it must not be able to spend the gate's ceiling.
+TYPECHECK_TIMEOUT_SECONDS = 120
+
 # Interpreter candidates for the verification checks, relative to the repo root.
 VENV_PYTHONS = (".venv/Scripts/python.exe", ".venv/bin/python")
 # PATH interpreters to try when there is no venv and the launcher cannot run the
@@ -114,6 +133,26 @@ VENV_PYTHONS = (".venv/Scripts/python.exe", ".venv/bin/python")
 PATH_PYTHONS = ("python", "py")
 # Importing this is the cheapest proof an interpreter can run the checks at all.
 VERIFY_IMPORT = "pytest"
+
+# Every capture below decodes as UTF-8 with replacement, never through the platform's
+# locale codec. `text=True` alone picks cp1252 on Windows, and a byte that codepage does
+# not map -- 0x9d, which ruff, pytest and docker all emit inside box-drawing and curly
+# quotes -- raises `UnicodeDecodeError` *inside subprocess's reader thread*, where no
+# `try` in this file can see it. `subprocess.run` then returns a CompletedProcess whose
+# `stdout` and `stderr` are both **None** (`stdout[0] if stdout else None`, over the
+# buffer the dead thread never filled), so the visible failure is a TypeError a hundred
+# lines away in `run_checks`: `unsupported operand type(s) for +: 'NoneType' and
+# 'NoneType'`, with two thread tracebacks above it and nothing naming the tool whose
+# output could not be read. That is how this reached a user -- as a Stop hook crash
+# pointing at the line that assembles a tail rather than at the line that decodes one.
+#
+# A tail is diagnostic text. A replacement character in it costs a reader nothing;
+# failing to decode one costs the whole verification tier.
+#
+# Spelled out at every call site rather than shared through a constant, because
+# `subprocess.run` is an overloaded signature: a `**kwargs` dict makes the arguments
+# opaque to mypy and to `test_every_capture_in_a_hook_declares_its_codec`, which is the
+# ratchet that keeps the next capture from being added without one.
 
 
 @functools.cache
@@ -232,6 +271,8 @@ def _git_skin_status(repo_root: Path) -> str:
             cwd=repo_root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
     except OSError:
         return ""
@@ -495,7 +536,13 @@ def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     """
     try:
         return subprocess.run(
-            ["git", *args], cwd=repo_root, capture_output=True, text=True, check=False
+            ["git", *args],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return subprocess.CompletedProcess(list(args), 1, "", "")
@@ -571,6 +618,8 @@ def _compose_running_services(repo_root: Path = REPO_ROOT) -> set[str]:
             cwd=repo_root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -593,6 +642,8 @@ def _compose_up_db_redis(repo_root: Path = REPO_ROOT) -> bool:
             cwd=repo_root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=180,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -610,6 +661,8 @@ def _compose_stop(services: list[str], repo_root: Path = REPO_ROOT) -> None:
             cwd=repo_root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=60,
         )
 
@@ -633,6 +686,8 @@ def _compose_host_port(
             cwd=repo_root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -676,27 +731,99 @@ def test_runner_argv(targets: list[str], root: Path | None = None) -> tuple[list
     return [verify_python(base), "-m", "pytest", *targets, "-q"], None
 
 
+def verify_deadline(budget: float = VERIFY_BUDGET_SECONDS) -> float:
+    """A `time.monotonic()` stamp `budget` seconds from now, shared by every tier.
+
+    Monotonic on purpose: the gate has to survive a clock the OS steps under it, and a
+    wall-clock deadline can go backwards mid-run.
+    """
+    return time.monotonic() + budget
+
+
+def timeout_tail(argv: list[str]) -> str:
+    """What `logs/stop-verify.log` says about a check the budget stopped.
+
+    Says nothing about the code, because nothing is known about it: the check did not
+    finish. Naming the command is the whole point -- the agent can run it by hand and
+    see for itself, which is the one thing a killed hook never let it do.
+    """
+    return (
+        f"Stopped: the {VERIFY_BUDGET_SECONDS}s budget for the whole verification tier "
+        "ran out while this check was running, so its result is unknown (an earlier "
+        "tier may have spent it).\nRe-run it by hand: " + " ".join(argv)
+    )
+
+
+def _bounded_run(
+    argv: list[str], cwd: Path, deadline: float | None, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess | None:
+    """`subprocess.run` capped by the tier's shared deadline; None when it ran out.
+
+    A `None` is not the same as the `OSError` skip its callers also handle: a tool this
+    machine cannot run is a local gap and defers to CI, while a check that would not
+    finish is a fact about this branch worth reporting. Both stay non-fatal here --
+    `OSError` still propagates to the caller that skips it.
+    """
+    left = None if deadline is None else deadline - time.monotonic()
+    if left is not None and left <= 0:
+        return None
+    try:
+        return subprocess.run(
+            argv,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=left,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def combined_output(result: subprocess.CompletedProcess) -> str:
+    """`stdout` and `stderr` as one string, tolerating either being `None`.
+
+    The codec above removes the only known way a capture returns `None` streams, and
+    this stays anyway, because the two failures are not the same size. An undecodable
+    byte in a lint tail is a cosmetic loss; a `TypeError` raised while *reporting* a
+    failure takes the whole Stop hook down, and a hook that dies writes no artifact,
+    prints nothing, and ends the session on "stop hook failed" -- the same worst-of-three
+    outcome `VERIFY_BUDGET_SECONDS` exists to prevent, arriving from the other end.
+
+    So: nothing on the reporting path may assume a stream was captured. `stdout=DEVNULL`
+    on a future call, or a test stubbing `subprocess.run`, produces `None` here too, and
+    neither should be able to end a session.
+    """
+    return (result.stdout or "") + (result.stderr or "")
+
+
 def _pytest_failures(
-    targets: list[str], repo_root: Path, extra_env: dict[str, str] | None = None
+    targets: list[str],
+    repo_root: Path,
+    extra_env: dict[str, str] | None = None,
+    deadline: float | None = None,
 ) -> list[tuple[str, str | None, str]]:
     """Run the host test tier over `targets`; [] on pass, one CHECK_TESTS failure else.
 
     Shared by both shapes of Tier 2b (with and without a DB), so the two differ only
     in the infra they arrange and the env they inject -- not in how a failure is
     captured and reported. An OS error is a skip: verification never blocks the agent
-    over a local tooling gap.
+    over a local tooling gap. Running out of `deadline` is not -- see `_bounded_run`.
     """
     argv, artifact = test_runner_argv(targets, repo_root)
     try:
-        result = subprocess.run(
+        result = _bounded_run(
             argv,
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
+            repo_root,
+            deadline,
             env={**os.environ, **extra_env} if extra_env else None,
         )
     except OSError:
         return []
+    if result is None:
+        return [(CHECK_TESTS, artifact, timeout_tail(argv))]
     # 5 is pytest's EXIT_NOTESTSCOLLECTED, and it is not a failure here. Targets come
     # from `host_test_targets`, which selects *changed files* under tests/ -- so editing
     # a helper that holds no tests of its own (conftest.py, a support module) hands
@@ -704,12 +831,15 @@ def _pytest_failures(
     # with "no tests ran", which no source edit can resolve.
     if result.returncode in (0, PYTEST_NO_TESTS_COLLECTED):
         return []
-    tail = (result.stdout + result.stderr).strip().splitlines()[-20:]
+    tail = combined_output(result).strip().splitlines()[-20:]
     return [(CHECK_TESTS, artifact, "\n".join(tail))]
 
 
 def run_host_tests(
-    paths: list[str], env: Mapping[str, str], repo_root: Path = REPO_ROOT
+    paths: list[str],
+    env: Mapping[str, str],
+    repo_root: Path = REPO_ROOT,
+    deadline: float | None = None,
 ) -> list[tuple[str, str | None, str]]:
     """Tier 2b: host pytest for changed app/tests code, DB or no DB.
 
@@ -727,15 +857,18 @@ def run_host_tests(
     decided whether tests run.
     """
     if CFG.db.enabled:
-        return run_db_tests(paths, env, repo_root)
+        return run_db_tests(paths, env, repo_root, deadline)
     targets = host_test_targets(paths)
     if not targets:
         return []
-    return _pytest_failures(targets, repo_root)
+    return _pytest_failures(targets, repo_root, deadline=deadline)
 
 
 def run_db_tests(
-    paths: list[str], env: Mapping[str, str], repo_root: Path = REPO_ROOT
+    paths: list[str],
+    env: Mapping[str, str],
+    repo_root: Path = REPO_ROOT,
+    deadline: float | None = None,
 ) -> list[tuple[str, str | None, str]]:
     """Tier 2b with a DB: host pytest for changed app/tests against db+redis.
 
@@ -766,7 +899,7 @@ def run_db_tests(
         db_env = host_db_env(repo_root)
         if db_env is None:
             return []
-        return _pytest_failures(targets, repo_root, db_env)
+        return _pytest_failures(targets, repo_root, db_env, deadline)
     finally:
         _compose_stop(started, repo_root)
 
@@ -820,11 +953,18 @@ def _command_for(name: str, root: Path | None = None) -> tuple[list[str], Path, 
     return None
 
 
-def run_checks(names: list[str], root: Path | None = None) -> list[tuple[str, str | None, str]]:
+def run_checks(
+    names: list[str], root: Path | None = None, deadline: float | None = None
+) -> list[tuple[str, str | None, str]]:
     """Run selected checks; return (name, artifact, tail) for each that failed.
 
     A missing tool or an OS error is a skip, never a failure: verification must
     never block the agent because of a local tooling gap.
+
+    `deadline` is the shared budget from `verify_deadline`; a check that outruns it is
+    reported rather than skipped, and the checks after it are stopped on arrival with
+    the same message. `None` leaves every check uncapped, which is what the unit tests
+    that stub `subprocess.run` want.
     """
     failures: list[tuple[str, str | None, str]] = []
     for name in names:
@@ -833,11 +973,14 @@ def run_checks(names: list[str], root: Path | None = None) -> list[tuple[str, st
             continue
         argv, cwd, artifact = spec
         try:
-            result = subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+            result = _bounded_run(argv, cwd, deadline)
         except OSError:
             continue
+        if result is None:
+            failures.append((name, artifact, timeout_tail(argv)))
+            continue
         if result.returncode != 0:
-            tail = (result.stdout + result.stderr).strip().splitlines()[-15:]
+            tail = combined_output(result).strip().splitlines()[-15:]
             failures.append((name, artifact, "\n".join(tail)))
     return failures
 
@@ -927,8 +1070,9 @@ def verify(raw_stdin: str, env: Mapping[str, str]) -> int:
     # Infra-light tiers (lint, script-tests, locks, frontend) plus the application
     # test tier, which arranges its own db+redis reachability/autostart/teardown when
     # this project has a DB and just runs pytest when it does not.
-    failures = run_checks(select_checks(paths), root)
-    failures += run_host_tests(paths, env, root)
+    deadline = verify_deadline()
+    failures = run_checks(select_checks(paths), root, deadline)
+    failures += run_host_tests(paths, env, root, deadline)
     write_verify_artifact(failures, root)
     if not failures:
         write_rounds(0, root)  # green: the next failure starts from a full budget.
@@ -951,12 +1095,19 @@ def main() -> int:
     if CFG.frontend.enabled and skin_changed(_git_skin_status(root)):
         npm = shutil.which("npm")
         if npm:
-            subprocess.run(
-                [npm, *CFG.frontend.typecheck_cmd],
-                cwd=root / CFG.frontend.dir,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            # Capped like the verification tiers, and for the same reason: this runs
+            # before them, inside the same hook, and its output is discarded -- so a
+            # typecheck that hangs spends the harness's whole ceiling on a side effect
+            # nobody reads. Its own budget rather than a share of the gate's, because
+            # the gate is the part whose result matters.
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                subprocess.run(
+                    [npm, *CFG.frontend.typecheck_cmd],
+                    cwd=root / CFG.frontend.dir,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=TYPECHECK_TIMEOUT_SECONDS,
+                )
 
     # Pre-stop verification runs last: it may exit 2 to block the stop and relay
     # failures back into the session. All best-effort side effects above have

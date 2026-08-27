@@ -44,7 +44,17 @@ def rebase_argv(commit_gpgsign: str, upstream: str = UPSTREAM) -> list[str]:
 
 
 def run_git(*args: str, capture_output: bool = False) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *args], capture_output=capture_output, check=False, text=True)
+    # UTF-8 with replacement, never the platform codec: a branch or path git echoes back
+    # can hold any byte, and cp1252 turns one it cannot map into a crash inside
+    # subprocess's reader thread. See the codec note under `VERIFY_IMPORT` in stop.py.
+    return subprocess.run(
+        ["git", *args],
+        capture_output=capture_output,
+        check=False,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
 
 
 def _report(result: subprocess.CompletedProcess[str]) -> int:

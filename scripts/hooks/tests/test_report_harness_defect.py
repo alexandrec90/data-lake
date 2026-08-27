@@ -31,7 +31,15 @@ class TestMain:
         assert report.main(["--message", "m"]) == 0
         assert "\tcommand=-\t" in read_ledger(tmp_path)
 
-    def test_no_devkit_dir_still_exits_zero(self, monkeypatch, capsys):
+    def test_no_devkit_dir_still_exits_zero(self, tmp_path, monkeypatch, capsys):
+        """Pinned to a *consuming* copy, which is the only one an unset var leaves with
+        nowhere to file: `harness_events.ledger_path` falls back to the checkout itself
+        when the copy is devkit. Unpinned, this would file a test report on the real
+        ledger and assert the opposite of what devkit does."""
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\nname = "someproject"\n', encoding="utf-8"
+        )
         monkeypatch.delenv("DEVKIT_DIR", raising=False)
+        monkeypatch.setattr(report.harness_events, "REPO_ROOT", tmp_path)
         assert report.main(["--message", "m"]) == 0
         assert "no central ledger" in capsys.readouterr().out

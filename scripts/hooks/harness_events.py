@@ -21,10 +21,12 @@ Where the ledger lives decides who can write to it, and there are two callers:
   and pass `root` explicitly.
 - **Vendored copies** in consuming projects know nothing about this machine's layout.
   They reach the ledger through `$DEVKIT_DIR` -- the same machine-level seam
-  `sync-devkit.py` reads -- and when it is unset (CI, a fresh clone, anyone else's
-  machine) `record` is a silent no-op. A diagnostic ledger must never be a reason a
-  hook fails, so unlike the drift gate there is no "stamped but unset" failure mode
-  here: silence is always the right degradation.
+  `sync-devkit.py` reads -- with one fallback: unset, a copy that *is* devkit writes
+  to its own checkout, because there the ledger and the copy are the same repo. Unset
+  anywhere else (CI, a fresh clone, anyone else's machine) `record` is a silent no-op.
+  A diagnostic ledger must never be a reason a hook fails, so unlike the drift gate
+  there is no "stamped but unset" failure mode here: silence is always the right
+  degradation.
 
 Event names and their fields belong to the writers; this module only owns the format.
 `record` never raises -- it is called from hooks on paths where they are already
@@ -35,11 +37,18 @@ Tested in `scripts/hooks/tests/test_harness_events.py`.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import os
+import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 LEDGER = Path("logs") / "harness-events.log"
+
+# The repo this copy is vendored into -- devkit itself, when nobody vendored it. Read by
+# `ledger_path` on the branch where `$DEVKIT_DIR` says nothing.
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # A blocked command or a lint finding can be pages long; the ledger wants enough to
 # recognise it, not to replay it. Grep the session transcript for the rest.
@@ -65,6 +74,34 @@ FIELD_LIMITS = {"message": 4000, "detail": 2000}
 # owns it. This is the stdlib-only half a hook can reach: hooks run before the venv
 # exists, so importing that module is not available to them.
 BOX_NAME_SEP = "--"
+
+
+# Which agent runtime the hook ran under. Spelled here as a literal for the reason
+# `codex-hook-adapter.py` spells it as one: that file is vendored and this one is too,
+# but neither may import the other -- a hook loads this module by path from
+# `worktree-guard.py`, where `scripts/hooks/` is not on `sys.path`.
+ADAPTER_ENV = "DEVKIT_HOOK_ADAPTER"
+NATIVE_AGENT = "claude"
+UNKNOWN_AGENT = "unknown"
+
+
+def agent_name(env: Mapping[str, str] | None = None) -> str:
+    """The agent runtime this hook is running under: `claude`, `codex`, ...
+
+    Every row on this ledger was written by a hook, and until now no row said **which
+    agent's** hook. That is not bookkeeping: the same hook does not behave the same
+    under both. A Claude session's PreToolUse response can re-aim a call, a Codex
+    session's cannot; the capped-Bash gate is wired for one and deliberately unported
+    to the other. So a block recorded under Codex is evidence about the *translation*,
+    and a triage pass that reads it as evidence about Claude retires a defect nobody
+    fixed -- and the reverse loses a Codex-only one behind a Claude fix.
+
+    The answer is not inferred. `codex-hook-adapter.py` exports `DEVKIT_HOOK_ADAPTER`
+    before it spawns a ported hook, precisely so a hook can tell; unset means nothing
+    translated this call, which is Claude Code running the hook natively.
+    """
+    source = os.environ if env is None else env
+    return (source.get(ADAPTER_ENV, "") or "").strip().lower() or NATIVE_AGENT
 
 
 def project_name(root: Path) -> str:
@@ -99,17 +136,64 @@ def event_line(stamp: str, event: str, fields: tuple[tuple[str, object], ...]) -
     return stamp + "\t" + "\t".join(f"{key}={clean(value, limit_for(key))}" for key, value in pairs)
 
 
+def _main_checkout(root: Path) -> Path:
+    """`root`, or -- when it is a git worktree -- the checkout it was cut from.
+
+    A worktree's `.git` is a *file* holding `gitdir: <main>/.git/worktrees/<name>`, so
+    this is one read rather than a `git` subprocess in a hook. It matters because the
+    fallback below fires inside ephemeral boxes too, and a ledger written into a box is
+    destroyed with it: `worktree.py reconcile` reaps the box, and the report an agent
+    filed from it was never on the machine's ledger at all.
+    """
+    with contextlib.suppress(OSError, ValueError, IndexError):
+        pointer = root / ".git"
+        if pointer.is_file():
+            line = pointer.read_text(encoding="utf-8").strip()
+            if line.startswith("gitdir:"):
+                gitdir = Path(line.split(":", 1)[1].strip())
+                for parent in gitdir.parents:
+                    if parent.name == ".git":
+                        return parent.parent
+    return root
+
+
+def _own_checkout_is_devkit() -> bool:
+    """Whether the copy this module belongs to is devkit itself.
+
+    Delegated to `harness_config` rather than re-implemented, and imported here rather
+    than at module scope: this module is loaded by path from `worktree-guard.py`, where
+    `scripts/hooks/` is not on `sys.path`, and a ledger helper must not make an import
+    error out of a hook that was already reporting something else.
+    """
+    try:
+        here = str(Path(__file__).resolve().parent)
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import harness_config
+    except Exception:  # pragma: no cover - a checkout missing the sibling module
+        return False
+    return harness_config.is_devkit_source(REPO_ROOT)
+
+
 def ledger_path(root: Path | None = None) -> Path | None:
     """Where this machine's ledger is, or None when it has none.
 
     `root` is for callers that already know the devkit checkout; without it the answer
-    comes from `$DEVKIT_DIR`, and unset means this machine keeps no central ledger.
+    comes from `$DEVKIT_DIR`.
+
+    Unset, it used to mean "this machine keeps no central ledger" -- true of a consumer
+    and of CI, and false in the one place it cost a report: **devkit itself**, where the
+    ledger is this very checkout's `logs/`. `$DEVKIT_DIR` is a Claude-settings variable
+    on the machine this was written for, so a Codex session filing a defect report with
+    `report-harness-defect.py` was told there was nowhere to file it, standing in the
+    directory the ledger lives in. So when the env says nothing, this copy answers for
+    itself if it *is* devkit, and keeps quiet if it is not.
     """
     if root is not None:
         return root / LEDGER
     devkit = os.environ.get("DEVKIT_DIR", "").strip()
     if not devkit:
-        return None
+        return _main_checkout(REPO_ROOT) / LEDGER if _own_checkout_is_devkit() else None
     base = Path(devkit)
     if not base.is_dir():
         return None
@@ -124,11 +208,19 @@ def record(
     Best-effort by contract: every caller is a hook mid-block or a CLI mid-report, and
     failing *their* work over bookkeeping would invert the priorities this file exists
     to serve.
+
+    `agent=` is stamped **here** rather than passed by each writer, for the reason the
+    workspace states as a rule: a remedy that depends on every caller remembering is the
+    same defect again. Several writers reach this ledger and most of them have no reason
+    to know what a hook adapter is. A caller recording an event on some *other* runtime's
+    behalf passes its own `agent` field, and that one is kept.
     """
     try:
         path = ledger_path(root)
         if path is None:
             return None
+        if not any(key == "agent" for key, _ in fields):
+            fields = (("agent", agent_name()), *fields)
         stamp = _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds")
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8", newline="\n") as handle:
