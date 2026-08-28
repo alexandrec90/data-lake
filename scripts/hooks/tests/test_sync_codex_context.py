@@ -41,3 +41,23 @@ def test_mirror_tree_removes_empty_destination(tmp_path):
     mod.mirror_tree(src, dest)
 
     assert not dest.exists()
+
+
+def test_main_adopts_project_hooks_without_an_existing_codex_directory(tmp_path, monkeypatch):
+    """Running the named Codex sync task is the opt-in; an empty/missing destination
+    must not silently reduce it to a skills-only operation.
+    """
+    claude = tmp_path / ".claude"
+    claude.mkdir()
+    (claude / "settings.json").write_text('{"hooks": {}}', encoding="utf-8")
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    generator = mod.Path(mod.__file__).with_name("sync-codex-hooks.py")
+    (scripts / generator.name).write_text(generator.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(mod, "REPO_ROOT", tmp_path)
+
+    assert mod.main() == 0
+
+    artifact = tmp_path / ".codex" / "hooks.json"
+    assert artifact.exists()
+    assert artifact.read_text(encoding="utf-8") == '{\n  "hooks": {}\n}\n'

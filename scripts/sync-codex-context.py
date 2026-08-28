@@ -7,7 +7,8 @@ Claude project instructions are not copied: Codex reads ``CLAUDE.md`` through
 1. Mirror ``.claude/skills/`` to ``.agents/skills/``, where Codex discovers
    repository-scoped skills.
 2. Regenerate ``.codex/hooks.json`` from ``.claude/settings.json`` via
-   ``sync-codex-hooks.py`` when the repository has opted into ``.codex/``.
+   ``sync-codex-hooks.py``. The generator owns the compatibility translation and
+   creates ``.codex/`` on first use.
 
 The pure tree helper is unit-tested in
 ``scripts/hooks/tests/test_sync_codex_context.py``.
@@ -75,7 +76,7 @@ def main() -> int:
 
     claude_settings = claude_dir / "settings.json"
     codex_hooks = REPO_ROOT / ".codex" / "hooks.json"
-    if claude_settings.exists() and codex_hooks.parent.exists():
+    if claude_settings.exists():
         result = subprocess.run(
             [
                 sys.executable,

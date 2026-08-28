@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+from pathlib import Path
 
 from conftest import load_module
 
@@ -179,3 +180,163 @@ def test_parse_args_strips_separator():
     args = hook.parse_args(["--event", "Stop", "--", "python3", "stop.py"])
     assert args.event == "Stop"
     assert args.command == ["python3", "stop.py"]
+
+
+# --- The success path: what a rc-0 hook's stdout becomes ----------------------------
+#
+# The failure path above is the loud one. These cover the quiet one: a hook that exits 0
+# has its stdout passed through, and whether Codex acts on it is decided by a schema
+# this repo does not own -- so a hook that grows a member Codex will not take stops
+# taking effect rather than starting to fail.
+#
+# The classification is read from `codex-hook-schema.json`, extracted from the Codex
+# binary. These tests read the committed snapshot rather than a fixture, because a
+# fixture would let the adapter agree with an invented contract; the snapshot is the
+# only copy of the real one that exists offline.
+
+
+def test_response_members_dots_the_nested_ones():
+    found = hook.response_members(
+        {"decision": "block", "hookSpecificOutput": {"hookEventName": "PreToolUse"}}
+    )
+    assert set(found) == {"decision", "hookSpecificOutput", "hookSpecificOutput.hookEventName"}
+
+
+def test_response_members_of_a_non_object_is_empty():
+    """A hook printing prose is emitting context, not a decision."""
+    assert hook.response_members("just some text") == []
+    assert hook.response_members(["a", "list"]) == []
+
+
+def test_the_snapshot_is_the_contract_this_adapter_judges_by():
+    """No snapshot, no findings: a vendored copy predating it must not start refusing."""
+    assert hook.accepted_members("PreToolUse")
+    assert hook.accepted_members("PreToolUse", schema_file=Path("nope.json")) == frozenset()
+    assert hook.accepted_members("NotAnEvent") == frozenset()
+
+
+def test_the_accepted_set_is_per_event_not_global():
+    """The defect that a flat allowlist cannot express, whatever it contains.
+
+    PreToolUse's verdict member is `permissionDecision`; PermissionRequest's is
+    `decision`. Each is a *lost decision* under the other's event.
+    """
+    assert hook.classify_member("hookSpecificOutput.permissionDecision", "PreToolUse") == "portable"
+    assert hook.classify_member("hookSpecificOutput.permissionDecision", "Stop") == "lost"
+    assert hook.classify_member("hookSpecificOutput.decision", "PermissionRequest") == "portable"
+
+
+def test_updated_input_is_portable_on_pretooluse():
+    """The reversion check for the guess this replaced.
+
+    A hand-written list called `hookSpecificOutput.updatedInput` Claude-only, on the
+    strength of the guard having been changed to stop emitting it. Codex's own
+    PreToolUse schema accepts it -- so refusing it would have converted every re-aim
+    into a deny. If this fails, the snapshot was refreshed from a Codex that withdrew
+    it, and `worktree-guard.redirect_blocker` is then load-bearing rather than cautious.
+    """
+    assert hook.classify_member("hookSpecificOutput.updatedInput", "PreToolUse") == "portable"
+
+
+def test_an_unknown_event_claims_nothing_either_way():
+    assert hook.classify_member("anything", "SomeFutureEvent") == "unknown-event"
+
+
+def test_a_decorative_member_codex_does_not_take_is_dropped_not_lost():
+    """`additionalContext` is real on PreToolUse and absent from Stop's schema."""
+    assert hook.classify_member("hookSpecificOutput.additionalContext", "PreToolUse") == "portable"
+    assert hook.classify_member("hookSpecificOutput.additionalContext", "Stop") == "dropped"
+
+
+def test_response_problems_ignores_non_json_stdout():
+    assert hook.response_problems("not json at all", "PreToolUse") == ([], [])
+    assert hook.response_problems("", "PreToolUse") == ([], [])
+
+
+def test_response_problems_separates_the_two_kinds():
+    payload = json.dumps(
+        {"decision": "block", "hookSpecificOutput": {"hookEventName": "Stop", "brandNew": True}}
+    )
+    lost, dropped = hook.response_problems(payload, "Stop")
+    assert lost == []
+    assert dropped == [
+        "hookSpecificOutput",
+        "hookSpecificOutput.hookEventName",
+        "hookSpecificOutput.brandNew",
+    ]
+
+
+def test_strip_members_removes_only_what_it_is_given():
+    payload = json.dumps({"decision": "block", "reason": "no", "hookSpecificOutput": {"a": 1}})
+    kept = json.loads(hook.strip_members(payload, ["hookSpecificOutput"]))
+    assert kept == {"decision": "block", "reason": "no"}
+
+
+def test_strip_members_reaches_a_nested_one():
+    payload = json.dumps({"hookSpecificOutput": {"hookEventName": "Stop", "novel": 1}})
+    kept = json.loads(hook.strip_members(payload, ["hookSpecificOutput.novel"]))
+    assert kept == {"hookSpecificOutput": {"hookEventName": "Stop"}}
+
+
+def test_strip_members_leaves_prose_alone():
+    assert hook.strip_members("not json", ["decision"]) == "not json"
+
+
+def test_dropped_reason_carries_the_hooks_own_words():
+    payload = json.dumps(
+        {
+            "decision": "block",
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": "re-issue against the box",
+            },
+        }
+    )
+    reason = hook.dropped_reason("PermissionRequest", ["decision"], payload)
+    assert "decision" in reason
+    assert "re-issue against the box" in reason
+
+
+def test_translate_success_refuses_a_lost_decision(tmp_path, monkeypatch):
+    """PermissionRequest's schema has no top-level `decision`, and it is the verdict."""
+    monkeypatch.setattr(hook, "_record_gap", lambda *args: None)
+    payload = json.dumps({"decision": "block", "reason": "denied"})
+    stdout, lost, _ = hook.translate_success("PermissionRequest", payload, repo_root=tmp_path)
+    assert lost == ["decision", "reason"]
+    assert json.loads(stdout)["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+
+
+def test_translate_success_leaves_a_portable_response_alone(tmp_path):
+    payload = json.dumps({"decision": "block", "reason": "no"})
+    stdout, lost, dropped = hook.translate_success("PostToolUse", payload, repo_root=tmp_path)
+    assert (stdout, lost, dropped) == (payload, [], [])
+
+
+def test_translate_success_strips_a_member_codex_would_reject(tmp_path, monkeypatch):
+    """Stripped rather than passed through: every Codex output schema is
+    `additionalProperties: false`, so one unknown member costs the whole response."""
+    seen = []
+    monkeypatch.setattr(hook, "_record_gap", lambda *args: seen.append(args))
+    payload = json.dumps(
+        {
+            "decision": "block",
+            "reason": "no",
+            "suppressOutput": True,
+            "hookSpecificOutput": {"hookEventName": "Stop"},
+        }
+    )
+    stdout, lost, dropped = hook.translate_success("Stop", payload, repo_root=tmp_path)
+    assert lost == []
+    assert "hookSpecificOutput" in dropped
+    kept = json.loads(stdout)
+    assert kept == {"decision": "block", "reason": "no", "suppressOutput": True}
+    assert seen and seen[0][3] == "dropped"
+
+
+def test_session_start_still_emits_nothing(monkeypatch, tmp_path):
+    """The one event whose stdout is discarded outright; classification must not undo it."""
+    monkeypatch.setattr(
+        hook.subprocess, "run", lambda *a, **k: _completed(0, stdout="workspace status")
+    )
+    code, stdout, _ = hook.run_hook("SessionStart", ["python3", "s.py"], "{}", repo_root=tmp_path)
+    assert (code, stdout) == (0, "")

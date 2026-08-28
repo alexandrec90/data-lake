@@ -343,6 +343,219 @@ def test_run_checks_oserror_is_skip_not_failure(monkeypatch):
     assert hook.run_checks([hook.CHECK_LINT]) == []
 
 
+class TestOutputIsDecodedNotGuessed:
+    """A tool's bytes must not be able to kill the hook that is reporting on them.
+
+    `text=True` alone decodes through the platform's locale codec -- cp1252 here,
+    strict UTF-8 on a CI runner -- and both raise on bytes real tools emit. The raise
+    happens inside subprocess's reader thread, where the `try` around the call cannot
+    see it, and `subprocess.run` hands back `stdout=None, stderr=None`. The failure a
+    user sees is then a `TypeError` in `run_checks`, several hundred lines from the
+    cause:
+
+        tail = (result.stdout + result.stderr).strip().splitlines()[-15:]
+        TypeError: unsupported operand type(s) for +: 'NoneType' and 'NoneType'
+
+    Revert either half and one of these fails: the codec test crashes the way the
+    reported session did, and the `None` test restores the `TypeError` itself.
+    """
+
+    def test_a_check_whose_output_is_not_utf8_is_reported_not_crashed(self, monkeypatch):
+        # A lone 0x9d: undefined in cp1252, invalid UTF-8, and the exact byte that ended
+        # a session from a lint tail. The check must still be reported as a failure.
+        argv = [
+            sys.executable,
+            "-c",
+            "import sys; sys.stderr.buffer.write(b'ruff: \\x9d line too long\\n'); sys.exit(1)",
+        ]
+        monkeypatch.setattr(
+            hook, "_command_for", lambda name, root=None: (argv, hook.REPO_ROOT, None)
+        )
+        failures = hook.run_checks([hook.CHECK_LINT])
+        assert len(failures) == 1
+        assert "line too long" in failures[0][2]
+
+    def test_run_checks_survives_streams_that_were_never_captured(self, monkeypatch):
+        import subprocess as sp
+
+        monkeypatch.setattr(
+            hook, "_command_for", lambda name, root=None: (["true"], hook.REPO_ROOT, None)
+        )
+        monkeypatch.setattr(
+            hook.subprocess, "run", lambda *a, **k: sp.CompletedProcess([], 1, None, None)
+        )
+        failures = hook.run_checks([hook.CHECK_LINT])
+        assert failures == [(hook.CHECK_LINT, None, "")]
+
+    def test_combined_output_joins_what_it_has(self):
+        import subprocess as sp
+
+        assert hook.combined_output(sp.CompletedProcess([], 1, "out\n", "err\n")) == "out\nerr\n"
+        assert hook.combined_output(sp.CompletedProcess([], 1, None, "err\n")) == "err\n"
+        assert hook.combined_output(sp.CompletedProcess([], 1, "out\n", None)) == "out\n"
+        assert hook.combined_output(sp.CompletedProcess([], 1, None, None)) == ""
+
+
+class TestTheGateIsBounded:
+    """A Stop hook that outruns its harness's ceiling is killed, and a killed hook
+    writes no artifact and prints nothing -- the session ends on "stop hook failed"
+    naming no tier. Reverting any of this restores an uncapped `subprocess.run` in the
+    Stop path, and these four fail: the first two hang the suite's stub forever, the
+    third stops asserting that later checks are cut off, the fourth loses the budget.
+    """
+
+    def test_a_check_that_outruns_the_budget_is_reported_not_skipped(self, monkeypatch):
+        """A skip would defer to CI, which is right for a tool this machine lacks and
+        wrong here: nothing is known about the check, so nothing may be assumed."""
+        import subprocess as sp
+
+        monkeypatch.setattr(
+            hook, "_command_for", lambda name, root=None: (["slow"], hook.REPO_ROOT, None)
+        )
+
+        def _hang(*a, **k):
+            raise sp.TimeoutExpired(["slow"], k.get("timeout") or 1)
+
+        monkeypatch.setattr(hook.subprocess, "run", _hang)
+        failures = hook.run_checks([hook.CHECK_LINT], deadline=hook.verify_deadline())
+        assert len(failures) == 1
+        assert failures[0][0] == hook.CHECK_LINT
+        assert "slow" in failures[0][2], "the tail must name the command to re-run"
+
+    def test_the_host_test_tier_is_bounded_too(self, monkeypatch, tmp_path):
+        """The longest tier, and the one a hung fixture or an open port stalls."""
+        import subprocess as sp
+
+        monkeypatch.setattr(hook, "test_runner_argv", lambda t, r: (["pytest"], "logs/t.log"))
+
+        def _hang(*a, **k):
+            raise sp.TimeoutExpired(["pytest"], k.get("timeout") or 1)
+
+        monkeypatch.setattr(hook.subprocess, "run", _hang)
+        failures = hook._pytest_failures(
+            ["tests/test_x.py"], tmp_path, deadline=hook.verify_deadline()
+        )
+        assert [f[0] for f in failures] == [hook.CHECK_TESTS]
+
+    def test_an_exhausted_budget_stops_the_remaining_checks_on_arrival(self, monkeypatch):
+        """The budget is shared, so the tier that spends it must not leave the ones
+        after it free to spend another one each."""
+        monkeypatch.setattr(
+            hook, "_command_for", lambda name, root=None: ([name], hook.REPO_ROOT, None)
+        )
+        monkeypatch.setattr(
+            hook.subprocess, "run", lambda *a, **k: pytest.fail("nothing may run past the budget")
+        )
+        failures = hook.run_checks(
+            [hook.CHECK_LINT, hook.CHECK_SCRIPT_TESTS], deadline=hook.verify_deadline(budget=-1)
+        )
+        assert [f[0] for f in failures] == [hook.CHECK_LINT, hook.CHECK_SCRIPT_TESTS]
+
+    def test_both_tiers_share_one_deadline(self, monkeypatch, sandboxed_verify):
+        """Two budgets would let the gate spend twice the ceiling and still be killed."""
+        seen: dict[str, float | None] = {}
+
+        def _checks(names, root=None, deadline=None):
+            seen["checks"] = deadline
+            return []
+
+        def _tests(paths, env, root=None, deadline=None):
+            seen["tests"] = deadline
+            return []
+
+        monkeypatch.setattr(hook, "run_checks", _checks)
+        monkeypatch.setattr(hook, "run_host_tests", _tests)
+        assert hook.verify("{}", {}) == 0
+        assert seen["checks"] is not None
+        assert seen["checks"] == seen["tests"]
+
+    def test_the_timeout_tail_says_what_is_unknown_and_how_to_find_out(self):
+        tail = hook.timeout_tail(["python", "-m", "pytest", "tests/test_x.py"])
+        assert "unknown" in tail
+        assert "python -m pytest tests/test_x.py" in tail
+
+    def test_a_stopped_check_is_recognised_as_unfinished(self):
+        """`unfinished` reads the tail's prefix, so `timeout_tail` and `UNFINISHED_MARK`
+        have to stay spelled the same. A drift between them is silent: every stopped
+        check would read as a finished failure again, which is the defect this fixes."""
+        stopped = ("tests", None, hook.timeout_tail(["pytest"]))
+        red = ("lint", None, "E999 SyntaxError")
+        assert hook.unfinished([stopped, red]) == ["tests"]
+
+    def test_a_round_of_nothing_but_stopped_checks_does_not_block(
+        self, monkeypatch, sandboxed_verify
+    ):
+        """The budget running out says nothing about the branch, and blocking on it just
+        buys the same non-answer one turn later — twice in a row on devkit#237, at the
+        tail of a session, with the suite already green by hand in between."""
+        monkeypatch.setattr(
+            hook,
+            "run_checks",
+            lambda names, root=None, deadline=None: [
+                ("tests", "logs/test-failures.log", hook.timeout_tail(["pytest"]))
+            ],
+        )
+        monkeypatch.setattr(hook, "run_host_tests", lambda paths, env, root=None, deadline=None: [])
+        assert hook.verify("{}", {}) == 0
+        # And it costs no round: the next *real* failure gets the full two chances.
+        assert sandboxed_verify["value"] == 0
+
+    def test_a_finished_failure_still_blocks_when_a_stopped_check_rides_along(
+        self, monkeypatch, sandboxed_verify
+    ):
+        """The stand-down is for a round that learned nothing, not for one that learned
+        something and ran out of time afterwards."""
+        monkeypatch.setattr(
+            hook,
+            "run_checks",
+            lambda names, root=None, deadline=None: [
+                ("lint", None, "E999 SyntaxError"),
+                ("tests", None, hook.timeout_tail(["pytest"])),
+            ],
+        )
+        monkeypatch.setattr(hook, "run_host_tests", lambda paths, env, root=None, deadline=None: [])
+        assert hook.verify("{}", {}) == 2
+
+    def test_the_status_line_calls_a_stopped_check_unknown_not_failed(self, capsys):
+        """`failed: tests` under an artifact reading "its result is unknown" is the gate
+        contradicting its own evidence, and the agent has to open the file to find out
+        which half to believe."""
+        hook._print_verify_failures(
+            [
+                ("lint", None, "E999 SyntaxError"),
+                ("tests", None, hook.timeout_tail(["pytest"])),
+            ],
+            blocking=True,
+        )
+        err = capsys.readouterr().err
+        assert "failed: lint" in err
+        assert "unknown" in err and "tests" in err
+        assert "failed: lint, tests" not in err
+
+    def test_the_budget_leaves_room_to_report(self):
+        """Set at or above a harness ceiling and the kill happens first, which is the
+        failure this exists to remove rather than relocate."""
+        assert hook.VERIFY_BUDGET_SECONDS < 600
+        assert hook.TYPECHECK_TIMEOUT_SECONDS < hook.VERIFY_BUDGET_SECONDS
+
+    def test_no_deadline_means_no_cap(self, monkeypatch):
+        """`None` is the default so a caller that never opted in is unchanged -- and so
+        the suite's own `subprocess.run` stubs, which take no `timeout`, still work."""
+        import subprocess as sp
+
+        seen: dict = {}
+        monkeypatch.setattr(
+            hook, "_command_for", lambda name, root=None: (["x"], hook.REPO_ROOT, None)
+        )
+        monkeypatch.setattr(
+            hook.subprocess,
+            "run",
+            lambda *a, **k: seen.update(k) or sp.CompletedProcess([], 0, "", ""),
+        )
+        assert hook.run_checks([hook.CHECK_LINT]) == []
+        assert seen["timeout"] is None
+
+
 def test_command_for_returns_none_when_a_repo_script_is_absent(tmp_path, monkeypatch):
     """Absence is decided here, not left to the OSError handler in `run_checks`.
 
@@ -380,26 +593,30 @@ def sandboxed_verify(monkeypatch, tmp_path):
 
 
 def test_verify_skips_when_opted_out(monkeypatch):
-    monkeypatch.setattr(hook, "run_checks", lambda names, root=None: [("lint", None, "x")])
+    monkeypatch.setattr(
+        hook, "run_checks", lambda names, root=None, deadline=None: [("lint", None, "x")]
+    )
     assert hook.verify("{}", {hook.SKIP_VERIFY_ENV: "1"}) == 0
 
 
 def test_verify_returns_two_on_failure(monkeypatch, sandboxed_verify):
     monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [])
     monkeypatch.setattr(
-        hook, "run_checks", lambda names, root=None: [("lint", "logs/lint-errors.log", "")]
+        hook,
+        "run_checks",
+        lambda names, root=None, deadline=None: [("lint", "logs/lint-errors.log", "")],
     )
     assert hook.verify("{}", {}) == 2
 
 
 def test_verify_returns_two_when_db_tests_fail(monkeypatch, sandboxed_verify):
-    monkeypatch.setattr(hook, "run_checks", lambda names, root=None: [])
+    monkeypatch.setattr(hook, "run_checks", lambda names, root=None, deadline=None: [])
     monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [("tests", None, "F app/x")])
     assert hook.verify("{}", {}) == 2
 
 
 def test_verify_returns_zero_when_clean(monkeypatch, sandboxed_verify):
-    monkeypatch.setattr(hook, "run_checks", lambda names, root=None: [])
+    monkeypatch.setattr(hook, "run_checks", lambda names, root=None, deadline=None: [])
     monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [])
     assert hook.verify("{}", {}) == 0
 
@@ -412,7 +629,9 @@ def test_verify_still_runs_the_checks_on_a_continuation_stop(monkeypatch, sandbo
     looking green. The flag now only decides whether the round counter restarts.
     """
     ran = []
-    monkeypatch.setattr(hook, "run_checks", lambda names, root=None: ran.append(names) or [])
+    monkeypatch.setattr(
+        hook, "run_checks", lambda names, root=None, deadline=None: ran.append(names) or []
+    )
     monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [])
     assert hook.verify('{"stop_hook_active": true}', {}) == 0
     assert ran, "a continuation stop must still verify -- otherwise a fix is never checked"
@@ -420,7 +639,7 @@ def test_verify_still_runs_the_checks_on_a_continuation_stop(monkeypatch, sandbo
 
 def test_verify_blocks_repeatedly_then_stands_down(monkeypatch, sandboxed_verify):
     monkeypatch.setattr(
-        hook, "run_checks", lambda names, root=None: [("lint", None, "still broken")]
+        hook, "run_checks", lambda names, root=None, deadline=None: [("lint", None, "still broken")]
     )
     monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [])
 
@@ -444,7 +663,7 @@ def test_verify_blocks_repeatedly_then_stands_down(monkeypatch, sandboxed_verify
 
 def test_verify_clears_the_counter_once_green(monkeypatch, sandboxed_verify):
     sandboxed_verify["value"] = 2
-    monkeypatch.setattr(hook, "run_checks", lambda names, root=None: [])
+    monkeypatch.setattr(hook, "run_checks", lambda names, root=None, deadline=None: [])
     monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [])
     assert hook.verify("{}", {}) == 0
     assert sandboxed_verify["value"] == 0, "the next failure must start from a full budget"
@@ -458,7 +677,9 @@ def test_verify_verifies_committed_work(monkeypatch, tmp_path):
     monkeypatch.setattr(hook, "write_verify_artifact", lambda failures, repo_root=None: None)
     monkeypatch.setattr(hook, "read_rounds", lambda *a, **k: 0)
     monkeypatch.setattr(hook, "write_rounds", lambda *a, **k: None)
-    monkeypatch.setattr(hook, "run_checks", lambda names, root=None: seen.append(names) or [])
+    monkeypatch.setattr(
+        hook, "run_checks", lambda names, root=None, deadline=None: seen.append(names) or []
+    )
     monkeypatch.setattr(hook, "run_host_tests", lambda *a, **k: [])
     assert hook.verify("{}", {}) == 0
     assert seen and hook.CHECK_LINT in seen[0], (
@@ -850,7 +1071,7 @@ def test_run_host_tests_runs_pytest_without_a_db(monkeypatch, tmp_path):
     _set_db_enabled(monkeypatch, False)
     calls: list[list[str]] = []
 
-    def fake_pytest(targets, repo_root, extra_env=None):
+    def fake_pytest(targets, repo_root, extra_env=None, deadline=None):
         calls.append(list(targets))
         assert extra_env is None, "a DB-less run must not inject DB env"
         return []
@@ -908,7 +1129,9 @@ def test_run_host_tests_delegates_to_the_db_tier_when_a_db_is_configured(monkeyp
     _set_db_enabled(monkeypatch, True)
     seen: list[tuple[list[str], Path]] = []
     monkeypatch.setattr(
-        hook, "run_db_tests", lambda paths, env, repo_root: seen.append((paths, repo_root)) or []
+        hook,
+        "run_db_tests",
+        lambda paths, env, repo_root, deadline=None: seen.append((paths, repo_root)) or [],
     )
     hook.run_host_tests(["app/main.py"], {}, tmp_path)
     assert seen == [(["app/main.py"], tmp_path)], "the DB tier owns infra gating, not this"
@@ -1109,9 +1332,13 @@ def test_verify_checks_the_session_box_not_the_checkout(monkeypatch, tmp_path):
 
     monkeypatch.setattr(hook, "_git_status_porcelain", lambda root: _note("status", root, ""))
     monkeypatch.setattr(hook, "_git_branch_diff", lambda root: "")
-    monkeypatch.setattr(hook, "run_checks", lambda names, root=None: _note("checks", root, []))
     monkeypatch.setattr(
-        hook, "run_host_tests", lambda paths, env, root=None: _note("tests", root, [])
+        hook, "run_checks", lambda names, root=None, deadline=None: _note("checks", root, [])
+    )
+    monkeypatch.setattr(
+        hook,
+        "run_host_tests",
+        lambda paths, env, root=None, deadline=None: _note("tests", root, []),
     )
     monkeypatch.setattr(
         hook, "write_verify_artifact", lambda failures, root=None: _note("artifact", root)

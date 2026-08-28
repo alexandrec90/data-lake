@@ -568,8 +568,8 @@ def decide(
 def record_block(raw: str) -> None:
     """One harness-events ledger line per block, so a false positive is diagnosable
     from `logs/harness-events.log` in the devkit checkout rather than from the chat of
-    whichever session it hit. Best-effort: `harness_events.record` resolves the ledger
-    through `$DEVKIT_DIR` and no-ops (never raises) on a machine without one.
+    whichever session it hit. Best-effort: `harness_events.ledger_path` owns where that
+    is, and `record` no-ops (never raises) when the answer is nowhere.
     """
     if harness_events is None:
         return
@@ -594,11 +594,31 @@ def record_block(raw: str) -> None:
     )
 
 
+def _read_stdin() -> str:
+    """The hook payload, decoded as UTF-8 rather than through the platform codec.
+
+    Same defect and same remedy as `worktree-guard.read_stdin`, which owns the account
+    of it. Here the cost is smaller and still real: a command carrying an em dash or a
+    quoted path with an accent arrives mangled, so `decide` judges a string the agent
+    never wrote and `record_block` puts that string on the ledger as evidence.
+    """
+    try:
+        buffer = getattr(sys.stdin, "buffer", None)
+        if buffer is not None:
+            return buffer.read().decode("utf-8", errors="replace")
+        return sys.stdin.read() if sys.stdin is not None else ""
+    except (OSError, ValueError):
+        return ""
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shell", choices=("bash", "powershell"), default="bash")
     args = parser.parse_args(argv)
-    raw = sys.stdin.read()
+    # UTF-8, never the platform codec -- see `worktree-guard.read_stdin`. A command
+    # carrying an em dash decoded through cp1252 reaches `decide` mangled, and the
+    # mangling is then what `record_block` puts on the ledger.
+    raw = _read_stdin()
     exit_code, message = decide(
         raw,
         command_shell=args.shell,
