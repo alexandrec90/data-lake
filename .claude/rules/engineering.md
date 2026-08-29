@@ -143,6 +143,19 @@ answer in the seconds after a push and says nothing either way — `--watch` cov
 That is one extra call at the front, against an unbounded wait plus the polls that follow
 when the wait is abandoned.
 
+**There is a third case, and it is the common one: a gate that has not started *yet*.**
+For the first seconds after a push, GitHub has accepted the commit and not yet attached
+a run to it, so `gh pr checks --watch` finds nothing to watch and **returns immediately**
+saying "no checks reported" — on a healthy PR, with nothing wrong and nothing to fix. It
+happened twice on devkit#222 and cost an extra `gh pr view` and a second watch each time,
+because the paragraph above frames that message as the `CONFLICTING` case alone.
+
+Tell them apart by **how long the call took, not by what it said**: a `--watch` that
+returns in about a second never waited for anything. Treat that as a race, and re-issue
+the same watch once. A `CONFLICTING` PR gives the same message and does not get better
+on a retry, which is what the `mergeStateStatus` call at the front settles — so issue
+that one first after a push and the ambiguity never arises.
+
 When the gate will outlast anything useful you could do meanwhile, the cheapest correct
 move is to stop: report that the branch is pushed and the gate is running, and let the
 result arrive in a fresh session. The same report costs the session floor there, against
