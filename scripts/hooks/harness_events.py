@@ -70,6 +70,31 @@ VALUE_LIMIT = 300
 FIELD_LIMITS = {"message": 4000, "detail": 2000}
 
 
+# The line every *block* message ends with: how to report the block itself as wrong.
+#
+# `report-harness-defect.py` has existed since this ledger did, and the instruction to
+# use it lives in `.claude/rules/engineering.md`. That reaches exactly one runtime.
+# **Codex reads every `CLAUDE.md` and reads straight past `.claude/rules/`**, no
+# `CLAUDE.md` names the reporter, `sync-codex-context.py` mirrors only `.claude/skills/`
+# to `.agents/`, and `codex-hook-adapter.py` discards SessionStart output outright -- so
+# there was no path by which a Codex session could learn the channel exists. The ledger
+# shows the result rather than implying it: on 2026-08-28, across 1176 rows, Codex had
+# filed **zero** agent-reports while its sessions were hitting the guard the same day.
+# Every report on the backlog is Claude's, and the Codex half of the harness -- the half
+# with a whole translation tier that can only be judged from a session running under it
+# -- was reporting nothing at all.
+#
+# So the pointer goes where neither runtime can miss it and no document has to be
+# loaded: in the block itself, at the moment an agent has been stopped and is deciding
+# between reporting the gate and routing around it. Block paths only. An allow says
+# nothing an agent might dispute, and a route already tells it where to re-issue.
+REPORT_HINT = (
+    "If this block was wrong, report it rather than working around it:\n"
+    '  python3 scripts/hooks/report-harness-defect.py --message "<what went wrong>" '
+    '--command "<the exact command>"'
+)
+
+
 # `<project>--<slug>-<MMDD>` is `worktree.py`'s box-naming rule, and `project_of` there
 # owns it. This is the stdlib-only half a hook can reach: hooks run before the venv
 # exists, so importing that module is not available to them.

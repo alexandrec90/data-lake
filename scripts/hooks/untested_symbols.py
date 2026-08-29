@@ -184,15 +184,37 @@ def reference_pattern(symbol: str) -> re.Pattern[str]:
 
 
 def module_pattern(module: Path) -> re.Pattern[str]:
-    """Matches a test file's mention of `module`, in either spelling.
+    """Matches a test file's mention of `module`, in a spelling that names the module.
 
     A hyphenated script is loaded by path (`'scripts/sync-devkit.py'`) and imported
     under an underscored name (`sync_devkit`); a test may use either, and a test using
     neither is not the one covering it.
+
+    The four accepted spellings are the four ways a test can actually reach a module:
+    the file name, an `import`, an attribute off it, and a binding of it to a name. A
+    **bare stem anywhere in the file** used to count, and that is a substring match with
+    a word boundary painted on: `test_run_tests.py` asserting `'--ignore=tests/local_e2e'`
+    pulled that whole file into `scripts/local-e2e.py`'s corpus, where an unrelated
+    `rt.main(` then satisfied `reference_pattern('main')` and `local-e2e.py::main` read
+    as covered. That is a **false negative** in the debt list -- the one failure mode
+    this module's opening claims it does not have -- and the ratchet turns it into
+    pressure to delete a real gap from the baseline as "now covered".
+
+    The file-name spelling is still a plain substring, deliberately: a test that names
+    `scripts/acme-tool.py` in a docstring joins its corpus, because that is also how a
+    test loading it by path spells it and the two are not distinguishable. That is the
+    conservative direction -- it can only admit a test, and `reference_pattern` still has
+    to find the symbol inside it.
     """
-    stem = re.escape(module.stem)
+    filename = re.escape(module.name)
     snake = re.escape(module.stem.replace("-", "_"))
-    return re.compile(rf"\b{stem}\b|\b{snake}\b")
+    return re.compile(
+        rf"\b{filename}\b"  # path spelling: 'scripts/sync-devkit.py'
+        rf"|^\s*(?:import|from)\s+.*\b{snake}\b"  # import sync_devkit / from x import ...
+        rf"|\b{snake}\s*\."  # sync_devkit.main
+        rf"|\b{snake}\b\s*=",  # sync_devkit = load(...)
+        re.MULTILINE,
+    )
 
 
 def corpus_for(module: Path, texts: dict[Path, str]) -> str:

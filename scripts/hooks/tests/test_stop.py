@@ -574,6 +574,29 @@ def test_command_for_returns_none_when_a_repo_script_is_absent(tmp_path, monkeyp
     assert hook._command_for(hook.CHECK_SCRIPT_TESTS) is not None
 
 
+def test_the_frontend_tier_skips_a_tree_that_was_never_provisioned(tmp_path, monkeypatch):
+    """A missing `node_modules` is a missing toolchain, and this tier already skips those.
+
+    A worktree checks out tracked files only, so a freshly cut box has no
+    `node_modules`; `npm run test:run` there exits non-zero with `'vitest' is not
+    recognized`, and that was reported as `failed: frontend -- would fail CI`. It fired
+    twice on one box while the same suite was green (1393 passed) in the checkout. The
+    verdict sends the session to audit a diff that is fine, and `run_checks`'s own
+    contract already says a tooling gap must never block the agent -- `shutil.which` was
+    just asking about the wrong half of the toolchain.
+    """
+    monkeypatch.setattr(hook.shutil, "which", lambda _name: "npm")
+    frontend = tmp_path / hook.CFG.frontend.dir
+    frontend.mkdir(parents=True)
+
+    assert hook._command_for(hook.CHECK_FRONTEND, tmp_path) is None
+
+    (frontend / "node_modules").mkdir()
+    spec = hook._command_for(hook.CHECK_FRONTEND, tmp_path)
+    assert spec is not None
+    assert spec[1] == frontend
+
+
 @pytest.fixture
 def sandboxed_verify(monkeypatch, tmp_path):
     """`verify` with git, the artifact and the round marker all confined to tmp_path.

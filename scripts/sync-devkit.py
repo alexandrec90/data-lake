@@ -199,6 +199,12 @@ MANIFEST: tuple[str, ...] = (
     # first CI run.
     ".claude/rules/engineering.md",
     ".claude/rules/authoring.md",
+    # The reference half of the policy above. Vendored because the pointers into it are:
+    # an unvendored target would leave every consumer's engineering.md citing a path that
+    # does not exist there. It sits *outside* `.claude/rules/` on purpose -- every `.md`
+    # under that directory is loaded as a rule, and an unscoped one is re-sent on every
+    # API call of every session, which is exactly what this file must not be.
+    ".claude/engineering-evidence.md",
     # The one portable task workflow. Its script detects the remote default branch
     # and owns the mechanical checks; the skill supplies the semantic commit/PR text.
     ".claude/skills/ship/SKILL.md",
