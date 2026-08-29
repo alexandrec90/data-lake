@@ -85,23 +85,20 @@ should add the `env` entry to its own `settings.json`; that file is not vendored
 `.codex/hooks.json`, and Codex's shell tool caps captured output before it reaches model
 context. Issue commands there directly -- including the nine.
 
-**This gate used to work the other way round**, and the reversal is worth knowing because
-the old design is the intuitive one. It required every call to *prove* it was bounded and
-blocked whatever it could not recognise -- which means modelling the shell, and 46% of
-every block it ever issued turned out to be its own false positive rather than a command
-anyone needed to change. So if this gate blocks something that is not one of the nine,
-that is a defect in it: **report it with the exact command**, per the feedback-loop
-guardrail at the foot of this file. Never rewrite a correct command to satisfy it.
+**If this gate blocks something that is not one of the nine, that is a defect in it:**
+report it with the exact command, per the feedback-loop guardrail at the foot of this
+file. Never rewrite a correct command to satisfy it. Why the gate is a blocklist rather
+than a proof obligation -- it used to be the other way round, and 46% of every block it
+issued was its own false positive -- is in
+[`.claude/engineering-evidence.md`](../engineering-evidence.md).
 
 ## Waiting on a CI gate: one blocking call, not a poll loop
 
 When you are asked to wait for a PR gate, the expensive part is not the `gh` command --
-it is that **every poll is a full API round trip that re-sends the whole conversation**.
-Measured over ~16k API calls in the workspace this rule was written for (2026-08): 307
-polling calls burned 36M billed input tokens, ~2.5% of all spend, at an average context
-of 117k tokens per poll. Polls land at the *end* of a session, where context is largest,
-so they are the most expensive place a call can go -- one late poll cost more than five
-whole sessions did.
+it is that **every poll is a full API round trip that re-sends the whole conversation**,
+landing at the *end* of a session where the context is largest. What that measured is in
+[`.claude/engineering-evidence.md`](../engineering-evidence.md), along with the two PRs
+that produced the diagnosis below.
 
 **Spell the wait as a single call that blocks**, backgrounded so the harness re-invokes
 you when it exits instead of holding a turn open:
@@ -123,14 +120,11 @@ Two things this does **not** condemn, because neither is waste:
 - **Asking once.** A single `gh pr checks` is one call and often the right answer. The
   waste begins at the *second* identical poll and compounds from there.
 
-**"No checks reported" is not a gate that has not started; it can be a gate that will
-never start.** GitHub builds a `pull_request` run against the *merge* ref, and a PR that
-has gone `CONFLICTING` has no merge ref to build — so no workflow is queued for the head
-commit at all, and `--watch` waits on something nothing will ever produce. The PR page
-does not read that way: it keeps showing the last green gate, from an **older** commit,
-so devkit#180 sat for hours with zero check runs on its head commit and read as gated and
-passing. Ask the one question that distinguishes the two, once, before or instead of
-waiting:
+**"No checks reported" has two causes and they need opposite responses**: a gate that
+has not started *yet*, and one that will **never** start because a `CONFLICTING` PR has
+no merge ref for GitHub to build a run against. Ask the one question that separates
+them, once, after a push -- one call against an unbounded wait plus the polls that
+follow when the wait is abandoned:
 
 ```bash
 gh pr view <N> --json mergeStateStatus,statusCheckRollup
@@ -140,21 +134,11 @@ gh pr view <N> --json mergeStateStatus,statusCheckRollup
 commit. `BLOCKED`/`UNSTABLE`/`CLEAN` mean the run exists and `--watch` is the right call.
 `UNKNOWN` means GitHub has not finished computing mergeability yet, which is the ordinary
 answer in the seconds after a push and says nothing either way — `--watch` covers it.
-That is one extra call at the front, against an unbounded wait plus the polls that follow
-when the wait is abandoned.
 
-**There is a third case, and it is the common one: a gate that has not started *yet*.**
-For the first seconds after a push, GitHub has accepted the commit and not yet attached
-a run to it, so `gh pr checks --watch` finds nothing to watch and **returns immediately**
-saying "no checks reported" — on a healthy PR, with nothing wrong and nothing to fix. It
-happened twice on devkit#222 and cost an extra `gh pr view` and a second watch each time,
-because the paragraph above frames that message as the `CONFLICTING` case alone.
-
-Tell them apart by **how long the call took, not by what it said**: a `--watch` that
-returns in about a second never waited for anything. Treat that as a race, and re-issue
-the same watch once. A `CONFLICTING` PR gives the same message and does not get better
-on a retry, which is what the `mergeStateStatus` call at the front settles — so issue
-that one first after a push and the ambiguity never arises.
+When you get the message anyway, tell the two apart by **how long the call took, not by
+what it said**: a `--watch` that returns in about a second never waited for anything, so
+treat it as the race and re-issue the same watch once. A `CONFLICTING` PR gives the same
+message and does not get better on a retry.
 
 When the gate will outlast anything useful you could do meanwhile, the cheapest correct
 move is to stop: report that the branch is pushed and the gate is running, and let the
@@ -206,47 +190,15 @@ teaching everyone to ignore it.
 
 **Adding a family prefix to `select` enables every member, including the cosmetic
 ones.** `"E"` is not one rule; it is nineteen, and `E501` (line-too-long) is one of
-them. Nobody in this workspace ever decided to cap line length — `select = ["E", "F",
-"I", "UP"]` was added once, E501 came along, and the same commit already carried two
-`per-file-ignores` entries turning it back off. It spread to every generated project
-from there and was suppressed one directory at a time for years.
+them — nobody here ever decided to cap line length. So when adding a family, **read its
+members and ignore the cosmetic ones in the same change**; a rule already exempted in
+two or three directories is not a rule anyone wants, which is the signal to turn it off
+globally rather than exempt it a fourth time.
 
-So, when adding a family: **read its members and ignore the cosmetic ones in the same
-change.** A rule already exempted in two or three directories is not a rule anyone
-wants — that is the signal it should be off globally, not exempted a fourth time.
-
-Currently off by this policy, and they are not to be re-enabled without a reason that
-names a defect they would catch:
-
-| Selector | What it enforces |
-| --- | --- |
-| `I` | import ordering |
-| `UP` | preferred modern syntax |
-| `SIM` | readability rewrites |
-| `N` | naming conventions |
-| `T20` | stray `print()` calls |
-| `E101 E401 E501 E701 E702 E703 E731 E741 E742 E743` | the cosmetic members of `E` |
-
-`E402`, `E711`–`E714`, `E721`, `E722`, `E902` and `E999` stay on: those catch real
-defects. So do `F`, `B`, `ASYNC`, `S` and `RUF`.
-
-`line-length` is a **formatter** setting and stays. Dropping E501 does not stop code
-being wrapped; it stops the wrapping being a commit failure.
-
-Two things make this stick rather than drift back:
-
-- devkit's `test_generated_projects_do_not_enforce_cosmetic_rules` fails if a newly
-  generated project would enforce any of the above. It tests *reachability*, because
-  dropping a family from `select` and listing a code in `ignore` are equally effective
-  and a check on one spelling would miss the other.
-- Selectors do not span linters. `S` is flake8-bandit and does **not** select `SIM108`
-  from flake8-simplify; only the numeric part matches as a prefix, which is why `E5`
-  covers `E501`. Assume otherwise and you will disable, or fail to disable, the wrong
-  set.
-
-This is a deliberate deletion of obsolete checks, which the closing paragraph of *When
-a linter is wrong* permits explicitly. It is **not** licence to skip a failing check:
-everything still enabled gets fixed or reported, never ignored.
+Which selectors are currently off by this policy, why a selector never spans linters,
+and the generated-project test that stops them drifting back are in
+[`.claude/engineering-evidence.md`](../engineering-evidence.md) — read it before editing
+any `select` or `ignore` list.
 
 ### Never silence a finding without naming the reason
 
@@ -297,19 +249,15 @@ everything with no submodule and no install step.
   `--push` sends a change authored here back up. `DEVKIT_VERSION` records which
   upstream commit the vendored copy corresponds to.
 - **`$DEVKIT_DIR` unset means there is nothing to compare against, and the stamp
-  decides what that is worth.** Before adoption every mode no-ops clean (exit 0):
-  nothing is vendored, so the gate has nothing to miss. Once `DEVKIT_VERSION` exists,
-  the same silence would report a comparison that never ran, so it **fails** instead.
-  `$DEVKIT_DIR` is a property of the machine and `DEVKIT_VERSION` is committed, which
-  is what makes the distinction reliable: a second workstation, a fresh clone or a CI
-  job missing its `env:` block is where the gate would otherwise go quiet. On a machine
-  with no devkit clone at all, the drift check that still works is
-  `pre-commit run devkit-drift --all-files` — same comparison, against the rev pinned
-  in `.pre-commit-config.yaml`.
+  decides what that is worth.** Before adoption every mode no-ops clean (exit 0); once
+  `DEVKIT_VERSION` exists the same silence would report a comparison that never ran, so
+  it **fails** instead. On a machine with no devkit clone at all, the drift check that
+  still works is `pre-commit run devkit-drift --all-files` — same comparison, against
+  the rev pinned in `.pre-commit-config.yaml`.
 - A vendored script may depend on a file the project owns (`lint-all.py`,
-  `run-tests.py`). Those dependencies are asserted by
-  `scripts/hooks/tests/test_repo_contract.py`, because at runtime a missing one is a
-  silent skip by design — the gate reports green having run nothing.
+  `run-tests.py`), and a missing one is a silent skip by design. Both that and the
+  stamp rule above are explained in
+  [`.claude/engineering-evidence.md`](../engineering-evidence.md).
 
 ## Guardrail: the instruction-file feedback loop
 
@@ -332,24 +280,18 @@ session reads it without being handed your chat. It complements the flag in your
 rather than replacing it — the user still has to see it — and on a machine with no
 `$DEVKIT_DIR` it says so and exits 0.
 
-### Reporting a *harness* defect: check the copy's age first
+### Reporting a *harness* defect: name the copy's age
 
-The hook scripts are a **vendored copy**, and every consuming project is routinely
-weeks of fixes behind devkit. A block or a crash you hit here may already be fixed
-upstream, and a report of one costs a human a relay and a false-positive triage.
-
-So before reporting that a hook misbehaved, spend one command:
+The hook scripts are a **vendored copy**, and every consuming project is routinely weeks
+of fixes behind devkit — so a block or a crash you hit here may already be fixed
+upstream, and a report of one costs a human a relay and a false-positive triage. Spend
+one command before reporting one, and put its answer in the report:
 
 ```bash
 python scripts/sync-devkit.py --check     # clean = this copy matches upstream
 ```
 
-- **Drift reported, or the block message named a SHA:** the copy is behind. Say so in
-  the report — `DEVKIT_VERSION` plus what `--check` said — or pull and re-test first.
-  A report that names the version can be triaged; one that does not cannot.
-- **Clean, or the message said the harness is the source:** the behaviour is current.
-  Report it as a defect, with the exact command and the exact message.
-
-Blocks from the capped-Bash gate carry this footer themselves, so the version is
-usually already in front of you. This is **not** a reason to route around the hook:
-an old copy is still worth reporting once you know that is what it is.
+A report that names `DEVKIT_VERSION` and what `--check` said can be triaged; one that
+does not cannot. Blocks from the capped-Bash gate carry this footer themselves, so the
+version is usually already in front of you. An old copy is still worth reporting once
+you know that is what it is — this is **not** a reason to route around the hook.

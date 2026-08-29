@@ -244,7 +244,9 @@ def block_message(
         f'--command "<your command>" --max-bytes {max_bytes}\n'
         "Nothing else is gated. This is a short blocklist of tree-scaling commands, "
         "not a requirement to prove every call is bounded -- so do not wrap commands "
-        "it did not name." + (f"\n{stamp}" if stamp else "")
+        "it did not name."
+        + (f"\n{harness_events.REPORT_HINT}" if harness_events is not None else "")
+        + (f"\n{stamp}" if stamp else "")
     )
 
 

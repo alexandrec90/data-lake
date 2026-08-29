@@ -386,6 +386,20 @@ def test_the_block_message_carries_the_harness_provenance_when_given_one():
     assert "`ls`" in msg
 
 
+def test_the_block_message_says_how_to_report_the_block_as_wrong():
+    """This gate's own rule says a block on something outside the nine is a defect in
+    it -- and until now the block never said where that goes.
+
+    It matters most for the runtime that cannot read the rule. Codex reads past
+    `.claude/rules/`, so a Codex session had no path to the reporter at all: on
+    2026-08-28 the ledger held 1176 rows and not one agent-report from Codex, against
+    seven of its guard-blocks the same day. A gate that offers no channel gets routed
+    around, which is the failure the guardrail exists to prevent.
+    """
+    _, msg = hook.decide(payload("Bash", "ls -la"), max_bytes=4000)
+    assert "report-harness-defect.py" in msg
+
+
 def test_no_stamp_leaves_the_message_exactly_as_it_was():
     """A project whose harness cannot be identified gets the message unchanged, with
     no trailing blank line hinting that something failed to render."""

@@ -970,6 +970,16 @@ def _command_for(name: str, root: Path | None = None) -> tuple[list[str], Path, 
         npm = shutil.which("npm")
         if not npm:
             return None
+        # An unprovisioned tree is a missing toolchain, not a failing suite. A worktree
+        # checks out tracked files only, so a freshly cut box has no `node_modules` and
+        # `npm run test:run` exits non-zero with `'vitest' is not recognized` -- which
+        # `run_checks` reported as `failed: frontend / would fail CI`, twice, while the
+        # same suite was green in the checkout. That verdict points the session at its
+        # own diff, which is the one place the problem is not, and the fix it implies
+        # (change the code) is the wrong one. `shutil.which("npm")` was already this
+        # tier's "is the toolchain here" test; it was just asking about the wrong half.
+        if not (base / CFG.frontend.dir / "node_modules").is_dir():
+            return None
         return ([npm, *CFG.frontend.test_cmd], base / CFG.frontend.dir, None)
     return None
 
