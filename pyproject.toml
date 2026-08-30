@@ -12,7 +12,7 @@ dependencies = [
     # the package never pulls a provider SDK), but a working install needs them present.
     "praw>=8.0.3",
     "pytrends>=4.9",
-    "yfinance>=1.6.0",
+    "yfinance>=1.7.0",
 ]
 
 [project.optional-dependencies]
@@ -20,7 +20,7 @@ dependencies = [
 # clear install hint when a command actually needs to read or write Parquet.
 archive = [
     "pyarrow>=25.0.1",
-    "boto3>=1.43.76",
+    "boto3>=1.43.82",
 ]
 # Read-only DuckDB research lens over the archived Parquet.
 research = [
@@ -31,7 +31,7 @@ research = [
 dev = [
     "pytest>=8",
     "pytest-cov>=6",
-    "ruff>=0.16.4",
+    "ruff>=0.16.5",
     "mypy>=2.3.1",
     "pre-commit>=4.6.2",
 ]
