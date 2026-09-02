@@ -103,6 +103,34 @@ Two practical consequences worth knowing before you add one:
 - Personal data in a shared table is still personal data. Hash it before it lands (see
   Privacy, below); the bucket and every consumer's database inherit whatever you store.
 
+## The archive's storage tier is local disk, by decision
+
+`store_from_settings` treats `local` and `s3` as equals, so which one is in use is not
+derivable from this package — it is a per-consumer setting, and today **every consumer is
+`local` and no bucket is configured anywhere.** The reason is cost: the workstation has
+~830 GB free, the archive holds nothing yet, and R2 would buy durability the projects do
+not need before there is data to lose.
+
+The pooled tree is `data-lake/data/archive` (gitignored here; `sports_betting` has always
+defaulted to it, `ibkr_trader` now points `ARCHIVE_LOCAL_DIR` there too). Datasets are
+namespaced by the `DatasetSpec.prefix` values in `archive/catalog.py`, so two consumers
+writing one tree share a `_catalog/` without colliding — that sharing is the point.
+
+Two things this costs, both worth re-reading before assuming the archive is a backup:
+
+- **A local archive bounds Postgres, not the disk.** `archive_price_bars` moves bytes from
+  the database to a directory on the same drive. The hot/cold window is still worth
+  keeping — it is what stops the *database* growing without limit — but "archived" here
+  means "out of Postgres", not "off this machine".
+- **Verify-then-delete deletes for real.** `archive/bars.py` drops the rows once it has
+  read the object back, so the archive tree is the only copy of everything past the
+  window. Whatever backs up the workstation has to cover it, or the first drive failure
+  takes the database and its archive together.
+
+Flipping to a bucket is a settings change plus a file copy — same `ObjectStore` protocol,
+same keys, same self-describing `_catalog/`. Every archive entry point takes the store as
+an argument, so a consumer can also split datasets across both backends in one process.
+
 ## Privacy
 
 Social payloads and rental listings are scraped content held under Québec Law 25.
