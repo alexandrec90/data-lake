@@ -46,7 +46,14 @@ Run each step in order. Stop on failure; never open a PR for an unverified branc
 2. Review the change. Get the file list from `git status --short`, then read the
    changes with the Read tool rather than paging a capped `git diff` — a cap drops the
    middle of a large diff, which is the one part a truncated read hides from you. Run
-   the targeted tests for the changed behavior. Stage only the intended files, then
+   the targeted tests for the changed behavior — and when a `scripts/` file changed,
+   that is **two test trees, not one**. `run-tests.py` takes its scope from
+   `testpaths`, the project's own suite; the vendored `scripts/hooks/tests/` sits
+   outside it by design and runs as its own step, so a green `run-tests.py` says
+   nothing about it. Run `pytest scripts/hooks/tests/` too: it applies gates a project
+   suite does not, such as requiring every public symbol in a script to be named by a
+   test. Skipping it does not get you past that gate — it moves the failure to the
+   Stop hook or CI, after the push. Stage only the intended files, then
    commit with an imperative subject and a body explaining why, written to a file and
    passed with `git commit -F`. The skill argument, when supplied, is only the subject
    when it *reads* as one — imperative, about the change. An argument that names
