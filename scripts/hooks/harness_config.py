@@ -24,6 +24,8 @@ Pure and unit-tested in `scripts/hooks/tests/test_harness_config.py`.
 from __future__ import annotations
 
 import contextlib
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -156,6 +158,54 @@ class TestContractConfig:
 
 
 @dataclass(frozen=True)
+class LayerRule:
+    """One import boundary: files under `sources` may not import anything `forbid`
+    names. `forbid` entries are module prefixes as written in the import (`app.db`,
+    `axios`) or repo-relative path prefixes of the resolved file (`app/db/`)."""
+
+    name: str = ""
+    sources: tuple[str, ...] = ()
+    forbid: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RestrictRule:
+    """One call-site boundary: `pattern` (a regex over the file's text) may appear
+    only in files under `only_in`. `paths` narrows which files are checked at all;
+    empty means every scanned file. The shape behind "browser storage only through
+    the wrapper", "no `fetch` outside the API client", "no SQL outside the
+    repository layer"."""
+
+    name: str = ""
+    pattern: str = ""
+    only_in: tuple[str, ...] = ()
+    paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class StructureConfig:
+    """What `scripts/hooks/structure_check.py` scans, and the limits it holds to.
+
+    `paths` defaults to the app directory, the frontend source tree when one is
+    enabled, and `scripts/`; the test directory is always scanned for the counters
+    (suppressions, skipped tests) but never measured for size. `exclude` and
+    `entrypoints` are repo-relative path prefixes: the first drops a subtree from the
+    scan (generated code, migrations), the second exempts one from the orphan rule
+    (files loaded by name rather than by import). `disabled` names rules a project
+    opts out of. `limits` overrides any default in the script's `DEFAULT_LIMITS`; an
+    unknown key is a configuration error the script reports rather than ignores.
+    """
+
+    paths: tuple[str, ...] = ()
+    exclude: tuple[str, ...] = ()
+    entrypoints: tuple[str, ...] = ()
+    disabled: tuple[str, ...] = ()
+    limits: dict[str, int] = field(default_factory=dict)
+    layers: tuple[LayerRule, ...] = ()
+    restrict: tuple[RestrictRule, ...] = ()
+
+
+@dataclass(frozen=True)
 class WorktreeConfig:
     """Extra `.env` assignments an ephemeral box must make for itself.
 
@@ -210,6 +260,7 @@ class Config:
     docker: DockerConfig = field(default_factory=DockerConfig)
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
     test_contract: TestContractConfig = field(default_factory=TestContractConfig)
+    structure: StructureConfig = field(default_factory=StructureConfig)
 
     def env(self, suffix: str) -> str:
         """The prefixed control-env name, e.g. env("SKIP_STOP_VERIFY")."""
@@ -302,6 +353,69 @@ def _test_contract_from(raw: dict[str, Any], default: TestContractConfig) -> Tes
     )
 
 
+def _int_map(value: Any) -> dict[str, int]:
+    """`{name: int}` from a TOML table, dropping entries that are not whole numbers.
+
+    A dropped limit falls back to the script's default rather than to "no limit",
+    and `bool` is excluded for the reason `_int_or` gives.
+    """
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(k): int(v) for k, v in value.items() if isinstance(v, int) and not isinstance(v, bool)
+    }
+
+
+def _layer_rules(value: Any) -> tuple[LayerRule, ...]:
+    if not isinstance(value, list):
+        return ()
+    rules = []
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        rules.append(
+            LayerRule(
+                name=str(raw.get("name", "")),
+                # `from` in TOML, because that is how the rule reads; a Python
+                # field cannot carry that name.
+                sources=_as_str_tuple(raw.get("from"), ()),
+                forbid=_as_str_tuple(raw.get("forbid"), ()),
+            )
+        )
+    return tuple(rules)
+
+
+def _restrict_rules(value: Any) -> tuple[RestrictRule, ...]:
+    if not isinstance(value, list):
+        return ()
+    rules = []
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        rules.append(
+            RestrictRule(
+                name=str(raw.get("name", "")),
+                pattern=str(raw.get("pattern", "")),
+                only_in=_as_str_tuple(raw.get("only_in"), ()),
+                paths=_as_str_tuple(raw.get("paths"), ()),
+            )
+        )
+    return tuple(rules)
+
+
+def _structure_from(raw: dict[str, Any], default: StructureConfig) -> StructureConfig:
+    return replace(
+        default,
+        paths=_as_str_tuple(raw.get("paths"), default.paths),
+        exclude=_as_str_tuple(raw.get("exclude"), default.exclude),
+        entrypoints=_as_str_tuple(raw.get("entrypoints"), default.entrypoints),
+        disabled=_as_str_tuple(raw.get("disabled"), default.disabled),
+        limits=_int_map(raw.get("limits")) or dict(default.limits),
+        layers=_layer_rules(raw.get("layers")) or default.layers,
+        restrict=_restrict_rules(raw.get("restrict")) or default.restrict,
+    )
+
+
 def _env_map(value: Any, fallback: dict[str, str]) -> dict[str, str]:
     # Both halves coerced to str: TOML gives an int for `PORT = 5176`, and a
     # non-string value reaching the `.env` writer would be a template that never
@@ -332,6 +446,7 @@ def from_dict(data: dict[str, Any]) -> Config:
     docker_raw = data.get("docker", {}) if isinstance(data.get("docker"), dict) else {}
     wt_raw = data.get("worktree", {}) if isinstance(data.get("worktree"), dict) else {}
     tc_raw = data.get("test_contract", {}) if isinstance(data.get("test_contract"), dict) else {}
+    st_raw = data.get("structure", {}) if isinstance(data.get("structure"), dict) else {}
     return Config(
         env_prefix=str(project.get("env_prefix", default.env_prefix)),
         app_dir=str(paths.get("app", default.app_dir)),
@@ -344,6 +459,7 @@ def from_dict(data: dict[str, Any]) -> Config:
         docker=_docker_from(docker_raw, default.docker),
         worktree=_worktree_from(wt_raw, default.worktree),
         test_contract=_test_contract_from(tc_raw, default.test_contract),
+        structure=_structure_from(st_raw, default.structure),
     )
 
 
@@ -457,10 +573,83 @@ def lookup(cfg: Config, dotted: str) -> str:
     return "" if isinstance(node, (dict, list, tuple)) else str(node)
 
 
+# --- The harness kill switch -------------------------------------------------
+#
+# `DEVKIT_HOOKS_OFF` switches hooks off from the **environment**, so one line in a
+# `settings.json` `env` block quietens the harness across every project at once and
+# deleting that line restores it. The alternative — stripping hook entries out of each
+# project's `.claude/settings.json` — is N files to edit and N files to reconstruct from
+# memory later, which is not a switch anyone flips twice. It is read here rather than in
+# each hook so the spelling, the "all" aliases and the off-values asymmetry have one
+# owner.
+#
+# **The branch tier is switchable too, and that is a deliberate reversal.**
+# `worktree-guard.py` — which routes an agent edit into a box on a task branch — and
+# `task_slug.py`, which names it, were exempt from this switch on the reasoning that
+# turning them off does not quieten a session, it lands agent work on a checkout's home
+# branch with nothing under it. That argument held only while the hooks were the *only*
+# thing that could cut the branch. They no longer are: devkit's workspace carries a task
+# per verb — cut the box, open an agent in it, ship it, destroy it — so an operator who
+# stands the tier down is choosing to drive it by hand rather than losing it. That tier is
+# devkit's, not every project's, which is why this comment describes the *reversal* rather
+# than naming a script a consumer does not have.
+#
+# The two share one name, `branch-tier`, rather than one each. They are halves of a
+# single mechanism — the slug exists to name the box the guard cuts — and the vendored
+# tier can only see one of them anyway: consumers run `worktree-guard-launch.py` and
+# have no copy of `task_slug.py` at all.
+HOOKS_OFF_ENV = "DEVKIT_HOOKS_OFF"
+
+# Every hook the switch reaches, spelled as it is written in the env var. Listing them
+# is what makes `DEVKIT_HOOKS_OFF=stop` a typo-checkable value rather than a guess, and
+# what lets the harness be re-enabled one hook at a time — the order it will actually
+# come back in, since the Stop gate is the expensive one and `lint-fix` is nearly free.
+SWITCHABLE_HOOKS = (
+    "session-start",
+    "capped-bash",
+    "lint-fix",
+    "stop",
+    "failure-retro",
+    "branch-tier",
+)
+
+# Anything meaning "every hook in `SWITCHABLE_HOOKS`". A bare `=1` is what an operator
+# reaches for first, so it has to mean the obvious thing.
+_ALL_HOOKS = frozenset({"1", "all", "*", "true", "yes", "on"})
+
+# Values that read as "off" to a human must not switch the harness off — the same
+# asymmetry `git_policy.SKIP_ENV_VAR` documents, for the same reason: someone who writes
+# `DEVKIT_HOOKS_OFF=0` means "leave the hooks running", and honouring it as "off" would
+# disable the harness for the person trying to turn it back on.
+_OFF_VALUES = frozenset({"", "0", "false", "no", "off"})
+
+
+def hooks_off(name: str, env: Mapping[str, str] | None = None) -> bool:
+    """True when `DEVKIT_HOOKS_OFF` names `name`, or names every hook.
+
+    Asked at the top of a hook's `main()`, before anything else runs — deliberately
+    *before* `load()`, so a project whose `.devkit.toml` is broken can still be
+    quietened. Never raises and never touches the filesystem for the same reason.
+    """
+    raw = (os.environ if env is None else env).get(HOOKS_OFF_ENV, "") or ""
+    if raw.strip().lower() in _OFF_VALUES:
+        return False
+    tokens = {token.strip().lower() for token in raw.replace(";", ",").split(",")}
+    return bool(tokens & _ALL_HOOKS) or name.strip().lower() in tokens
+
+
 if __name__ == "__main__":  # pragma: no cover - exercised via subprocess in tests
     # `python3 scripts/hooks/harness_config.py python.install_command` -> stdout.
     # Exists so `.claude/hooks/session-start.sh` can read the manifest without a
     # TOML parser in shell. Always exits 0: a hook must not die over config.
     import sys
 
-    print(lookup(load(Path.cwd()), sys.argv[1]) if len(sys.argv) > 1 else "")
+    argv = sys.argv[1:]
+    if argv[:1] == ["--hook-off"]:
+        # `--hook-off session-start` -> exit 0 when that hook is switched off, 1 when it
+        # is live. An exit code rather than stdout because the only caller is
+        # `session-start.sh`, where `if ... --hook-off session-start; then exit 0; fi` is
+        # the whole of what it needs. This arm is the one that may exit non-zero; the
+        # lookup arm below still must not, per the note above.
+        sys.exit(0 if len(argv) > 1 and hooks_off(argv[1]) else 1)
+    print(lookup(load(Path.cwd()), argv[0]) if argv else "")

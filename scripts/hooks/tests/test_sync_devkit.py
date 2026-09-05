@@ -10,6 +10,12 @@ import pytest
 from conftest import load_module
 
 sh = load_module("scripts/sync-devkit.py")
+# The settings tier the pull drives. Loaded here rather than off `sh`, because
+# `sync-devkit.py` imports it on use and deliberately holds no reference: a project's
+# first pull runs that script before this file exists. Its own contract is covered in
+# `test_project_settings.py`; what is checked from here is the pull and the check
+# reaching it with this module's retired list.
+ps = load_module("scripts/project_settings.py")
 
 
 def test_resolve_src_prefers_arg_then_env():
@@ -879,7 +885,7 @@ def test_a_retired_hook_command_is_dropped():
         'python3 "${CLAUDE_PROJECT_DIR:-.}/scripts/hooks/branch-per-task.py"',
         'python3 "${CLAUDE_PROJECT_DIR:-.}/scripts/hooks/lint-fix.py"',
     )
-    pruned, dropped = sh.prune_hook_commands(payload, ("scripts/hooks/branch-per-task.py",))
+    pruned, dropped = ps.prune_hook_commands(payload, ("scripts/hooks/branch-per-task.py",))
     assert dropped == ["branch-per-task.py"]
     assert "UserPromptSubmit" not in pruned["hooks"]
     assert pruned["hooks"]["PreToolUse"][0]["hooks"][0]["command"].endswith('lint-fix.py"')
@@ -892,7 +898,7 @@ def test_a_surviving_hook_in_the_same_group_is_kept():
         'python3 "x/scripts/hooks/branch-on-write.py"',
         'python3 "x/scripts/hooks/lint-fix.py"',
     )
-    pruned, dropped = sh.prune_hook_commands(
+    pruned, dropped = ps.prune_hook_commands(
         payload, ("scripts/hooks/branch-per-task.py", "scripts/hooks/branch-on-write.py")
     )
     assert sorted(dropped) == ["branch-on-write.py", "branch-per-task.py"]
@@ -903,21 +909,21 @@ def test_a_surviving_hook_in_the_same_group_is_kept():
 def test_an_emptied_event_is_removed_not_left_as_a_husk():
     """`{"hooks": []}` is a shape the next reader cannot tell from an accident."""
     payload = _settings('python3 "x/scripts/hooks/branch-per-task.py"')
-    pruned, _ = sh.prune_hook_commands(payload, ("scripts/hooks/branch-per-task.py",))
+    pruned, _ = ps.prune_hook_commands(payload, ("scripts/hooks/branch-per-task.py",))
     assert pruned["hooks"] == {}
     assert pruned["model"] == "opus"  # everything outside `hooks` is untouched
 
 
 def test_nothing_is_dropped_when_no_hook_is_retired():
     payload = _settings('python3 "x/scripts/hooks/lint-fix.py"')
-    pruned, dropped = sh.prune_hook_commands(payload, ("scripts/hooks/branch-per-task.py",))
+    pruned, dropped = ps.prune_hook_commands(payload, ("scripts/hooks/branch-per-task.py",))
     assert dropped == []
     assert pruned == payload
 
 
 @pytest.mark.parametrize("payload", [None, [], "text", {}, {"hooks": "nonsense"}])
 def test_a_settings_shape_this_does_not_understand_is_returned_untouched(payload):
-    assert sh.prune_hook_commands(payload, ("scripts/hooks/branch-per-task.py",)) == (payload, [])
+    assert ps.prune_hook_commands(payload, ("scripts/hooks/branch-per-task.py",)) == (payload, [])
 
 
 def test_prune_settings_rewrites_the_file(tmp_path):
@@ -926,8 +932,8 @@ def test_prune_settings_rewrites_the_file(tmp_path):
     path.write_text(
         json.dumps(_settings('python3 "x/scripts/hooks/branch-per-task.py"')), encoding="utf-8"
     )
-    assert sh.prune_settings(tmp_path, ("scripts/hooks/branch-per-task.py",)) == [
-        "branch-per-task.py"
+    assert sh.settings_pass(tmp_path, ("scripts/hooks/branch-per-task.py",)) == [
+        f"(unwired retired hook) {sh.SETTINGS_FILE}: branch-per-task.py"
     ]
     assert "branch-per-task" not in path.read_text(encoding="utf-8")
 
@@ -938,12 +944,12 @@ def test_prune_settings_leaves_an_unparseable_file_exactly_as_it_was(tmp_path):
     path = tmp_path / sh.SETTINGS_FILE
     path.parent.mkdir(parents=True)
     path.write_text("{ not json, branch-per-task.py", encoding="utf-8")
-    assert sh.prune_settings(tmp_path, ("scripts/hooks/branch-per-task.py",)) == []
+    assert sh.settings_pass(tmp_path, ("scripts/hooks/branch-per-task.py",)) == []
     assert path.read_text(encoding="utf-8") == "{ not json, branch-per-task.py"
 
 
 def test_prune_settings_is_silent_when_there_is_no_settings_file(tmp_path):
-    assert sh.prune_settings(tmp_path, ("scripts/hooks/branch-per-task.py",)) == []
+    assert sh.settings_pass(tmp_path, ("scripts/hooks/branch-per-task.py",)) == []
 
 
 def test_a_live_hook_merely_mentioning_a_retired_basename_is_kept():
@@ -957,7 +963,7 @@ def test_a_live_hook_merely_mentioning_a_retired_basename_is_kept():
     """
     lint = 'markdownlint-cli2 --config .config.yaml "docs/roadmap.md" "README.md"'
     payload = _settings(lint)
-    pruned, dropped = sh.prune_hook_commands(payload, (".claude/skills/state-tools/README.md",))
+    pruned, dropped = ps.prune_hook_commands(payload, (".claude/skills/state-tools/README.md",))
     assert dropped == []
     assert pruned == payload
 
@@ -1402,6 +1408,63 @@ def test_the_baseline_is_not_vendored(tmp_path):
     assert sh.UNTESTED_BASELINE_FILE not in sh.MANIFEST
 
 
+# --- seeding the structure ratchet ---------------------------------------------------
+#
+# Same shape as the untested-symbol seeding above, for the same reason: the pull that
+# delivers the gate must not be the pull that reddens it.
+
+STRUCTURE_CHECKER = "scripts/hooks/structure_check.py"
+STRUCTURE_SCANNER = "scripts/hooks/structure_scan.py"
+
+
+def _structure_project(root: Path, source: str = "x = 1  # noqa\n") -> Path:
+    for rel in (STRUCTURE_CHECKER, STRUCTURE_SCANNER, CONFIG_MODULE):
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text((sh.REPO_ROOT / rel).read_text(encoding="utf-8"), encoding="utf-8")
+    # `paths` narrowed to the project's own tree, so the vendored hooks copied in
+    # above are not measured as the consumer's debt.
+    _seed(root, ".devkit.toml", '[paths]\napp = "src/"\n\n[structure]\npaths = ["src"]\n')
+    _seed(root, "src/main.py", source)
+    return root
+
+
+def test_structure_seeding_records_the_debt_the_project_already_has(tmp_path):
+    root = _structure_project(tmp_path)
+    assert sh.seed_structure_baseline(root) == 1
+    assert "suppressions::src/main.py = 1" in sh.read_structure_baseline(root)
+
+
+def test_structure_seeding_is_skipped_when_the_project_has_already_adopted(tmp_path):
+    root = _structure_project(tmp_path)
+    _seed(root, sh.STRUCTURE_BASELINE_FILE, "")
+    assert sh.seed_structure_baseline(root) is None
+    assert sh.read_structure_baseline(root) == []
+
+
+def test_structure_seeding_is_skipped_when_the_checker_was_not_vendored(tmp_path):
+    _seed(tmp_path, ".devkit.toml", "")
+    assert sh.seed_structure_baseline(tmp_path) is None
+    assert not (tmp_path / sh.STRUCTURE_BASELINE_FILE).exists()
+
+
+def test_a_checker_that_fails_leaves_no_structure_baseline(tmp_path):
+    root = _structure_project(tmp_path)
+    _seed(root, STRUCTURE_CHECKER, "raise SystemExit(3)\n")
+    assert sh.seed_structure_baseline(root) is None
+
+
+def test_the_structure_baseline_reader_drops_comments_and_blank_lines(tmp_path):
+    _seed(tmp_path, sh.STRUCTURE_BASELINE_FILE, "# header\n\nfile_lines::src/a.py = 900\n")
+    assert sh.read_structure_baseline(tmp_path) == ["file_lines::src/a.py = 900"]
+
+
+def test_the_structure_baseline_is_not_vendored():
+    assert sh.STRUCTURE_BASELINE_FILE not in sh.MANIFEST
+    assert STRUCTURE_CHECKER in sh.MANIFEST
+    assert STRUCTURE_SCANNER in sh.MANIFEST
+
+
 def test_pull_adopts_the_ratchet_and_says_so(tmp_path, monkeypatch, capsys):
     """End to end, because the ordering is the part that can go wrong: seeding runs the
     scanner the same pull just copied in, so it has to happen after the copy."""
@@ -1429,3 +1492,92 @@ def test_a_second_pull_does_not_say_it_again(tmp_path, monkeypatch, capsys):
     capsys.readouterr()
     assert sh.main(["--pull", "--src", str(src), "--allow-untagged"]) == 0
     assert "untested-symbol ratchet" not in capsys.readouterr().out
+
+
+# --- the settings pass, from the two modes that drive it ----------------------
+# `project_settings.py` owns the edits and is tested there; these two hold the wiring
+# between the modes and that tier, which is the half that was missing for a release --
+# the shim shipped in the MANIFEST and no command anywhere ran it.
+
+
+def test_the_two_modules_name_the_same_settings_file():
+    """The one constant that is spelled twice, and why. `sync-devkit.py` must import the
+    settings tier lazily -- a project's first pull runs it before that file exists -- so
+    it cannot read the path from there at module scope. Two copies with no gate is how a
+    rename lands in one of them; this is the gate."""
+    assert sh.SETTINGS_FILE == ps.SETTINGS_FILE
+
+
+def test_the_bootstrap_pull_runs_without_the_settings_tier(tmp_path, monkeypatch, capsys):
+    """A generated project runs the copy of `sync-devkit.py` the generator placed there,
+    at a moment when nothing else in the MANIFEST exists. An import at module scope made
+    that pull a traceback -- the one pull that cannot be retried differently."""
+    src, dst = tmp_path / "shared", tmp_path / "proj"
+    _seed(src, "scripts/x.py", "v1")
+    monkeypatch.setattr(sh, "REPO_ROOT", dst)
+    monkeypatch.setattr(sh, "MANIFEST", ("scripts/x.py",))
+    monkeypatch.setattr(sh, "git_head", lambda p: "abc1234")
+    monkeypatch.setitem(sys.modules, "project_settings", None)
+    assert sh.main(["--pull", "--src", str(src), "--allow-untagged"]) == 0
+    assert sh.settings_pass(dst) == []
+    assert sh.retired_hook_paths() == ()
+    assert sh.local_faults(dst) == ([], "")
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def _unguarded_project(root: Path) -> Path:
+    _seed(root, ps.GUARD_HOOK, "# the shim\n")
+    _seed(root, sh.SETTINGS_FILE, "{}")
+    return root
+
+
+def test_pull_wires_the_guard_and_says_so(tmp_path, monkeypatch, capsys):
+    """End to end, because the ordering is the part that can go wrong: the wiring names
+    a file the same pull delivers, so it has to run after the copy."""
+    src, dst = tmp_path / "shared", tmp_path / "proj"
+    _seed(src, "scripts/x.py", "v1")
+    _unguarded_project(dst)
+    monkeypatch.setattr(sh, "REPO_ROOT", dst)
+    monkeypatch.setattr(sh, "MANIFEST", ("scripts/x.py",))
+    monkeypatch.setattr(sh, "git_head", lambda p: "abc1234")
+    assert sh.main(["--pull", "--src", str(src), "--allow-untagged"]) == 0
+    assert "cross-checkout edit guard" in capsys.readouterr().out
+    assert ps.guard_unwired(dst) is False
+
+
+def test_check_fails_on_an_unwired_guard_without_calling_it_drift(tmp_path, monkeypatch, capsys):
+    """`--pull` fixes it, but nothing upstream differs -- and "the harness drifted"
+    sends the reader to compare files that are identical."""
+    src, dst = tmp_path / "shared", tmp_path / "proj"
+    _seed(src, "scripts/x.py", "v1")
+    _seed(dst, "scripts/x.py", "v1")
+    _unguarded_project(dst)
+    monkeypatch.setattr(sh, "REPO_ROOT", dst)
+    monkeypatch.setattr(sh, "MANIFEST", ("scripts/x.py",))
+    assert sh.main(["--src", str(src)]) == 1
+    err = capsys.readouterr().err
+    assert "UNWIRED" in err
+    assert "no hook runs the cross-checkout edit guard" in err
+    assert "drifted from the shared repo" not in err
+
+
+def test_check_passes_once_the_guard_is_wired(tmp_path, monkeypatch):
+    src, dst = tmp_path / "shared", tmp_path / "proj"
+    _seed(src, "scripts/x.py", "v1")
+    _seed(dst, "scripts/x.py", "v1")
+    sh.settings_pass(_unguarded_project(dst))
+    monkeypatch.setattr(sh, "REPO_ROOT", dst)
+    monkeypatch.setattr(sh, "MANIFEST", ("scripts/x.py",))
+    assert sh.main(["--src", str(src)]) == 0
+
+
+def test_the_retired_list_reaches_the_settings_pass_from_this_module(tmp_path, monkeypatch):
+    """`RETIRED_PATHS` is read at call time so a caller can replace it on this module;
+    the pass must not have captured its own copy at import."""
+    root = _unguarded_project(tmp_path)
+    command = 'python3 "x/scripts/hooks/made-up.py"'
+    _seed(
+        root, sh.SETTINGS_FILE, json.dumps({"hooks": {"Stop": [{"hooks": [{"command": command}]}]}})
+    )
+    monkeypatch.setattr(sh, "RETIRED_PATHS", ("scripts/hooks/made-up.py",))
+    assert any("made-up.py" in note for note in sh.settings_pass(root))

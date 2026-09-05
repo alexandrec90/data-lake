@@ -1,0 +1,112 @@
+# Structural findings the code already had when it adopted the gate.
+#
+# Debt, not configuration. This file SHRINKS on its own: a new key fails the gate, a
+# value that grew fails the gate, and a line the code no longer earns fails it too,
+# so fixing a finding forces its line out (`structure_check.py --tighten` does that).
+# Never add or raise a line to make new code pass; fix the code. `dependency::` is one
+# exception -- adding a package is a line here, so the PR diff shows it.
+#
+# `--record --reason "..."` is the other, and it is the deliberate hole. A module far
+# past `file_lines` cannot gain a line, so a bug whose fix belongs in one has nowhere
+# to go, and the split the finding asks for is a separate body of work. Recording says
+# so out loud: the reason is mandatory, counter rules (`suppressions`, `todos`,
+# `skipped_tests`, ...) are refused because those are always somebody giving up rather
+# than a module's size, and every move is logged below with what it moved and why.
+#
+# Regenerate only when adopting the gate: python scripts/hooks/structure_check.py --seed
+complexity::scripts/hooks/enforce-capped-bash.py::split_top_level = 29
+complexity::scripts/hooks/lint-fix.py::extract_paths = 16
+complexity::scripts/hooks/structure_check.py::_pyproject_dependencies = 26
+complexity::scripts/hooks/structure_check.py::resolve_python = 18
+complexity::scripts/hooks/structure_scan.py::mask_literals = 18
+complexity::scripts/hooks/structure_scan.py::scan_js = 19
+complexity::scripts/sync-devkit.py::main = 69
+complexity::src/data_lake/archive/bars.py::restore_price_bars = 18
+complexity::src/data_lake/ingestion/news/newsapi.py::fetch = 16
+complexity::src/data_lake/ingestion/social/google_trends.py::fetch = 16
+definitions::scripts/hooks/harness_config.py = 32
+definitions::scripts/hooks/stop.py = 51
+definitions::scripts/hooks/structure_check.py = 42
+definitions::scripts/hooks/structure_scan.py = 31
+definitions::scripts/report-workflow-failure.py = 27
+definitions::scripts/sync-devkit.py = 44
+dependency::pyproject.toml::boto3 = 1
+dependency::pyproject.toml::duckdb = 1
+dependency::pyproject.toml::httpx = 1
+dependency::pyproject.toml::mypy = 1
+dependency::pyproject.toml::pandas = 1
+dependency::pyproject.toml::praw = 1
+dependency::pyproject.toml::pre-commit = 1
+dependency::pyproject.toml::pyarrow = 1
+dependency::pyproject.toml::pytest = 1
+dependency::pyproject.toml::pytest-cov = 1
+dependency::pyproject.toml::pytrends = 1
+dependency::pyproject.toml::ruff = 1
+dependency::pyproject.toml::sqlalchemy = 1
+dependency::pyproject.toml::yfinance = 1
+file_lines::scripts/hooks/enforce-capped-bash.py = 629
+file_lines::scripts/hooks/harness_config.py = 655
+file_lines::scripts/hooks/stop.py = 1110
+file_lines::scripts/hooks/structure_check.py = 1042
+file_lines::scripts/hooks/structure_scan.py = 669
+file_lines::scripts/report-workflow-failure.py = 614
+file_lines::scripts/sync-devkit.py = 1417
+function_lines::scripts/hooks/enforce-capped-bash.py::split_top_level = 96
+function_lines::scripts/sync-devkit.py::main = 246
+function_lines::src/data_lake/archive/bars.py::restore_price_bars = 88
+function_lines::src/data_lake/ingestion/market/fmp.py::fetch = 93
+function_lines::src/data_lake/ingestion/market/yahoo.py::fetch = 88
+function_lines::src/data_lake/ingestion/market/yahoo_fx.py::fetch = 82
+function_lines::src/data_lake/ingestion/news/newsapi.py::fetch = 82
+function_params::scripts/report-workflow-failure.py::apply = 7
+function_params::src/data_lake/ingestion/news/finnhub_backfill.py::backfill_symbols = 9
+function_params::src/data_lake/ingestion/news/finnhub_backfill.py::run_backfill = 7
+nesting_depth::scripts/hooks/harness_events.py::_main_checkout = 5
+nesting_depth::scripts/hooks/structure_check.py::strongly_connected = 5
+nesting_depth::scripts/hooks/structure_scan.py::_complexity = 5
+nesting_depth::scripts/hooks/structure_scan.py::_word_before = 5
+nesting_depth::scripts/hooks/structure_scan.py::mask_literals = 9
+nesting_depth::scripts/hooks/structure_scan.py::scan_python = 6
+nesting_depth::src/data_lake/archive/raw.py::restore_raw_payloads = 5
+orphan::src/data_lake/archive/lens.py = 1
+orphan::src/data_lake/db/adoption.py = 1
+orphan::src/data_lake/ingestion/market/alpha_vantage.py = 1
+orphan::src/data_lake/ingestion/market/finnhub_market.py = 1
+orphan::src/data_lake/ingestion/market/ibkr_historical.py = 1
+orphan::src/data_lake/ingestion/market/yahoo_fundamentals.py = 1
+orphan::src/data_lake/ingestion/market/yahoo_fx.py = 1
+orphan::src/data_lake/ingestion/news/finnhub_backfill.py = 1
+orphan::src/data_lake/ingestion/news/newsapi.py = 1
+orphan::src/data_lake/ingestion/social/google_trends.py = 1
+orphan::src/data_lake/ingestion/social/reddit.py = 1
+orphan::src/data_lake/testing.py = 1
+skipped_tests::scripts/hooks/tests/test_codex_translation.py = 2
+skipped_tests::scripts/hooks/tests/test_hook_execution_contract.py = 3
+skipped_tests::scripts/hooks/tests/test_lint_fix.py = 1
+skipped_tests::scripts/hooks/tests/test_repo_contract.py = 7
+skipped_tests::scripts/hooks/tests/test_session_start.py = 2
+skipped_tests::scripts/hooks/tests/test_stop.py = 2
+skipped_tests::scripts/hooks/tests/test_structure_check.py = 1
+skipped_tests::scripts/hooks/tests/test_structure_scan.py = 3
+skipped_tests::scripts/hooks/tests/test_sync_codex_hooks.py = 2
+skipped_tests::scripts/hooks/tests/test_untested_symbols.py = 1
+suppressions::scripts/hooks/enforce-capped-bash.py = 2
+suppressions::scripts/hooks/harness_config.py = 1
+suppressions::scripts/hooks/harness_events.py = 1
+suppressions::scripts/hooks/invoke-capped.py = 1
+suppressions::scripts/hooks/lint-fix.py = 2
+suppressions::scripts/hooks/tests/test_sync_codex_hooks.py = 1
+suppressions::scripts/log-wrap.py = 2
+suppressions::scripts/notify-wrap.py = 1
+suppressions::scripts/notify.py = 1
+suppressions::scripts/task_branch.py = 1
+suppressions::src/data_lake/archive/lens.py = 1
+suppressions::src/data_lake/archive/parquet_io.py = 2
+suppressions::src/data_lake/archive/store.py = 1
+swallowed_errors::scripts/hooks/harness_events.py = 2
+swallowed_errors::scripts/notify.py = 1
+swallowed_errors::src/data_lake/ingestion/market/alpha_vantage.py = 1
+swallowed_errors::src/data_lake/ingestion/market/yahoo_common.py = 1
+swallowed_errors::src/data_lake/ingestion/news/finnhub_backfill.py = 1
+todos::src/data_lake/ingestion/market/finnhub_market.py = 1
+todos::src/data_lake/ingestion/market/ibkr_historical.py = 1
