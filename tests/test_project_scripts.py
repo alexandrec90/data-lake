@@ -173,3 +173,91 @@ def test_a_failing_check_names_itself_in_the_artifact(monkeypatch, tmp_path):
     log = artifact.read_text(encoding="utf-8")
     assert "=== mypy ===" in log and "boom" in log
     assert "=== ruff ===" not in log
+
+
+# --- notify-wrap ------------------------------------------------------------
+
+
+class _Completed:
+    """Stands in for `subprocess.CompletedProcess`; only the exit code is read."""
+
+    def __init__(self, returncode: int) -> None:
+        self.returncode = returncode
+
+
+@pytest.fixture
+def notify_wrap(monkeypatch):
+    """The wrapper with its toast captured, so a test never reaches win11toast."""
+    script = load_script("notify-wrap.py")
+    toasts: list[tuple[str, str]] = []
+    monkeypatch.setattr(script, "notify", lambda title, message: toasts.append((title, message)))
+    script.toasts = toasts
+    return script
+
+
+def run_wrapped(script, monkeypatch, argv, runner):
+    monkeypatch.setattr(sys, "argv", ["notify-wrap.py", *argv])
+    monkeypatch.setattr(script.subprocess, "run", runner)
+    return script.main()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["Task: Name", "python", "x.py"],  # no `--`, so the command is unidentifiable
+        ["--", "python", "x.py"],  # no title
+        ["Task: Name", "--"],  # no command
+    ],
+    ids=["no-separator", "no-title", "no-command"],
+)
+def test_a_malformed_invocation_exits_2_without_running_anything(notify_wrap, monkeypatch, argv):
+    """`2` rather than `1`: a tasks.json typo is a usage error, not a task failure, and
+    running a half-parsed argv would launch something nobody asked for."""
+
+    def never(*args, **kwargs):
+        raise AssertionError("a malformed invocation must not spawn a process")
+
+    assert run_wrapped(notify_wrap, monkeypatch, argv, never) == 2
+    assert notify_wrap.toasts == []
+
+
+def test_the_wrapped_exit_code_is_passed_through(notify_wrap, monkeypatch):
+    """VS Code decides the task's green check / red X from this. Returning 0 on a failing
+    suite would paint every broken run as passing."""
+    seen: list[list[str]] = []
+
+    def runner(cmd, **kwargs):
+        seen.append(cmd)
+        return _Completed(3)
+
+    assert run_wrapped(notify_wrap, monkeypatch, ["Test: Suite", "--", "pytest", "-q"], runner) == 3
+    assert seen == [["pytest", "-q"]]
+
+
+def test_a_multi_word_title_survives_the_separator(notify_wrap, monkeypatch):
+    """tasks.json passes the label unquoted, so the title arrives as several argv items;
+    joining only the first would toast "Test:" for every task."""
+    argv = ["Test:", "Run", "pytest", "--", "pytest"]
+    assert run_wrapped(notify_wrap, monkeypatch, argv, lambda cmd, **kw: _Completed(0)) == 0
+    assert notify_wrap.toasts == [("Test: Run pytest", "Passed in 0s")]
+
+
+def test_a_failure_toasts_as_a_failure(notify_wrap, monkeypatch):
+    run_wrapped(notify_wrap, monkeypatch, ["Lint", "--", "ruff"], lambda cmd, **kw: _Completed(1))
+    title, message = notify_wrap.toasts[0]
+    assert (title, message.split(" (")[0]) == ("Lint", "Failed")
+
+
+def test_a_batch_launcher_falls_back_to_the_shell(notify_wrap, monkeypatch):
+    """Windows cannot CreateProcess a `.cmd` shim (npm, npx, vite) directly. Without the
+    retry the wrapper dies with FileNotFoundError and the task never runs at all."""
+    attempts: list[bool] = []
+
+    def runner(cmd, **kwargs):
+        attempts.append(kwargs.get("shell", False))
+        if len(attempts) == 1:
+            raise FileNotFoundError(cmd[0])
+        return _Completed(0)
+
+    assert run_wrapped(notify_wrap, monkeypatch, ["Build", "--", "npm", "run"], runner) == 0
+    assert attempts == [False, True]

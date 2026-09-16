@@ -39,6 +39,11 @@ logs/
 ibc/
 tws_settings/
 
+# Agent worktrees. `claude --worktree` and `remote-control --spawn worktree` cut a
+# nested checkout here; git does not ignore a linked worktree on its parent's behalf,
+# so without this the parent reads as dirty for as long as the worktree lives.
+.claude/worktrees/
+
 # OS / editor
 .DS_Store
 Thumbs.db
