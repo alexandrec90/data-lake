@@ -589,6 +589,18 @@ POLICY_CLAUSES = (
     "silently work around a bad instruction",
 )
 
+# The feedback loop's load-bearing half, asserted positively rather than as an
+# anti-restatement: these are the clauses that make filing mandatory instead of merely
+# available, and each one replaced a softer sentence that an agent could satisfy without
+# writing anything down. Matched against whitespace-collapsed prose, because these
+# clauses span a line break at today's wrap and re-wrapping the paragraph is an edit
+# nobody should have to notice breaks a test.
+FEEDBACK_LOOP_CLAUSES = (
+    "Saying it in your reply does not file it",
+    "in the turn you noticed it",
+    "The harness itself is in scope",
+)
+
 
 def _instruction_files() -> list[Path]:
     """Every CLAUDE.md in the repo, skipping generated and vendor trees."""
@@ -745,6 +757,37 @@ def test_skill_references_are_one_level_deep_and_exist():
             )
 
 
+def test_rule_references_exist():
+    """A rule's Markdown link target is a claim too, and nothing checked it.
+
+    `test_skill_references_are_one_level_deep_and_exist` covers `SKILL.md`, and
+    `tests/test_doc_claims.py` covers cited paths -- but only the *backticked* ones,
+    which in a link like ``[`.claude/engineering-evidence.md`](../engineering-evidence.md)``
+    is the link **text**. The target is never read, so a typo or a rename in it dangles
+    in silence. `authoring.md` telling authors to "link references with normal Markdown
+    links so the contract can resolve them" reads as though this was already checked.
+    It matters more now than it did: a rule pointer is the prescribed remedy for the
+    500-line contract, so the pattern is spreading rather than holding still.
+
+    **Existence only**, deliberately, and neither half of the skill assertion may be
+    reused here:
+
+    * Not the sibling assertion. Every `.md` under `.claude/rules/` loads *as a rule*,
+      so a rule's reference has to live outside that directory -- the one place the
+      skill check requires it to be.
+    * Not the one-level-deep assertion. `engineering-evidence.md` links onward to
+      `scripts/*.md`, which is existing, intended content.
+    """
+    missing: list[str] = []
+    for rule in _rule_files():
+        for reference in _local_markdown_references(rule):
+            if not reference.is_file():
+                missing.append(f"{rule.relative_to(REPO_ROOT).as_posix()} -> {reference}")
+    assert not missing, "rules link to Markdown files that do not exist:\n  " + "\n  ".join(
+        sorted(missing)
+    )
+
+
 def test_long_skill_references_have_a_linked_table_of_contents():
     for skill in _skill_files():
         for reference in _local_markdown_references(skill):
@@ -816,6 +859,37 @@ def test_vendored_policy_is_present():
     """
     assert (REPO_ROOT / VENDORED_POLICY).is_file(), (
         f"{VENDORED_POLICY} is missing -- run `python scripts/sync-devkit.py --pull`"
+    )
+
+
+@consumes_harness
+def test_feedback_loop_requires_the_ledger_and_not_just_the_reply():
+    """A harness defect has to be *filed*, and the policy has to say so bindingly.
+
+    The failure this pins is not an agent ignoring the rule -- it is the rule being
+    agreeable. The clause used to read "give the flag a durable copy too", which an
+    agent can satisfy by mentioning the defect in its reply and moving on; the operator
+    then carries the report in their head until they forget it, which is the one outcome
+    the central ledger exists to prevent. So the mandate, the mechanism and the consumer
+    are asserted together: soften any one of the three and this goes red.
+    """
+    raw = (REPO_ROOT / VENDORED_POLICY).read_text(encoding="utf-8")
+    policy_text = " ".join(raw.split())
+    for clause in FEEDBACK_LOOP_CLAUSES:
+        assert clause in policy_text, (
+            f"{VENDORED_POLICY} no longer says {clause!r} -- the feedback loop is only "
+            "worth its lines while filing to the ledger is mandatory rather than "
+            "encouraged. Restore the clause or change this test deliberately."
+        )
+
+    reporter = "scripts/hooks/report-harness-defect.py"
+    assert (REPO_ROOT / reporter).is_file(), (
+        f"{VENDORED_POLICY} tells every agent to run {reporter}, which is not here"
+    )
+    sync = load_module("scripts/sync-devkit.py")
+    assert reporter in sync.MANIFEST, (
+        f"{reporter} is out of the MANIFEST, so the policy that every project vendors "
+        "names a script those projects do not get -- the report dies in the transcript."
     )
 
 
