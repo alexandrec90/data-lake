@@ -30,6 +30,10 @@ updates:
       interval: weekly
     assignees:
       - alexandrec90
+    # Bump uv.lock, never the pyproject floors. Unset, Dependabot raised this library's
+    # `pandas>=2.2` to `pandas>=3.0.6` in PR #40, and ibkr_trader, which needs pandas<3,
+    # could no longer resolve against it.
+    versioning-strategy: increase-if-necessary
     groups:
       minor-and-patch:
         update-types:
