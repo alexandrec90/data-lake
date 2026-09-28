@@ -35,7 +35,7 @@ research = [
 dev = [
     "pytest>=8",
     "pytest-cov>=6",
-    "ruff>=0.16.8",
+    "ruff>=0.16.9",
     "mypy>=2.3.1",
     "pre-commit>=4.6.2",
 ]
