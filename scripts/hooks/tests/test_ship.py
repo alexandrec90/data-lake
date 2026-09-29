@@ -1,5 +1,7 @@
 """Unit tests for the deterministic mechanics behind /ship."""
 
+import pytest
+
 from conftest import load_module
 
 ship = load_module("scripts/ship.py")
@@ -65,6 +67,37 @@ def test_push_does_not_retry_rejection(monkeypatch):
     )
     assert not ship._push("claude/x", sleep=lambda _: None)
     assert len(calls) == 1
+
+
+def test_a_failed_pre_push_gate_is_not_reported_as_a_network_failure(monkeypatch, capsys):
+    """The ledger report: a test the pre-push gate failed read as "push failed after
+    retries", and the session went to diagnose the network. Nothing was retried."""
+    gate = "FAILED tests/test_x.py::test_y\nerror: failed to push some refs to 'origin'\n"
+    monkeypatch.setattr(ship, "_git", lambda *args: _Result(1, stderr=gate))
+    assert not ship._push("claude/x", sleep=lambda _: None)
+    err = capsys.readouterr().err
+    assert "FAILED tests/test_x.py::test_y" in err
+    assert "pre-push gate failed" in err
+    assert "retries" not in err and "network error)" in err
+
+
+def test_push_failure_names_each_cause():
+    assert "network error after 4 retries" in ship.push_failure("fatal: connection timed out")
+    assert "rejected by the remote" in ship.push_failure(" ! [rejected] x -> x (fetch first)")
+    assert "pre-push gate" in ship.push_failure("error: failed to push some refs to 'o'")
+    assert "not a network error" in ship.push_failure("fatal: something else")
+
+
+def test_the_hook_output_on_stdout_is_printed_too(monkeypatch, capsys):
+    monkeypatch.setattr(
+        ship,
+        "_git",
+        lambda *args: _Result(
+            1, stdout="push-gate: tests failed", stderr="failed to push some refs"
+        ),
+    )
+    ship._push("claude/x", sleep=lambda _: None)
+    assert "push-gate: tests failed" in capsys.readouterr().err
 
 
 def _wire_main(monkeypatch, *, branch="claude/x", clean=True, lint=True, push=True):
@@ -342,6 +375,19 @@ def test_fix_is_a_mode_of_main_taking_optional_paths(monkeypatch):
     assert ship.main(["--fix"]) == ship.EXIT_OK
     assert ship.main(["--fix", "a.py", "b.py"]) == ship.EXIT_OK
     assert seen == [[], ["a.py", "b.py"]]
+
+
+@pytest.mark.parametrize("branch", ["flag-wired-agent-hooks", "main"])
+def test_fix_runs_on_any_branch_because_it_opens_no_pr(monkeypatch, branch):
+    """The branch rule is about where a new PR opens, and `--fix` opens nothing. devkit
+    #390's head is `flag-wired-agent-hooks`: the pass accepts it because the PR is
+    already open, then its resolver's merge was refused at `--fix` on the name alone."""
+    _wire_main(monkeypatch, branch=branch)
+    seen: list[list[str]] = []
+    monkeypatch.setattr(ship, "_fix", lambda paths: seen.append(paths) or ship.EXIT_OK)
+    assert ship.main(["--fix"]) == ship.EXIT_OK
+    assert seen == [[]]
+    assert ship.main([]) == ship.EXIT_NOT_SHIPPABLE
 
 
 def test_fix_refuses_with_a_remedy_when_no_pre_commit_exists(monkeypatch, capsys):

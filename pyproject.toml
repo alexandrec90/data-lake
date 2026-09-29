@@ -33,7 +33,7 @@ research = [
 
 [dependency-groups]
 dev = [
-    "pytest>=8",
+    "pytest>=9.1",
     "pytest-cov>=6",
     "ruff>=0.16.9",
     "mypy>=2.3.1",
@@ -100,6 +100,8 @@ mypy_path = "src"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
+addopts = "-p devkit_temproot"
+pythonpath = ["scripts/pytest-plugins"]
 testpaths = ["tests"]
 
 # Same ratchet rule as the consumer repo: raise it as coverage grows, never lower it to make a
