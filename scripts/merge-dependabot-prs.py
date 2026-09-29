@@ -24,7 +24,8 @@ a REST endpoint, so the retry survives the exact failure that created the work f
 
 **The guards are re-derived, never inherited.** A schedule carries no PR, so each
 candidate is re-checked from scratch: carrying the `automerge` label, and with a
-*successful `PR Gate` run on its current head SHA*. That last one is what keeps this
+*successful `PR Gate` run on its current head SHA* (`gate_passed` says which runs
+count). That last one is what keeps this
 honest -- it is the same condition the event job waits for, so the sweep can only ever
 complete a merge that was already earned, and a push to the branch moves the head past
 the gated SHA and disqualifies it. There is deliberately no author guard: only write
@@ -41,6 +42,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 # The label `dependabot-automerge.yml`'s classify job applies to routine Dependabot
 # bumps, and anything with write access may apply by hand. Only a PR carrying it is a
@@ -61,6 +63,13 @@ PASSING_CONCLUSIONS = ("success", "skipped", "neutral")
 # first page and picks the rest up on the next pass -- the sweep is idempotent, so a
 # partial pass costs a delay and never a wrong decision.
 PR_SCAN_LIMIT = 100
+
+# GitHub computes `mergeable` lazily, on request, and forgets it whenever the base moves.
+# A gate that finishes just after another PR merged reads null, and so does the hourly
+# retry when merges keep coming -- devkit #405 was stranded twice that way while fixer
+# PRs landed minutes apart. A few reads seconds apart get the answer.
+MERGEABLE_READS = 5
+MERGEABLE_WAIT = 3.0
 
 
 class GhError(RuntimeError):
@@ -84,24 +93,28 @@ def labels_of(pr: dict) -> list[str]:
     return [label.get("name", "") for label in pr.get("labels") or []]
 
 
-def gate_passed(repo: str, sha: str, run) -> bool:
-    """True when `PR Gate` has a successful `pull_request` run on exactly this SHA.
+def gate_passed(repo: str, sha: str, run, branch: str = "") -> bool:
+    """True when `PR Gate` has a successful run on exactly this SHA, for this PR.
 
-    Scoped to the SHA rather than the branch, and to `pull_request` rather than any event,
-    because both are load-bearing. A branch-scoped answer would let an older commit's green
-    gate merge code it never ran against, and a hand-dispatched `workflow_dispatch` run of
-    the gate is not the same evidence -- it is somebody re-running a workflow, possibly on
-    a different ref, and the event job has never accepted it either.
+    Scoped to the SHA rather than the branch: a branch-scoped answer would let an older
+    commit's green gate merge code it never ran against. A `pull_request` run is the
+    PR's by construction. A `workflow_dispatch` run counts too, when it ran on the PR's
+    own head `branch`: a push made with `GITHUB_TOKEN` -- a lock repair, a generated-file
+    sync -- raises no usable `pull_request` event, so the workflow that pushed dispatches
+    the gate itself, and that run is the only verdict the commit will ever get.
+    carameli #393 sat open with every check green at its head because this accepted
+    `pull_request` alone.
     """
     if not sha:
         return False
     payload = gh_json(f"repos/{repo}/actions/runs?head_sha={sha}&per_page=100", run) or {}
     for entry in payload.get("workflow_runs") or []:
-        if (
-            entry.get("name") == GATE_WORKFLOW
-            and entry.get("event") == "pull_request"
-            and entry.get("conclusion") == "success"
-        ):
+        if entry.get("name") != GATE_WORKFLOW or entry.get("conclusion") != "success":
+            continue
+        event = entry.get("event")
+        if event == "pull_request":
+            return True
+        if event == "workflow_dispatch" and branch and entry.get("head_branch") == branch:
             return True
     return False
 
@@ -174,12 +187,23 @@ def verdict(repo: str, pr: dict, run, env_sha: str = "") -> tuple[bool, str]:
     gated = (env_sha or "").strip()
     if gated and sha != gated:
         return False, f"head moved to {sha[:7]}, past the gated {gated[:7]}"
-    if not gate_passed(repo, sha, run):
+    if not gate_passed(repo, sha, run, (pr.get("head") or {}).get("ref") or ""):
         return False, f"no successful {GATE_WORKFLOW} run on {sha[:7]}"
     blocking = blocking_checks(repo, sha, run)
     if blocking:
         return False, f"checks not all green: {', '.join(blocking)}"
     return True, f"{GATE_WORKFLOW} passed on {sha[:7]} and it is labelled {AUTOMERGE_LABEL}"
+
+
+def settled(repo: str, number: int, run, sleep, detail: dict) -> dict:
+    """The PR re-read until GitHub has decided `mergeable`, up to `MERGEABLE_READS` reads;
+    still undecided after that, `verdict` defers it to the next pass."""
+    for _ in range(MERGEABLE_READS - 1):
+        if detail.get("mergeable") is not None:
+            break
+        sleep(MERGEABLE_WAIT)
+        detail = gh_json(f"repos/{repo}/pulls/{number}", run) or detail
+    return detail
 
 
 def open_prs(repo: str, run) -> list[dict]:
@@ -211,7 +235,7 @@ def candidates(env: dict[str, str], repo: str, run) -> tuple[list[dict], str]:
     return open_prs(repo, run), "sweep"
 
 
-def main(env: dict[str, str] | None = None, run=None) -> int:
+def main(env: dict[str, str] | None = None, run=None, sleep=time.sleep) -> int:
     env = dict(os.environ) if env is None else env
     run = subprocess.run if run is None else run
 
@@ -238,7 +262,9 @@ def main(env: dict[str, str] | None = None, run=None) -> int:
         # The listing endpoint omits `mergeable`, so re-read each PR on its own. It is
         # also the freshest possible view, which matters on a pass that may have spent a
         # while on the PRs before this one.
-        detail = gh_json(f"repos/{repo}/pulls/{number}", run) or pr
+        detail = settled(
+            repo, int(number), run, sleep, gh_json(f"repos/{repo}/pulls/{number}", run) or pr
+        )
         should_merge, why = verdict(repo, detail, run, gated_sha)
         if not should_merge:
             print(f"#{number}: leaving open -- {why}.")
