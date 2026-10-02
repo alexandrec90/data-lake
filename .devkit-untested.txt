@@ -20,7 +20,6 @@ scripts/hooks/enforce-capped-bash.py::split_top_level
 scripts/hooks/enforce-capped-bash.py::statements
 scripts/hooks/enforce-capped-bash.py::strip_prefixes
 scripts/hooks/enforce-capped-bash.py::strip_quoted
-scripts/hooks/session-sync.py::main
 scripts/hooks/session-sync.py::run_git
 scripts/lint-all.py::changed_python_files
 scripts/lint-all.py::run_check

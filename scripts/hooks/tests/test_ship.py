@@ -1,10 +1,22 @@
 """Unit tests for the deterministic mechanics behind /ship."""
 
+import sys
+import types
+
 import pytest
 
 from conftest import load_module
 
 ship = load_module("scripts/ship.py")
+# Before the autouse stub below replaces it in every test.
+real_reconcile_baseline = ship.reconcile_baseline
+
+
+@pytest.fixture(autouse=True)
+def _no_baseline_scan(monkeypatch):
+    """`_fix` reconciles the real baseline, which scans and may REWRITE this checkout's
+    `.devkit-untested.txt`; every test here gets a reconcile that found nothing."""
+    monkeypatch.setattr(ship, "reconcile_baseline", lambda: ((0, 0), ".devkit-untested.txt"))
 
 
 class _Result:
@@ -313,6 +325,34 @@ def test_pre_commit_is_looked_for_where_the_dispatcher_looks(tmp_path):
     ]
 
 
+def test_a_venv_with_its_interpreter_runs_pre_commit_as_a_module(tmp_path):
+    """uv writes the interpreter's absolute path into each console script, so a launcher
+    written from a tree since deleted dies with `uv trampoline failed to canonicalize
+    script path` -- the fix pass's ship step was refused on exactly that in devkit, whose
+    `claude --worktree` trees share the checkout's `.venv`. The venv's own interpreter
+    reads `pyvenv.cfg` and survives it, and it is still the dispatcher's choice."""
+    nothing = {"which": lambda name: None, "find_spec": lambda name: None}
+    for launcher, python in (
+        ("Scripts/pre-commit.exe", "Scripts/python.exe"),
+        ("bin/pre-commit", "bin/python"),
+    ):
+        tree = tmp_path / python.replace("/", "-")
+        for name in (launcher, python):
+            (tree / ".venv" / name).parent.mkdir(parents=True, exist_ok=True)
+            (tree / ".venv" / name).write_text("", encoding="utf-8")
+        assert ship.pre_commit_command(tree, None, **nothing) == [
+            str(tree / ".venv" / python),
+            "-m",
+            "pre_commit",
+        ]
+
+
+def test_a_launcher_with_no_interpreter_beside_it_is_run_as_it_is(tmp_path):
+    """No module form to fall back to: a launcher alone is what the venv offers."""
+    launcher = tmp_path / "Scripts" / "pre-commit.exe"
+    assert ship.venv_module_command(launcher) == [str(launcher)]
+
+
 def _fixers(*codes: int):
     """A fake runner answering the given exit codes in order, and the argv it saw."""
     results = [_Result(code) for code in codes]
@@ -396,3 +436,83 @@ def test_fix_refuses_with_a_remedy_when_no_pre_commit_exists(monkeypatch, capsys
     monkeypatch.setattr(ship, "pre_commit_command", lambda root, checkout: None)
     assert ship._fix([]) == ship.EXIT_FIXERS_FAILED
     assert "provision first" in capsys.readouterr().err
+
+
+def test_a_failed_fix_names_the_command_it_ran(monkeypatch, capsys):
+    """4099febd: a launcher dying on uv's one-line `failed to canonicalize script path`
+    left the pass's pre-commit.log naming neither the launcher nor its venv."""
+    launcher = ["C:/checkout/.venv/Scripts/python.exe", "-m", "pre_commit"]
+    monkeypatch.setattr(ship, "_porcelain", lambda: " M x.py\n")
+    monkeypatch.setattr(ship, "_git", lambda *args: _Result(0, stdout=""))
+    monkeypatch.setattr(ship, "pre_commit_command", lambda root, checkout: launcher)
+    monkeypatch.setattr(ship, "run_fixers", lambda paths, command: (7, "still fails"))
+    assert ship._fix([]) == 7
+    err = capsys.readouterr().err.splitlines()
+    assert err[-2] == f"ship: ran {' '.join(launcher)} run --files (1 path(s))"
+    # The verdict stays last: `ship_intent.refusal_line` falls back to the last line.
+    assert err[-1] == "ship: still fails"
+
+
+def test_a_quiet_fix_does_not_name_the_command(monkeypatch, capsys):
+    monkeypatch.setattr(ship, "_porcelain", lambda: " M x.py\n")
+    monkeypatch.setattr(ship, "_git", lambda *args: _Result(0, stdout=""))
+    monkeypatch.setattr(ship, "pre_commit_command", lambda root, checkout: ["pre-commit"])
+    monkeypatch.setattr(ship, "run_fixers", lambda paths, command: (0, "quiet"))
+    assert ship._fix([]) == ship.EXIT_OK
+    assert "ship: ran" not in capsys.readouterr().out
+
+
+def test_fix_drops_the_baseline_lines_the_change_covered(monkeypatch, capsys):
+    """ibkr_trader #74: a test that covered `make_connector` left its baseline line in,
+    and the vendored gate went red on a PR whose session had claimed a green suite.
+    The commit stage drops it like a formatter rewrite, and runs the fixers over it."""
+    monkeypatch.setattr(ship, "reconcile_baseline", lambda: ((1, 0), ".devkit-untested.txt"))
+    monkeypatch.setattr(ship, "_porcelain", lambda: " M tests/test_x.py\n")
+    monkeypatch.setattr(ship, "_git", lambda *args: _Result(0, stdout=""))
+    monkeypatch.setattr(ship, "pre_commit_command", lambda root, checkout: ["pre-commit"])
+    seen: list[list[str]] = []
+    monkeypatch.setattr(
+        ship, "run_fixers", lambda paths, command: seen.append(paths) or (0, "quiet")
+    )
+    assert ship._fix([]) == ship.EXIT_OK
+    assert seen == [["tests/test_x.py", ".devkit-untested.txt"]]
+    assert "dropped 1 line(s) this change covered" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("result", [None, (0, 0)])
+def test_nothing_to_drop_leaves_the_paths_alone(result):
+    """No baseline (`None`, an unadopted project) and a clean one are both no-ops."""
+    paths, line = ship.drop_covered_baseline(["a.py"], lambda: (result, ".devkit-untested.txt"))
+    assert (paths, line) == (["a.py"], "")
+
+
+def test_a_baseline_already_among_the_paths_is_not_listed_twice():
+    paths, _line = ship.drop_covered_baseline(
+        [".devkit-untested.txt"], lambda: ((2, 0), ".devkit-untested.txt")
+    )
+    assert paths == [".devkit-untested.txt"]
+
+
+def test_a_scan_that_cannot_read_the_tree_does_not_stop_the_fixers():
+    """The fixers are the commit stage's job; the ratchet is a courtesy on top of it."""
+
+    def broken():
+        raise SyntaxError("bad.py")
+
+    paths, line = ship.drop_covered_baseline(["a.py"], broken)
+    assert paths == ["a.py"] and "could not reconcile" in line
+
+
+def test_reconcile_baseline_records_nothing_new(monkeypatch):
+    """`before=None` is `reconcile`'s drop-only mode: a gap this change made is the
+    gate's to report, never the commit stage's to launder into the debt list."""
+    calls = []
+    fake = types.SimpleNamespace(
+        REPO_ROOT="root",
+        CFG="cfg",
+        BASELINE_NAME=".devkit-untested.txt",
+        reconcile=lambda root, cfg, before: calls.append((root, cfg, before)) or (3, 0),
+    )
+    monkeypatch.setitem(sys.modules, "untested_symbols", fake)
+    assert real_reconcile_baseline() == ((3, 0), ".devkit-untested.txt")
+    assert calls == [("root", "cfg", None)]
