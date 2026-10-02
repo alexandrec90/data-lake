@@ -35,6 +35,21 @@ EXIT_FIXERS_FAILED = 7
 PRE_COMMIT_TAILS = (Path("Scripts") / "pre-commit.exe", Path("bin") / "pre-commit")
 
 
+def venv_module_command(launcher: Path) -> list[str]:
+    """`<venv python> -m pre_commit` when the venv's interpreter sits beside `launcher`,
+    else the launcher itself.
+
+    uv writes the interpreter's absolute path into every console script, so one written
+    from a tree since deleted dies with `uv trampoline failed to canonicalize script
+    path` -- devkit's `claude --worktree` trees share the checkout's `.venv` through a
+    link, and the tree that last synced into it is gone the day it merges. The
+    interpreter reads `pyvenv.cfg` and survives that. The launcher still says pre-commit
+    is installed here. Mirrored in `git_policy.framework._pre_commit_command`.
+    """
+    python = launcher.with_name("python.exe" if launcher.suffix == ".exe" else "python")
+    return [str(python), "-m", "pre_commit"] if python.is_file() else [str(launcher)]
+
+
 # What `claude --worktree <name>` names the branch it cuts: the literal string
 # `worktree-` followed by the name, with any `/` replaced by `+`. It is hard-coded in the
 # CLI -- there is no setting for it -- so a session that isolates itself with the built-in
@@ -291,7 +306,7 @@ def pre_commit_command(
         for tail in PRE_COMMIT_TAILS:
             candidate = base / ".venv" / tail
             if candidate.is_file():
-                return [str(candidate)]
+                return venv_module_command(candidate)
     found = which("pre-commit")
     if found:
         return [found]
@@ -334,8 +349,42 @@ def run_fixers(paths: list[str], command: list[str], runner=subprocess.run) -> t
     )
 
 
+def reconcile_baseline() -> tuple[tuple[int, int] | None, str]:
+    """`untested_symbols.reconcile` with nothing to record, and the baseline's name.
+
+    Imported here, not at the top: the scan reads every source file, and only `--fix`
+    pays for it.
+    """
+    import untested_symbols
+
+    root, cfg = untested_symbols.REPO_ROOT, untested_symbols.CFG
+    return untested_symbols.reconcile(root, cfg, None), untested_symbols.BASELINE_NAME
+
+
+def drop_covered_baseline(paths: list[str], reconcile=None) -> tuple[list[str], str]:
+    """Drop the untested-symbol baseline's lines this change covered: `(paths, line)`.
+
+    A test that covers a baselined symbol fails the vendored gate until its line goes,
+    and nothing a session runs locally says so -- ibkr_trader #74 claimed a green full
+    suite and went red on exactly that. Dropping a covered line only shrinks the debt,
+    the one direction the file may move without a decision, so the commit stage makes
+    it here like a formatter rewrite: the rewritten baseline joins `paths`, and the
+    line says what changed. `before=None` records nothing new, ever.
+    """
+    try:
+        result, name = (reconcile or reconcile_baseline)()
+    except (OSError, SyntaxError, ValueError) as exc:
+        return paths, f"could not reconcile the untested-symbol baseline: {exc}"
+    if not result or not result[0]:
+        return paths, ""
+    kept = paths if name in paths else [*paths, name]
+    return kept, f"dropped {result[0]} line(s) this change covered from {name}"
+
+
 def _fix(explicit: list[str]) -> int:
-    paths = explicit or changed_paths(_porcelain())
+    paths, dropped = drop_covered_baseline(explicit or changed_paths(_porcelain()))
+    if dropped:
+        print(f"ship: {dropped}")
     common = _git("rev-parse", "--path-format=absolute", "--git-common-dir")
     where = (common.stdout or "").strip()
     checkout = Path(where).parent if common.returncode == 0 and where else None
@@ -348,6 +397,13 @@ def _fix(explicit: list[str]) -> int:
         )
         return EXIT_FIXERS_FAILED
     code, verdict = run_fixers(paths, command)
+    if code:
+        # What ran, before the verdict: a launcher that dies on its own (uv's one-line
+        # `failed to canonicalize script path`) names neither itself nor its venv, and
+        # without this the pass's `pre-commit.log` held that line alone -- a dozen calls
+        # of binary scanning to find the stale `.venv` (4099febd). Kept off the last
+        # line, which `ship_intent.refusal_line` may take into a signature.
+        print(f"ship: ran {' '.join(command)} run --files ({len(paths)} path(s))", file=sys.stderr)
     print(f"ship: {verdict}", file=sys.stderr if code else sys.stdout)
     return code
 
