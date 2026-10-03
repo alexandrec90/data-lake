@@ -6,7 +6,8 @@ reuse the same data without duplicating connectors, schema, or storage architect
 Two halves, usable independently:
 
 - **`data_lake.ingestion`** — one connector per provider (news, social, market). Each fetches from
-  its API and **upserts into the consumer's Postgres**, keyed so re-running is idempotent.
+  its API and **upserts into the consumer's Postgres**, keyed so re-running is idempotent. Social
+  posts are the exception: they come from the archive (below).
 - **`data_lake.archive`** — offload cold rows to Parquet on any S3-compatible bucket (Cloudflare
   R2) with verify-before-delete, a self-describing catalog under `_catalog/`, and a read-only
   DuckDB lens.
@@ -66,6 +67,26 @@ catching a shareable table that grows an `account_id`.
 Two related guardrails, same file: nothing under `src/data_lake/` may import a consumer package
 (the dependency runs consumer → lake, never the reverse), and the archive may only publish
 datasets backed by a lake table.
+
+## Social posts (Reddit, X)
+
+There is no Reddit or X API connector — the PRAW one was retired because its API key could not
+be obtained. The sibling `social-scraper` project collects posts keylessly
+through a browser and exports them to the archive as the `social_scraper_posts` dataset
+(`social_scraper/posts/platform=<p>/dt=<date>/part.parquet` plus `_catalog/social_scraper_posts.json`).
+`SocialScraperConnector` (`data_lake.ingestion.social.social_scraper`) reads that dataset from the
+configured archive store and upserts it into `social_posts` on `(platform, external_id)`, with
+`sentiment` left NULL for the consumer to score:
+
+```python
+SocialScraperConnector().fetch()                     # every platform; returns rows upserted
+SocialScraperConnector().fetch(platforms=["reddit"])
+```
+
+It needs the `archive` extra and an archive backend. It reads only partitions social-scraper has
+rewritten since the newest `fetched_at` already loaded per platform, and it **raises** when the
+archive holds no `social_scraper_posts` manifest — that means the export has never reached this
+store, which a returned 0 would hide.
 
 ## Privacy
 
