@@ -11,14 +11,10 @@ Importable without any extra, and it never reads the environment — a test that
 override a credential gets an obviously-fake value, not whatever is in your shell.
 """
 
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from typing import Any, Literal
 
 __all__ = ["FakeLakeSettings", "lake_settings"]
-
-
-def _subreddits() -> list[str]:
-    return ["wallstreetbets", "investing", "stocks", "CanadianInvestor"]
 
 
 @dataclass
@@ -30,10 +26,6 @@ class FakeLakeSettings:
     finnhub_key: str = "test-finnhub-key"
     alpha_vantage_key: str = "test-alpha-vantage-key"
     fmp_key: str = "test-fmp-key"
-    reddit_client_id: str = "test-reddit-id"
-    reddit_client_secret: str = "test-reddit-secret"
-    reddit_user_agent: str = "data-lake-tests/0.1"
-    subreddits: list[str] = field(default_factory=_subreddits)
     ibkr_host: str = "127.0.0.1"
     ibkr_port: int = 4004
     ibkr_client_id: int = 1

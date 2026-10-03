@@ -57,9 +57,6 @@ scripts/sync-codex-hooks.py::root_expression
 scripts/sync-devkit.py::receipt_retired_present
 scripts/sync-devkit.py::remove_retired
 scripts/sync-devkit.py::retired_present
-src/data_lake/archive/catalog.py::DatasetManifest
-src/data_lake/archive/catalog.py::DatasetSpec
-src/data_lake/archive/catalog.py::PartitionEntry
 src/data_lake/archive/parquet_io.py::ArchiveResult
 src/data_lake/archive/parquet_io.py::as_utc
 src/data_lake/archive/parquet_io.py::chunked

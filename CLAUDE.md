@@ -115,6 +115,10 @@ The pooled tree is `data-lake/data/archive` (gitignored here; `sports_betting` h
 defaulted to it, `ibkr_trader` now points `ARCHIVE_LOCAL_DIR` there too). Datasets are
 namespaced by the `DatasetSpec.prefix` values in `archive/catalog.py`, so two consumers
 writing one tree share a `_catalog/` without colliding — that sharing is the point.
+The tree is read as well as written: `src/data_lake/ingestion/social/social_scraper.py` is how
+`social_posts` gets filled at all, from a dataset whose layout social-scraper owns (its
+README, "Data contract"), so a consumer whose archive settings miss that tree or bucket
+gets no social data.
 
 Two things this costs, both worth re-reading before assuming the archive is a backup:
 

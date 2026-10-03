@@ -207,8 +207,8 @@ class SocialPost(Base):
     )
 
     id: Mapped[int] = mapped_column(SqliteFriendlyBigInt, primary_key=True)
-    platform: Mapped[str] = mapped_column(String(32))  # reddit
-    channel: Mapped[str] = mapped_column(String(64))  # subreddit name
+    platform: Mapped[str] = mapped_column(String(32))  # reddit | x
+    channel: Mapped[str] = mapped_column(String(64))  # subreddit; X: search | timeline
     external_id: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     author_hash: Mapped[str | None] = mapped_column(String(64))  # sha256, never the username
