@@ -59,7 +59,6 @@ scripts/sync-devkit.py::remove_retired
 scripts/sync-devkit.py::retired_present
 src/data_lake/archive/catalog.py::DatasetManifest
 src/data_lake/archive/catalog.py::DatasetSpec
-src/data_lake/archive/catalog.py::ManifestError
 src/data_lake/archive/catalog.py::PartitionEntry
 src/data_lake/archive/parquet_io.py::ArchiveResult
 src/data_lake/archive/parquet_io.py::as_utc
@@ -67,11 +66,7 @@ src/data_lake/archive/parquet_io.py::chunked
 src/data_lake/archive/parquet_io.py::merge_into_partition
 src/data_lake/archive/parquet_io.py::verify_partition
 src/data_lake/archive/store.py::ObjectStore
-src/data_lake/db/models.py::Dividend
-src/data_lake/db/models.py::EarningsEvent
 src/data_lake/db/models.py::Feature
-src/data_lake/db/models.py::FundamentalSnapshot
-src/data_lake/db/models.py::ShareCount
 src/data_lake/ingestion/market/finnhub_market.py::FinnhubMarketConnector
 src/data_lake/ingestion/market/fmp_fx.py::get_or_create_fx_instrument
 src/data_lake/ingestion/market/ibkr_historical.py::IbkrHistoricalConnector
