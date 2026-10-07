@@ -19,4 +19,5 @@ SETTINGS = lake_settings(
     finnhub_key="",
     alpha_vantage_key="",
     fmp_key="",
+    tiingo_api_key="",
 )

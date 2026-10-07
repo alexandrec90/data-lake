@@ -67,7 +67,6 @@ src/data_lake/db/models.py::Feature
 src/data_lake/ingestion/market/finnhub_market.py::FinnhubMarketConnector
 src/data_lake/ingestion/market/fmp_fx.py::get_or_create_fx_instrument
 src/data_lake/ingestion/market/ibkr_historical.py::IbkrHistoricalConnector
-src/data_lake/ingestion/market/yahoo_common.py::daily_ts
 src/data_lake/ingestion/market/yahoo_common.py::get_instrument
 src/data_lake/ingestion/market/yahoo_common.py::get_or_create_instrument
 src/data_lake/ingestion/market/yahoo_common.py::run_within_timeout

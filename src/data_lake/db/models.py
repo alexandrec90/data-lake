@@ -19,7 +19,8 @@ Conventions:
 - External payloads are preserved in a `raw` JSON column for reprocessing, so a parser fix
   never requires re-fetching.
 - Upsert keys: (source, external_id) for text content; (platform, external_id) for scraped
-  listings; (instrument, ts, bar_size, source, what_to_show) for bars.
+  listings; (instrument, ts, bar_size, source, what_to_show) for bars; (index_code, symbol,
+  start_date, source) for index membership spans.
 - Privacy (Québec Law 25): people are stored as hashes, never names — social authors and
   listing sellers alike.
 """
@@ -94,6 +95,37 @@ class PriceBar(Base):
     low: Mapped[float] = mapped_column(Float)
     close: Mapped[float] = mapped_column(Float)
     volume: Mapped[float | None] = mapped_column(Float)
+
+
+class IndexMembership(Base):
+    """One span of one symbol's membership in a stock index (point-in-time universe).
+
+    Written by ``ingestion.market.index_membership`` from a public reference file; the
+    pricing columns are filled by ``ingestion.market.index_pricing``. ``symbol`` is the ticker
+    *as spelled during the span* — a rename is a separate span, never rewritten in place, and
+    no rename is ever guessed, because pricing one company with another's history is worse
+    than leaving a span visibly unpriced.
+
+    Pricing columns: ``instrument_id`` is the instrument whose bars price the span (None until
+    resolved); ``resolution`` says how it was found (``yahoo`` | ``tiingo:<ticker>`` |
+    ``unpriced``); ``resolved_at`` is when, so an ``unpriced`` span is retried after a while.
+    """
+
+    __tablename__ = "index_memberships"
+    __table_args__ = (
+        UniqueConstraint("index_code", "symbol", "start_date", "source"),
+        Index("ix_index_memberships_window", "index_code", "start_date", "end_date"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    index_code: Mapped[str] = mapped_column(String(32))  # SP500
+    symbol: Mapped[str] = mapped_column(String(32))
+    start_date: Mapped[date] = mapped_column(Date)
+    end_date: Mapped[date | None] = mapped_column(Date)  # None = current member
+    source: Mapped[str] = mapped_column(String(32))  # fja05680
+    instrument_id: Mapped[int | None] = mapped_column(ForeignKey("instruments.id"))
+    resolution: Mapped[str | None] = mapped_column(String(64))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Dividend(Base):
