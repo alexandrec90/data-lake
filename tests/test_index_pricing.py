@@ -10,11 +10,16 @@ from _db import make_session_scope
 from _lake_env import SETTINGS
 from data_lake.db.models import IndexMembership, Instrument, PriceBar
 from data_lake.ingestion.market import index_pricing, tiingo, yahoo, yahoo_common
-from data_lake.ingestion.market.index_pricing import covers, resolve_index_prices
+from data_lake.ingestion.market.index_pricing import (
+    PricingOptions,
+    covers,
+    resolve_index_prices,
+)
 from data_lake.ingestion.market.tiingo import TiingoListing
 
 SINCE = date(2020, 1, 1)
 TODAY = date(2024, 6, 30)
+OPTIONS = PricingOptions(today=TODAY)
 
 
 @pytest.fixture(autouse=True)
@@ -134,7 +139,7 @@ def test_existing_yahoo_bars_resolve_without_a_network_call(monkeypatch, scope):
         instrument_id = instrument.id
     calls = _yahoo(monkeypatch, {})
 
-    report = resolve_index_prices(since=SINCE, today=TODAY, session_factory=scope)
+    report = resolve_index_prices(since=SINCE, options=OPTIONS, session_factory=scope)
 
     assert calls == []
     assert report.already == 1
@@ -147,7 +152,7 @@ def test_yahoo_download_that_covers_is_stored_under_the_dashed_symbol(monkeypatc
     span_id = _span(scope, "BRK.B", date(2010, 2, 16))
     calls = _yahoo(monkeypatch, {"BRK-B": _frame(date(2018, 11, 28), date(2024, 6, 28))})
 
-    report = resolve_index_prices(since=SINCE, today=TODAY, session_factory=scope)
+    report = resolve_index_prices(since=SINCE, options=OPTIONS, session_factory=scope)
 
     assert report.resolved_yahoo == 1
     assert calls == [("BRK-B", SINCE - timedelta(days=400), TODAY + timedelta(days=1), True)]
@@ -165,7 +170,7 @@ def test_yahoo_download_that_does_not_cover_creates_no_instrument(monkeypatch, s
     # a reused ticker: Yahoo serves the new company, whose history starts too late
     _yahoo(monkeypatch, {"DEAD": _frame(date(2022, 6, 1), date(2024, 6, 28))})
 
-    report = resolve_index_prices(since=SINCE, today=TODAY, session_factory=scope)
+    report = resolve_index_prices(since=SINCE, options=OPTIONS, session_factory=scope)
 
     assert (report.unpriced, report.resolved_yahoo) == (1, 0)
     row = _get(scope, span_id)
@@ -184,7 +189,7 @@ def test_delisted_yahoo_ticker_falls_through_to_the_tiingo_q_ticker(monkeypatch,
 
     report = resolve_index_prices(
         since=SINCE,
-        today=TODAY,
+        options=OPTIONS,
         tiingo=connector,
         tiingo_listings=listings,
         session_factory=scope,
@@ -208,7 +213,7 @@ def test_tiingo_series_that_does_not_cover_leaves_the_span_unpriced(monkeypatch,
 
     report = resolve_index_prices(
         since=SINCE,
-        today=TODAY,
+        options=OPTIONS,
         tiingo=connector,
         tiingo_listings={"GAP": [_listing("GAP", date(2000, 1, 1), date(2023, 3, 14))]},
         session_factory=scope,
@@ -241,7 +246,7 @@ def test_unusable_tiingo_listings_are_never_requested(monkeypatch, scope, listin
 
     report = resolve_index_prices(
         since=SINCE,
-        today=TODAY,
+        options=OPTIONS,
         tiingo=connector,
         tiingo_listings=listings,
         session_factory=scope,
@@ -260,7 +265,7 @@ def test_tiingo_budget_exhaustion_defers_instead_of_marking_unpriced(monkeypatch
 
     report = resolve_index_prices(
         since=SINCE,
-        today=TODAY,
+        options=OPTIONS,
         tiingo=connector,
         tiingo_listings=listings,
         session_factory=scope,
@@ -281,7 +286,7 @@ def test_tiingo_429_defers_the_rest_of_the_run(monkeypatch, scope):
 
     report = resolve_index_prices(
         since=SINCE,
-        today=TODAY,
+        options=OPTIONS,
         tiingo=connector,
         tiingo_listings=listings,
         session_factory=scope,
@@ -300,7 +305,7 @@ def test_refused_tiingo_key_fails_one_span_and_defers_the_rest(monkeypatch, scop
 
     report = resolve_index_prices(
         since=SINCE,
-        today=TODAY,
+        options=OPTIONS,
         tiingo=connector,
         tiingo_listings=listings,
         session_factory=scope,
@@ -331,7 +336,7 @@ def test_unpriced_spans_are_retried_only_after_the_window(monkeypatch, scope):
     )
     calls = _yahoo(monkeypatch, {})
 
-    report = resolve_index_prices(since=SINCE, today=TODAY, session_factory=scope)
+    report = resolve_index_prices(since=SINCE, options=OPTIONS, session_factory=scope)
 
     assert [c[0] for c in calls] == ["STALE"]
     assert report.unpriced == 1
@@ -354,10 +359,24 @@ def test_only_unresolved_spans_live_since_the_cutoff_are_considered(monkeypatch,
         )
     calls = _yahoo(monkeypatch, {})
 
-    resolve_index_prices(since=SINCE, today=TODAY, session_factory=scope)
+    resolve_index_prices(since=SINCE, options=OPTIONS, session_factory=scope)
 
     # DONE has a resolution but no instrument, so it is still unresolved
     assert [c[0] for c in calls] == ["DONE"]
+
+
+def test_options_pick_the_index_and_the_warmup(monkeypatch, scope):
+    _span(scope, "AAA", date(2015, 1, 1))
+    with scope() as session:
+        session.add(
+            IndexMembership(index_code="NDX", symbol="NNN", start_date=date(2015, 1, 1), source="x")
+        )
+    calls = _yahoo(monkeypatch, {})
+    options = PricingOptions(index_code="NDX", today=TODAY, warmup_days=10)
+
+    resolve_index_prices(since=SINCE, options=options, session_factory=scope)
+
+    assert calls == [("NNN", SINCE - timedelta(days=10), TODAY + timedelta(days=1), True)]
 
 
 def test_yahoo_probe_budget_defers_the_overflow(monkeypatch, scope):
@@ -365,7 +384,7 @@ def test_yahoo_probe_budget_defers_the_overflow(monkeypatch, scope):
     _span(scope, "BBB", date(2015, 1, 1))
     calls = _yahoo(monkeypatch, {"AAA": _frame(date(2018, 1, 2), date(2024, 6, 28))})
 
-    report = resolve_index_prices(since=SINCE, today=TODAY, max_yahoo=1, session_factory=scope)
+    report = resolve_index_prices(since=SINCE, options=OPTIONS, max_yahoo=1, session_factory=scope)
 
     assert [c[0] for c in calls] == ["AAA"]
     assert (report.resolved_yahoo, report.deferred) == (1, 1)
@@ -382,7 +401,7 @@ def test_a_failing_span_is_recorded_and_the_run_continues(monkeypatch, scope):
         },
     )
 
-    report = resolve_index_prices(since=SINCE, today=TODAY, session_factory=scope)
+    report = resolve_index_prices(since=SINCE, options=OPTIONS, session_factory=scope)
 
     assert report.resolved_yahoo == 1
     assert list(report.failed) == ["BBB@2015-01-01"]
@@ -396,9 +415,9 @@ def test_every_attempted_span_failing_raises(monkeypatch, scope):
     _yahoo(monkeypatch, {"AAA": RuntimeError("down"), "BBB": RuntimeError("down")})
 
     with pytest.raises(RuntimeError, match="all 2 span"):
-        resolve_index_prices(since=SINCE, today=TODAY, session_factory=scope)
+        resolve_index_prices(since=SINCE, options=OPTIONS, session_factory=scope)
 
 
 def test_a_quiet_run_does_not_raise(scope):
-    report = resolve_index_prices(since=SINCE, today=TODAY, session_factory=scope)
+    report = resolve_index_prices(since=SINCE, options=OPTIONS, session_factory=scope)
     assert report == index_pricing.PricingReport()

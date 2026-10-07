@@ -224,6 +224,26 @@ def test_fetch_stores_adjusted_fields_under_the_listing_exchange(monkeypatch, ke
         usage.check("OTHER")
 
 
+def test_instrument_key_normalises_and_defaults_the_exchange():
+    assert tiingo.instrument_key(" sivbq ", " pink ") == ("SIVBQ", "PINK", "USD")
+    assert tiingo.instrument_key("aaa") == ("AAA", tiingo.DEFAULT_EXCHANGE, "USD")
+    assert tiingo.instrument_key("aaa", "  ") == ("AAA", tiingo.DEFAULT_EXCHANGE, "USD")
+
+
+def test_find_instrument_matches_only_the_listing_exchange():
+    scope = make_session_scope()
+    with scope() as session:
+        session.add(Instrument(symbol="DO", exchange="SMART", currency="USD"))
+        session.add(Instrument(symbol="DO", exchange="NYSE", currency="USD"))
+    with scope() as session:
+        found = tiingo.find_instrument(session, "do", "nyse")
+        assert found is not None
+        assert (found.symbol, found.exchange) == ("DO", "NYSE")
+        # a reused ticker's later company (Yahoo's SMART row) is never matched
+        assert tiingo.find_instrument(session, "DO") is None
+        assert tiingo.find_instrument(session, "DO", "NASDAQ") is None
+
+
 def test_fetch_resumes_after_the_last_stored_bar(monkeypatch, keyed):
     scope = make_session_scope()
     starts = []

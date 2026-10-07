@@ -37,7 +37,7 @@ from data_lake.ingestion.market.tiingo import (
 )
 from data_lake.ingestion.market.yahoo_common import YahooProviderError
 
-__all__ = ["PricingReport", "covers", "resolve_index_prices"]
+__all__ = ["PricingOptions", "PricingReport", "covers", "resolve_index_prices"]
 
 #: Slack on each end of a span: a listing that starts within a month of the window, or bars
 #: that stop within ten days of its end, still count as covering it.
@@ -57,11 +57,46 @@ class PricingReport:
 
 
 @dataclass(frozen=True)
+class PricingOptions:
+    """The knobs a scheduled run leaves at their defaults.
+
+    ``today`` defaults to the current UTC date. Unpriced spans are retried after
+    ``retry_unpriced_days``; bars are fetched from ``warmup_days`` before a span's window.
+    """
+
+    index_code: str = INDEX_CODE
+    today: date | None = None
+    retry_unpriced_days: int = 30
+    warmup_days: int = 400
+
+
+@dataclass(frozen=True)
 class _Span:
     id: int
     symbol: str
     start: date
     end: date | None
+
+
+@dataclass(frozen=True)
+class _Window:
+    """One span's pricing window: ``start..need_to``, fetched from ``fetch_from``."""
+
+    span: _Span
+    start: date
+    need_to: date
+    fetch_from: date
+
+    @property
+    def label(self) -> str:
+        return f"{self.span.symbol}@{self.span.start.isoformat()}"
+
+    @property
+    def provider_symbol(self) -> str:
+        return _provider_symbol(self.span.symbol)
+
+    def is_covered_by(self, span_range: tuple[date, date] | None) -> bool:
+        return _covers(span_range, self.start, self.need_to)
 
 
 def covers(first_bar: date, last_bar: date, window_start: date, need_to: date) -> bool:
@@ -159,45 +194,22 @@ def _mark(
     row.resolved_at = now
 
 
-def resolve_index_prices(
-    *,
-    since: date,
-    index_code: str = INDEX_CODE,
-    today: date | None = None,
-    max_yahoo: int = 100,
-    tiingo: TiingoConnector | None = None,
-    tiingo_listings: dict[str, list[TiingoListing]] | None = None,
-    retry_unpriced_days: int = 30,
-    warmup_days: int = 400,
-    session_factory: SessionFactory | None = None,
-) -> PricingReport:
-    """Resolve prices for ``index_code``'s spans live on or after ``since``.
-
-    Bars are fetched from ``warmup_days`` before the span's window, since momentum features
-    need about a year of history before a name can be entered. At most ``max_yahoo`` Yahoo
-    probes run; spans past that, or needing Tiingo once its budget is spent, are *deferred*
-    (left for the next run) rather than marked unpriced.
-
-    Per-span provider errors land in ``report.failed`` and the run continues. If every span
-    that reached a provider failed, raises ``RuntimeError`` — so a scheduler can tell an
-    outage from a quiet run.
-    """
-    factory = resolve_session_factory(session_factory)
-    today = today or _utcnow().date()
-    now = _utcnow()
-    retry_after = now - timedelta(days=retry_unpriced_days)
-
+def _pending_spans(
+    factory: SessionFactory, since: date, options: PricingOptions, now: datetime
+) -> list[_Span]:
+    """Unresolved spans live on or after ``since``, minus those marked unpriced too recently."""
+    retry_after = now - timedelta(days=options.retry_unpriced_days)
     with factory() as session:
         rows = session.scalars(
             select(IndexMembership)
             .where(
-                IndexMembership.index_code == index_code,
+                IndexMembership.index_code == options.index_code,
                 IndexMembership.instrument_id.is_(None),
                 or_(IndexMembership.end_date.is_(None), IndexMembership.end_date >= since),
             )
             .order_by(IndexMembership.symbol, IndexMembership.start_date)
         ).all()
-        spans = [
+        return [
             _Span(row.id, row.symbol, row.start_date, row.end_date)
             for row in rows
             if not (
@@ -207,92 +219,150 @@ def resolve_index_prices(
             )
         ]
 
-    report = PricingReport()
-    yahoo_left = max_yahoo
-    use_tiingo = tiingo is not None and tiingo_listings is not None
-    tiingo_blocked = False  # budget spent or key refused: defer rather than mark unpriced
-    attempted = 0
 
-    for span in spans:
-        window_start = max(span.start, since)
-        need_to = span.end or today
-        fetch_from = window_start - timedelta(days=warmup_days)
-        label = f"{span.symbol}@{span.start.isoformat()}"
-        yahoo_symbol = _provider_symbol(span.symbol)
+def _window(span: _Span, since: date, today: date, warmup_days: int) -> _Window:
+    start = max(span.start, since)
+    return _Window(span, start, span.end or today, start - timedelta(days=warmup_days))
 
-        with factory() as session:
-            instrument = yahoo_common.get_instrument(session, yahoo_symbol)
-            if instrument is not None and _covers(
-                _stored_range(session, instrument.id, "yahoo"), window_start, need_to
-            ):
-                _mark(session, span.id, instrument.id, "yahoo", now)
-                report.already += 1
-                continue
 
-        if yahoo_left <= 0:
-            report.deferred += 1
-            continue
-        yahoo_left -= 1
-        attempted += 1
+@dataclass
+class _Run:
+    """One run's state: what is left of the Yahoo budget, and whether Tiingo is blocked."""
 
+    factory: SessionFactory
+    now: datetime
+    yahoo_left: int
+    tiingo: TiingoConnector | None
+    listings: dict[str, list[TiingoListing]]
+    #: Budget spent or key refused: defer rather than mark unpriced.
+    tiingo_blocked: bool = False
+    attempted: int = 0
+    report: PricingReport = field(default_factory=PricingReport)
+
+    def resolve(self, window: _Window) -> None:
+        if self._already_stored(window):
+            self.report.already += 1
+            return
+        if self.yahoo_left <= 0:
+            self.report.deferred += 1
+            return
+        self.yahoo_left -= 1
+        self.attempted += 1
         try:
-            values = _probe_yahoo(yahoo_symbol, fetch_from, need_to)
-            if _covers(_values_range(values), window_start, need_to):
-                with factory() as session:
-                    instrument = yahoo_common.get_or_create_instrument(session, yahoo_symbol)
-                    upsert_daily_bars(session, instrument.id, values, source="yahoo")
-                    _mark(session, span.id, instrument.id, "yahoo", now)
-                report.resolved_yahoo += 1
-                continue
-
-            candidates = (
-                _usable_listings(span.symbol, tiingo_listings, window_start, need_to)
-                if use_tiingo and tiingo_listings is not None
-                else []
-            )
-            if candidates and tiingo_blocked:
-                report.deferred += 1
-                continue
-
-            resolved = False
-            for listing in candidates:
-                assert tiingo is not None
-                try:
-                    tiingo.fetch(
-                        symbol=listing.ticker,
-                        date_from=fetch_from.isoformat(),
-                        date_to=need_to.isoformat(),
-                        exchange=listing.exchange,
-                    )
-                except TiingoBudgetExhausted:
-                    tiingo_blocked = True
-                    break
-                with factory() as session:
-                    stored = find_instrument(session, listing.ticker, listing.exchange)
-                    if stored is not None and _covers(
-                        _stored_range(session, stored.id, "tiingo"), window_start, need_to
-                    ):
-                        _mark(session, span.id, stored.id, f"tiingo:{listing.ticker}", now)
-                        resolved = True
-                        break
-            if resolved:
-                report.resolved_tiingo += 1
-                continue
-            if tiingo_blocked:
-                report.deferred += 1
-                continue
-
-            with factory() as session:
-                _mark(session, span.id, None, "unpriced", now)
-            report.unpriced += 1
+            self._resolve_with_providers(window)
         except TiingoProviderError as exc:
             if exc.status in (401, 403):
-                tiingo_blocked = True  # the key will not start working mid-run
-            report.failed[label] = str(exc)
+                self.tiingo_blocked = True  # the key will not start working mid-run
+            self.report.failed[window.label] = str(exc)
         except YahooProviderError as exc:
-            report.failed[label] = str(exc)
+            self.report.failed[window.label] = str(exc)
 
-    if attempted and len(report.failed) == attempted:
-        sample = "; ".join(f"{k}: {v}" for k, v in list(report.failed.items())[:3])
-        raise RuntimeError(f"all {attempted} span(s) sent to a provider failed ({sample})")
-    return report
+    def raise_if_all_failed(self) -> None:
+        failed = self.report.failed
+        if self.attempted and len(failed) == self.attempted:
+            sample = "; ".join(f"{k}: {v}" for k, v in list(failed.items())[:3])
+            raise RuntimeError(f"all {self.attempted} span(s) sent to a provider failed ({sample})")
+
+    def _already_stored(self, window: _Window) -> bool:
+        with self.factory() as session:
+            instrument = yahoo_common.get_instrument(session, window.provider_symbol)
+            if instrument is None or not window.is_covered_by(
+                _stored_range(session, instrument.id, "yahoo")
+            ):
+                return False
+            _mark(session, window.span.id, instrument.id, "yahoo", self.now)
+            return True
+
+    def _resolve_with_providers(self, window: _Window) -> None:
+        if self._try_yahoo(window):
+            self.report.resolved_yahoo += 1
+            return
+        if self.tiingo_blocked:
+            self.report.deferred += 1
+            return
+        if self._try_tiingo(window):
+            self.report.resolved_tiingo += 1
+            return
+        if self.tiingo_blocked:  # spent while trying this span
+            self.report.deferred += 1
+            return
+        with self.factory() as session:
+            _mark(session, window.span.id, None, "unpriced", self.now)
+        self.report.unpriced += 1
+
+    def _try_yahoo(self, window: _Window) -> bool:
+        values = _probe_yahoo(window.provider_symbol, window.fetch_from, window.need_to)
+        if not window.is_covered_by(_values_range(values)):
+            return False
+        with self.factory() as session:
+            instrument = yahoo_common.get_or_create_instrument(session, window.provider_symbol)
+            upsert_daily_bars(session, instrument.id, values, source="yahoo")
+            _mark(session, window.span.id, instrument.id, "yahoo", self.now)
+        return True
+
+    def _try_tiingo(self, window: _Window) -> bool:
+        if self.tiingo is None:
+            return False
+        usable = _usable_listings(window.span.symbol, self.listings, window.start, window.need_to)
+        for listing in usable:
+            try:
+                self.tiingo.fetch(
+                    symbol=listing.ticker,
+                    date_from=window.fetch_from.isoformat(),
+                    date_to=window.need_to.isoformat(),
+                    exchange=listing.exchange,
+                )
+            except TiingoBudgetExhausted:
+                self.tiingo_blocked = True
+                return False
+            if self._mark_tiingo(window, listing):
+                return True
+        return False
+
+    def _mark_tiingo(self, window: _Window, listing: TiingoListing) -> bool:
+        with self.factory() as session:
+            stored = find_instrument(session, listing.ticker, listing.exchange)
+            if stored is None or not window.is_covered_by(
+                _stored_range(session, stored.id, "tiingo")
+            ):
+                return False
+            _mark(session, window.span.id, stored.id, f"tiingo:{listing.ticker}", self.now)
+            return True
+
+
+def resolve_index_prices(
+    *,
+    since: date,
+    max_yahoo: int = 100,
+    tiingo: TiingoConnector | None = None,
+    tiingo_listings: dict[str, list[TiingoListing]] | None = None,
+    options: PricingOptions | None = None,
+    session_factory: SessionFactory | None = None,
+) -> PricingReport:
+    """Resolve prices for the index's spans live on or after ``since``.
+
+    Bars are fetched from ``options.warmup_days`` before the span's window, since momentum
+    features need about a year of history before a name can be entered. At most
+    ``max_yahoo`` Yahoo probes run; spans past that, or needing Tiingo once its budget is
+    spent, are *deferred* (left for the next run) rather than marked unpriced. Tiingo is
+    tried only when both ``tiingo`` and ``tiingo_listings`` are given.
+
+    Per-span provider errors land in ``report.failed`` and the run continues. If every span
+    that reached a provider failed, raises ``RuntimeError`` — so a scheduler can tell an
+    outage from a quiet run.
+    """
+    factory = resolve_session_factory(session_factory)
+    options = options or PricingOptions()
+    today = options.today or _utcnow().date()
+    now = _utcnow()
+    run = _Run(
+        factory=factory,
+        now=now,
+        yahoo_left=max_yahoo,
+        tiingo=tiingo if tiingo_listings is not None else None,
+        listings=tiingo_listings or {},
+    )
+    for span in _pending_spans(factory, since, options, now):
+        run.resolve(_window(span, since, today, options.warmup_days))
+    run.raise_if_all_failed()
+    return run.report

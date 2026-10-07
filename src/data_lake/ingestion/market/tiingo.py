@@ -258,6 +258,30 @@ def _bar_values(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return values
 
 
+def _payload(ticker: str, response: httpx.Response) -> list[dict[str, Any]]:
+    """The JSON row list of a non-404 prices response; raises on any failure status."""
+    status = response.status_code
+    if status == 429:
+        raise TiingoBudgetExhausted(f"Tiingo answered HTTP 429 for {ticker}")
+    if status in (401, 403):
+        raise TiingoProviderError(
+            f"Tiingo refused the request for {ticker} with HTTP {status}. "
+            "Check TIINGO_API_KEY (omitted from this error).",
+            status=status,
+        )
+    if status >= 400:
+        raise TiingoProviderError(
+            f"Tiingo request for {ticker} failed with HTTP {status}", status=status
+        )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if not isinstance(payload, list):
+        raise TiingoProviderError(f"unexpected Tiingo response shape for {ticker}")
+    return payload
+
+
 def instrument_key(ticker: str, exchange: str = "") -> tuple[str, str, str]:
     """The (symbol, exchange, currency) a Tiingo series is stored under.
 
@@ -311,23 +335,7 @@ class TiingoConnector(Connector):
         ticker = symbol.strip().upper()
         if not ticker:
             raise ValueError("symbol is required")
-        start = date.fromisoformat(date_from) if date_from else None
-        if start is None:
-            with self.session() as session:
-                instrument = find_instrument(session, ticker, exchange)
-                latest = (
-                    session.scalar(
-                        select(func.max(PriceBar.ts)).where(
-                            PriceBar.instrument_id == instrument.id,
-                            PriceBar.source == self.name,
-                            PriceBar.what_to_show == "ADJUSTED_LAST",
-                            PriceBar.bar_size == "1 day",
-                        )
-                    )
-                    if instrument
-                    else None
-                )
-            start = latest.date() + timedelta(days=1) if latest else EARLIEST_DATE
+        start = date.fromisoformat(date_from) if date_from else self._resume_date(ticker, exchange)
         params = {"startDate": start.isoformat(), "format": "json"}
         if date_to:
             if start > date.fromisoformat(date_to):
@@ -343,29 +351,9 @@ class TiingoConnector(Connector):
             ) from None
         self.usage.record(ticker)
 
-        status = response.status_code
-        if status == 404:
+        if response.status_code == 404:
             return 0
-        if status == 429:
-            raise TiingoBudgetExhausted(f"Tiingo answered HTTP 429 for {ticker}")
-        if status in (401, 403):
-            raise TiingoProviderError(
-                f"Tiingo refused the request for {ticker} with HTTP {status}. "
-                "Check TIINGO_API_KEY (omitted from this error).",
-                status=status,
-            )
-        if status >= 400:
-            raise TiingoProviderError(
-                f"Tiingo request for {ticker} failed with HTTP {status}", status=status
-            )
-
-        try:
-            payload = response.json()
-        except ValueError:
-            payload = None
-        if not isinstance(payload, list):
-            raise TiingoProviderError(f"unexpected Tiingo response shape for {ticker}")
-        values = _bar_values(payload)
+        values = _bar_values(_payload(ticker, response))
         if not values:
             return 0
 
@@ -377,3 +365,19 @@ class TiingoConnector(Connector):
                 session.add(instrument)
                 session.flush()
             return upsert_daily_bars(session, instrument.id, values, source=self.name)
+
+    def _resume_date(self, ticker: str, exchange: str) -> date:
+        """The day after the last stored Tiingo bar, or :data:`EARLIEST_DATE` if none."""
+        with self.session() as session:
+            instrument = find_instrument(session, ticker, exchange)
+            if instrument is None:
+                return EARLIEST_DATE
+            latest = session.scalar(
+                select(func.max(PriceBar.ts)).where(
+                    PriceBar.instrument_id == instrument.id,
+                    PriceBar.source == self.name,
+                    PriceBar.what_to_show == "ADJUSTED_LAST",
+                    PriceBar.bar_size == "1 day",
+                )
+            )
+        return latest.date() + timedelta(days=1) if latest else EARLIEST_DATE
