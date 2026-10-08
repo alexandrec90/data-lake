@@ -164,20 +164,23 @@ class S3ObjectStore:
     def put_bytes(self, key: str, data: bytes) -> None:
         self.client.put_object(Bucket=self.bucket, Key=self._key(key), Body=data)
 
+    def _get_once(self, key: str) -> bytes:
+        try:
+            response = self.client.get_object(Bucket=self.bucket, Key=self._key(key))
+        except Exception as exc:
+            if _is_missing_s3_object(exc):
+                raise KeyError(key) from None
+            raise
+        data: bytes = response["Body"].read()
+        return data
+
     def get_bytes(self, key: str) -> bytes:
         broken = _broken_download_errors()
-        for attempt in range(1, self.read_attempts + 1):
+        # Every attempt but the last retries a broken body; the last one's error propagates.
+        for attempt in range(1, self.read_attempts):
             try:
-                response = self.client.get_object(Bucket=self.bucket, Key=self._key(key))
-            except Exception as exc:
-                if _is_missing_s3_object(exc):
-                    raise KeyError(key) from None
-                raise
-            try:
-                return response["Body"].read()
+                return self._get_once(key)
             except broken as exc:
-                if attempt == self.read_attempts:
-                    raise
                 delay = READ_RETRY_DELAY * 2 ** (attempt - 1)
                 logger.warning(
                     "archive read of %s broke on attempt %d/%d (%s); re-fetching in %.0fs",
@@ -188,7 +191,7 @@ class S3ObjectStore:
                     delay,
                 )
                 time.sleep(delay)
-        raise AssertionError("unreachable: the last attempt returns or raises")  # pragma: no cover
+        return self._get_once(key)
 
     def exists(self, key: str) -> bool:
         try:
