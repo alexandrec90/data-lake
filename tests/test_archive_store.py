@@ -136,6 +136,64 @@ def test_s3_store_does_not_hide_non_missing_client_errors():
         store.exists("private.parquet")
 
 
+class ResponseStreamingError(Exception):
+    """botocore's name for a body read the connection broke under, without botocore."""
+
+
+class _BrokenOnceClient(FakeS3Client):
+    """A client whose first ``breaks`` body reads die mid-stream, as R2's did on 2026-10-08:
+    ``IncompleteRead(1589248 bytes read, 3445119 more expected)``."""
+
+    def __init__(self, breaks: int, error: type[Exception] = ResponseStreamingError):
+        super().__init__()
+        self.breaks, self.error, self.gets = breaks, error, 0
+
+    def get_object(self, Bucket, Key):
+        response = super().get_object(Bucket, Key)
+        self.gets += 1
+        if self.gets <= self.breaks:
+            error = self.error
+
+            class _Broken:
+                def read(self) -> bytes:
+                    raise error("Connection broken: IncompleteRead(1589248 bytes read)")
+
+            return {"Body": _Broken()}
+        return response
+
+
+@pytest.mark.parametrize("error", [ResponseStreamingError, ConnectionResetError])
+def test_s3_store_retries_a_body_read_the_connection_broke(error):
+    """ibkr_trader's social job died on one broken 5 MB read, losing the whole run."""
+    client = _BrokenOnceClient(breaks=2, error=error)
+    store = S3ObjectStore(client, "bucket")
+    client.blobs[("bucket", "posts.parquet")] = b"posts"
+    assert store.get_bytes("posts.parquet") == b"posts"
+    assert client.gets == 3, "a fresh request each time, not a re-read of the dead stream"
+
+
+def test_s3_store_gives_up_on_a_stream_that_keeps_breaking():
+    client = _BrokenOnceClient(breaks=99)
+    client.blobs[("bucket", "posts.parquet")] = b"posts"
+    with pytest.raises(ResponseStreamingError):
+        S3ObjectStore(client, "bucket").get_bytes("posts.parquet")
+    assert client.gets == S3ObjectStore.READ_ATTEMPTS
+
+
+def test_s3_store_does_not_retry_an_error_that_is_not_a_broken_stream():
+    class Refused(FakeS3Client):
+        gets = 0
+
+        def get_object(self, Bucket, Key):
+            self.gets += 1
+            raise _S3ClientError("AccessDenied", Key)
+
+    client = Refused()
+    with pytest.raises(_S3ClientError):
+        S3ObjectStore(client, "bucket").get_bytes("private.parquet")
+    assert client.gets == 1
+
+
 def test_s3_store_listing_paginates_and_strips_prefix():
     store = S3ObjectStore(FakeS3Client(page_size=2), "bucket", prefix="pre")
     for name in ("a", "b", "c", "d", "e"):

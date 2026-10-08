@@ -7,6 +7,7 @@ the settings object only. Keys are POSIX-style relative paths (``price_bars/…/
 """
 
 from dataclasses import dataclass
+from http.client import IncompleteRead
 from pathlib import Path
 from typing import Protocol
 
@@ -42,6 +43,20 @@ def _is_missing_s3_object(exc: Exception) -> bool:
     error = response.get("Error", {})
     code = error.get("Code") if isinstance(error, dict) else None
     return str(code) in {"404", "NoSuchKey", "NotFound"}
+
+
+# What a body read raises when the connection dies under it, by class name: botocore's
+# wrapper and urllib3's are behind the optional ``[archive]`` extra, so not imported here.
+_BROKEN_STREAM_NAMES = frozenset(
+    {"ResponseStreamingError", "IncompleteReadError", "ProtocolError", "ReadTimeoutError"}
+)
+
+
+def _is_broken_stream(exc: Exception) -> bool:
+    """Whether ``exc`` is a response body the connection broke mid-read: worth a new request."""
+    return isinstance(exc, (ConnectionError, IncompleteRead)) or any(
+        cls.__name__ in _BROKEN_STREAM_NAMES for cls in type(exc).__mro__
+    )
 
 
 class LocalDirStore:
@@ -89,6 +104,9 @@ class LocalDirStore:
 class S3ObjectStore:
     """S3-compatible bucket (Cloudflare R2, Backblaze B2, MinIO, AWS)."""
 
+    # Requests per ``get_bytes`` when the body read keeps breaking (``_is_broken_stream``).
+    READ_ATTEMPTS = 3
+
     def __init__(self, client, bucket: str, *, prefix: str = ""):
         if not bucket:
             raise ValueError("S3 archive needs a bucket name (ARCHIVE_S3_BUCKET)")
@@ -121,13 +139,25 @@ class S3ObjectStore:
         self.client.put_object(Bucket=self.bucket, Key=self._key(key), Body=data)
 
     def get_bytes(self, key: str) -> bytes:
-        try:
-            response = self.client.get_object(Bucket=self.bucket, Key=self._key(key))
-        except Exception as exc:
-            if _is_missing_s3_object(exc):
-                raise KeyError(key) from None
-            raise
-        return response["Body"].read()
+        """The object's bytes, asked for afresh when the connection breaks mid-body.
+
+        botocore retries a request that fails, not a body read that dies once the response
+        has begun: on 2026-10-08 one partition's read broke at 1.5 of 5 MB
+        (``IncompleteRead``) and ibkr_trader's social job lost the whole run to it.
+        """
+        for attempt in range(1, self.READ_ATTEMPTS + 1):
+            try:
+                response = self.client.get_object(Bucket=self.bucket, Key=self._key(key))
+            except Exception as exc:
+                if _is_missing_s3_object(exc):
+                    raise KeyError(key) from None
+                raise
+            try:
+                return response["Body"].read()
+            except Exception as exc:
+                if attempt == self.READ_ATTEMPTS or not _is_broken_stream(exc):
+                    raise
+        raise AssertionError("unreachable: the last attempt returns or raises")
 
     def exists(self, key: str) -> bool:
         try:
