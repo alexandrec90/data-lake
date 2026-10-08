@@ -103,16 +103,18 @@ Two practical consequences worth knowing before you add one:
 - Personal data in a shared table is still personal data. Hash it before it lands (see
   Privacy, below); the bucket and every consumer's database inherit whatever you store.
 
-## The archive's storage tier is local disk, by decision
+## The archive's storage tier is local disk by default, not everywhere
 
 `store_from_settings` treats `local` and `s3` as equals, so which one is in use is not
-derivable from this package — it is a per-consumer setting, and today **every consumer is
-`local` and no bucket is configured anywhere.** The reason is cost: the workstation has
-~830 GB free, the archive holds nothing yet, and R2 would buy durability the projects do
-not need before there is data to lose.
+derivable from this package — it is a per-consumer setting, read off that consumer's
+settings, never assumed from here. Local disk is the default because of cost: the
+workstation has ~830 GB free, and R2 buys durability a project does not need before there
+is data to lose. **That default is not universal:** `ibkr_trader`'s scheduler container
+reads social-scraper's export from an R2 bucket, so a broken download there is a real
+failure mode — `S3ObjectStore.get_bytes` re-fetches an object whose body dies mid-read.
 
-The pooled tree is `data-lake/data/archive` (gitignored here; `sports_betting` has always
-defaulted to it, `ibkr_trader` now points `ARCHIVE_LOCAL_DIR` there too). Datasets are
+The pooled local tree is `data-lake/data/archive` (gitignored here; `sports_betting` has
+always defaulted to it). Datasets are
 namespaced by the `DatasetSpec.prefix` values in `archive/catalog.py`, so two consumers
 writing one tree share a `_catalog/` without colliding — that sharing is the point.
 The tree is read as well as written: `src/data_lake/ingestion/social/social_scraper.py` is how

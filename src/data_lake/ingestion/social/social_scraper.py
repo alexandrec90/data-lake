@@ -31,6 +31,11 @@ health reads a returned 0 as "ran fine, nothing new". An archive with no
 *this* store, or the archive settings point at a different tree or bucket — either way the
 pipeline delivers nothing, and only an error makes that visible. Once the dataset exists its
 manifest is never removed, so the error cannot flap.
+
+**Memory is one partition deep.** A run can select many partitions — a backlog after an
+outage, or a bulk import on social-scraper's side that rewrites many days at once — so each
+is flushed and released before the next is read. Holding every post until the end grew a
+consumer's scheduler to three quarters of its Docker VM's memory.
 """
 
 import logging
@@ -205,9 +210,13 @@ class SocialScraperConnector(Connector):
         count = 0
         with self.session() as session:
             selected = select_partitions(manifest, _watermarks(session), wanted, lookback)
-            known: dict[_Key, SocialPost] = {}
             for key, entry in selected:
-                count += self._load_partition(session, key, entry, wanted, known)
+                count += self._load_partition(session, key, entry, wanted, {})
+                # Write the partition and let go of its posts before reading the next, so
+                # memory stays one partition deep however many a run selects. Still one
+                # transaction: a failure later in the run rolls this partition back too.
+                session.flush()
+                session.expunge_all()
         logger.info(
             "social-scraper: %d row(s) upserted from %d of %d partition(s)",
             count,

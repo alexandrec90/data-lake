@@ -276,6 +276,46 @@ def test_incremental_fetch_skips_partitions_already_loaded(tmp_path, monkeypatch
     assert [p.external_id for p in _posts(factory)] == ["a", "b", "c"]
 
 
+def test_a_loaded_partition_is_released_before_the_next_is_read(tmp_path, monkeypatch):
+    """Memory stays one partition deep, however many partitions a run selects.
+
+    Every post of every selected partition used to stay referenced until the run ended,
+    which grew ibkr_trader's scheduler to three quarters of its 3.8 GB Docker VM.
+    """
+    store, factory = LocalDirStore(tmp_path), _session_factory()
+    day = timedelta(days=1)
+    keys = _export(
+        store,
+        [
+            _post("reddit", "a", fetched=T0 - timedelta(minutes=5)),
+            _post("reddit", "b", fetched=T0 - timedelta(minutes=5), created_at=CREATED + day),
+            _post("x", "c", fetched=T0 - timedelta(minutes=5), created_at=CREATED + 2 * day),
+        ],
+        now=T0,
+    )
+    sessions: list[Session] = []
+
+    @contextmanager
+    def spying_factory() -> Iterator[Session]:
+        with factory() as session:
+            sessions.append(session)
+            yield session
+
+    held_at_read: dict[str, int] = {}
+    real_get = store.get_bytes
+
+    def spy(key: str) -> bytes:
+        if key.endswith(".parquet"):
+            held_at_read[key] = len(list(sessions[-1]))
+        return real_get(key)
+
+    monkeypatch.setattr(store, "get_bytes", spy)
+    assert _connector(store, spying_factory).fetch() == 3
+
+    assert held_at_read == dict.fromkeys(keys, 0)
+    assert [p.external_id for p in _posts(factory)] == ["a", "b", "c"]
+
+
 def test_select_partitions_holds_each_platform_to_its_own_watermark():
     def entry(updated_at: datetime) -> PartitionEntry:
         return PartitionEntry(rows=1, min_ts=CREATED, max_ts=CREATED, updated_at=updated_at)
