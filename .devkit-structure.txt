@@ -33,7 +33,6 @@ dependency::pyproject.toml::sqlalchemy = 1
 dependency::pyproject.toml::yfinance = 1
 function_lines::src/data_lake/archive/bars.py::restore_price_bars = 88
 function_lines::src/data_lake/ingestion/market/fmp.py::fetch = 93
-function_lines::src/data_lake/ingestion/market/yahoo.py::fetch = 88
 function_lines::src/data_lake/ingestion/market/yahoo_fx.py::fetch = 82
 function_lines::src/data_lake/ingestion/news/newsapi.py::fetch = 82
 function_params::src/data_lake/ingestion/news/finnhub_backfill.py::backfill_symbols = 9
@@ -44,6 +43,7 @@ orphan::src/data_lake/db/adoption.py = 1
 orphan::src/data_lake/ingestion/market/alpha_vantage.py = 1
 orphan::src/data_lake/ingestion/market/finnhub_market.py = 1
 orphan::src/data_lake/ingestion/market/ibkr_historical.py = 1
+orphan::src/data_lake/ingestion/market/index_pricing.py = 1
 orphan::src/data_lake/ingestion/market/yahoo_fundamentals.py = 1
 orphan::src/data_lake/ingestion/market/yahoo_fx.py = 1
 orphan::src/data_lake/ingestion/news/finnhub_backfill.py = 1
@@ -64,3 +64,6 @@ todos::src/data_lake/ingestion/market/ibkr_historical.py = 1
 
 # 2026-10-03  recorded: library connector: its only importer is the consumer (ibkr_trader's scheduler/cli), outside this scan -- the same standing as the other ingestion orphan lines here; replaces the retired reddit.py line
 #   orphan::src/data_lake/ingestion/social/social_scraper.py -> 1
+
+# 2026-10-07  recorded: library entry point: its only importer is the consumer (ibkr_trader's scheduler, its index-prices job), outside this scan -- the same standing as the other ingestion orphan lines here
+#   orphan::src/data_lake/ingestion/market/index_pricing.py -> 1

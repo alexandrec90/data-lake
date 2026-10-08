@@ -34,6 +34,9 @@ class IngestionSettings(Protocol):
     def fmp_key(self) -> str: ...
 
     @property
+    def tiingo_api_key(self) -> str: ...
+
+    @property
     def ibkr_host(self) -> str: ...
 
     @property

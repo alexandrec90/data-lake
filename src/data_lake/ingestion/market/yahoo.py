@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from data_lake.db.models import Instrument, PriceBar
 from data_lake.ingestion.base import Connector
+from data_lake.ingestion.market.bars import upsert_daily_bars
 from data_lake.ingestion.market.yahoo_common import (
     DOWNLOAD_TIMEOUT_SECONDS,
     YahooProviderError,
@@ -175,37 +176,11 @@ class YahooConnector(Connector):
 
         with self.session() as session:
             instrument = _get_or_create_instrument(session, yahoo_symbol)
-            count = 0
-            for values in _bar_values(frame):
-                existing = session.scalar(
-                    select(PriceBar).where(
-                        PriceBar.instrument_id == instrument.id,
-                        PriceBar.ts == values["ts"],
-                        PriceBar.bar_size == bar_size,
-                        PriceBar.source == self.name,
-                        PriceBar.what_to_show == what_to_show,
-                    )
-                )
-                if existing:
-                    existing.open = values["open"]
-                    existing.high = values["high"]
-                    existing.low = values["low"]
-                    existing.close = values["close"]
-                    existing.volume = values["volume"]
-                else:
-                    session.add(
-                        PriceBar(
-                            instrument_id=instrument.id,
-                            ts=values["ts"],
-                            bar_size=bar_size,
-                            source=self.name,
-                            what_to_show=what_to_show,
-                            open=values["open"],
-                            high=values["high"],
-                            low=values["low"],
-                            close=values["close"],
-                            volume=values["volume"],
-                        )
-                    )
-                count += 1
-            return count
+            return upsert_daily_bars(
+                session,
+                instrument.id,
+                _bar_values(frame),
+                source=self.name,
+                what_to_show=what_to_show,
+                bar_size=bar_size,
+            )
