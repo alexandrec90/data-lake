@@ -6,12 +6,22 @@ boto3 import lives behind the ``[archive]`` extra. Credentials reach this packag
 the settings object only. Keys are POSIX-style relative paths (``price_bars/…/2025-06.parquet``).
 """
 
+import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from data_lake.runtime import resolve_settings
 from data_lake.settings import ArchiveSettings
+
+logger = logging.getLogger(__name__)
+
+#: Whole-object GETs tried before a broken download is raised. botocore's own retries cover
+#: the request up to the response headers, never the body read that follows them.
+DEFAULT_READ_ATTEMPTS = 3
+#: Seconds before the first re-fetch; doubled per further attempt.
+READ_RETRY_DELAY = 2.0
 
 
 @dataclass(frozen=True)
@@ -42,6 +52,25 @@ def _is_missing_s3_object(exc: Exception) -> bool:
     error = response.get("Error", {})
     code = error.get("Code") if isinstance(error, dict) else None
     return str(code) in {"404", "NoSuchKey", "NotFound"}
+
+
+def _broken_download_errors() -> tuple[type[Exception], ...]:
+    """What botocore's ``StreamingBody.read`` raises when a download dies part-way.
+
+    The connection dropping (``ResponseStreamingError``), the body ending short of its
+    ``Content-Length`` (``IncompleteReadError``) and the socket stalling past the read
+    timeout (``ReadTimeoutError``). Imported lazily: botocore comes with the ``archive``
+    extra, and without it no real S3 client exists to raise them.
+    """
+    try:
+        from botocore.exceptions import (
+            IncompleteReadError,
+            ReadTimeoutError,
+            ResponseStreamingError,
+        )
+    except ImportError:  # pragma: no cover - exercised only without the extra
+        return ()
+    return (ResponseStreamingError, IncompleteReadError, ReadTimeoutError)
 
 
 class LocalDirStore:
@@ -87,14 +116,29 @@ class LocalDirStore:
 
 
 class S3ObjectStore:
-    """S3-compatible bucket (Cloudflare R2, Backblaze B2, MinIO, AWS)."""
+    """S3-compatible bucket (Cloudflare R2, Backblaze B2, MinIO, AWS).
 
-    def __init__(self, client, bucket: str, *, prefix: str = ""):
+    ``get_bytes`` re-fetches an object whose download breaks mid-body, up to
+    ``read_attempts`` GETs in all. A whole-object GET is idempotent, and without this one
+    dropped connection on one multi-megabyte partition failed the whole social-posts load.
+    """
+
+    def __init__(
+        self,
+        client,
+        bucket: str,
+        *,
+        prefix: str = "",
+        read_attempts: int = DEFAULT_READ_ATTEMPTS,
+    ):
         if not bucket:
             raise ValueError("S3 archive needs a bucket name (ARCHIVE_S3_BUCKET)")
+        if read_attempts < 1:
+            raise ValueError(f"read_attempts must be at least 1, got {read_attempts}")
         self.client = client
         self.bucket = bucket
         self.prefix = prefix.strip("/")
+        self.read_attempts = read_attempts
 
     @classmethod
     def from_settings(cls, settings: ArchiveSettings) -> "S3ObjectStore":
@@ -121,13 +165,30 @@ class S3ObjectStore:
         self.client.put_object(Bucket=self.bucket, Key=self._key(key), Body=data)
 
     def get_bytes(self, key: str) -> bytes:
-        try:
-            response = self.client.get_object(Bucket=self.bucket, Key=self._key(key))
-        except Exception as exc:
-            if _is_missing_s3_object(exc):
-                raise KeyError(key) from None
-            raise
-        return response["Body"].read()
+        broken = _broken_download_errors()
+        for attempt in range(1, self.read_attempts + 1):
+            try:
+                response = self.client.get_object(Bucket=self.bucket, Key=self._key(key))
+            except Exception as exc:
+                if _is_missing_s3_object(exc):
+                    raise KeyError(key) from None
+                raise
+            try:
+                return response["Body"].read()
+            except broken as exc:
+                if attempt == self.read_attempts:
+                    raise
+                delay = READ_RETRY_DELAY * 2 ** (attempt - 1)
+                logger.warning(
+                    "archive read of %s broke on attempt %d/%d (%s); re-fetching in %.0fs",
+                    key,
+                    attempt,
+                    self.read_attempts,
+                    type(exc).__name__,
+                    delay,
+                )
+                time.sleep(delay)
+        raise AssertionError("unreachable: the last attempt returns or raises")  # pragma: no cover
 
     def exists(self, key: str) -> bool:
         try:
