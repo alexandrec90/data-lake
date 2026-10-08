@@ -27,6 +27,7 @@ class FakeLakeSettings:
     alpha_vantage_key: str = "test-alpha-vantage-key"
     fmp_key: str = "test-fmp-key"
     tiingo_api_key: str = "test-tiingo-key"
+    sec_user_agent: str = "data-lake tests test@example.com"
     ibkr_host: str = "127.0.0.1"
     ibkr_port: int = 4004
     ibkr_client_id: int = 1

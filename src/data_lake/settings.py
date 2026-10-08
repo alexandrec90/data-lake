@@ -37,6 +37,11 @@ class IngestionSettings(Protocol):
     def tiingo_api_key(self) -> str: ...
 
     @property
+    def sec_user_agent(self) -> str:
+        """SEC EDGAR's required declared User-Agent, e.g. ``"Name admin@example.com"``."""
+        ...
+
+    @property
     def ibkr_host(self) -> str: ...
 
     @property
