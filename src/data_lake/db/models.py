@@ -20,7 +20,7 @@ Conventions:
   never requires re-fetching.
 - Upsert keys: (source, external_id) for text content; (platform, external_id) for scraped
   listings; (instrument, ts, bar_size, source, what_to_show) for bars; (index_code, symbol,
-  start_date, source) for index membership spans.
+  start_date, source) for index membership spans; (source, external_id) for IPO events.
 - Privacy (Québec Law 25): people are stored as hashes, never names — social authors and
   listing sellers alike.
 """
@@ -228,6 +228,57 @@ class NewsArticle(Base):
     sentiment: Mapped[float | None] = mapped_column(Float)  # filled by signals stage
     sentiment_model: Mapped[str | None] = mapped_column(String(32))
     raw: Mapped[dict | None] = mapped_column(JSON)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class IpoEvent(Base):
+    """One IPO-shaped event: a registration filing on EDGAR, or a deal on an IPO calendar.
+
+    Two sources describe the same pipeline at different stages, and are kept as separate rows
+    rather than merged, because nothing in either reliably joins them before listing:
+
+    - ``sec_edgar`` (``ingestion.market.sec_edgar``) — one row per filing, keyed by accession
+      number. ``S-1``/``F-1``/``DRS`` are ``filed``, their ``/A`` amendments ``amended``,
+      ``424B4`` ``priced``, ``RW`` ``withdrawn``. These forms are also used for resales, SPACs
+      and follow-ons; every one is stored, and ``raw`` carries the SIC code so a consumer can
+      filter. ``filed_at`` is EDGAR's "Date Filed" at 00:00 UTC — for a confidential ``DRS``
+      that is the submission date, weeks before it became public.
+    - ``finnhub`` (``ingestion.market.finnhub_ipo``) — one row per deal on Finnhub's calendar.
+      The calendar gives no id, and a deal's date, symbol and exchange all move as it
+      progresses (``exchange`` is null until a deal is scheduled), so the key is a hash of the
+      normalised company name alone and a re-dated deal updates in place.
+
+    ``stage`` is one of ``filed`` | ``amended`` | ``expected`` | ``priced`` | ``withdrawn``;
+    the provider's own status or form type stays in ``raw``/``form_type``.
+    """
+
+    __tablename__ = "ipo_events"
+    __table_args__ = (
+        UniqueConstraint("source", "external_id"),
+        Index("ix_ipo_events_expected_date", "expected_date"),
+        Index("ix_ipo_events_filed_at", "filed_at"),
+    )
+
+    id: Mapped[int] = mapped_column(SqliteFriendlyBigInt, primary_key=True)
+    source: Mapped[str] = mapped_column(String(32))  # finnhub | sec_edgar
+    external_id: Mapped[str] = mapped_column(String(256))  # accession number | name hash
+    company_name: Mapped[str] = mapped_column(Text)  # as the provider spells it
+    symbol: Mapped[str | None] = mapped_column(String(16))
+    exchange: Mapped[str | None] = mapped_column(String(32))
+    cik: Mapped[str | None] = mapped_column(String(10))  # zero-padded to 10 digits
+    stage: Mapped[str] = mapped_column(String(16))
+    form_type: Mapped[str | None] = mapped_column(String(16))  # EDGAR form, e.g. "S-1/A"
+    filed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expected_date: Mapped[date | None] = mapped_column(Date)  # calendar date, not yet listed
+    price_low: Mapped[float | None] = mapped_column(Float)
+    price_high: Mapped[float | None] = mapped_column(Float)
+    shares: Mapped[int | None] = mapped_column(BigInteger)
+    deal_value_usd: Mapped[float | None] = mapped_column(Float)
+    url: Mapped[str | None] = mapped_column(Text)  # EDGAR filing index page
+    raw: Mapped[dict | None] = mapped_column(JSON)
+    #: Never updated after insert — an alert dedupes on it, and it is the point-in-time
+    #: "when did we know" that ``filed_at`` (a regulatory date) is not.
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
