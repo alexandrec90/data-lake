@@ -55,7 +55,9 @@ unknowable. So a failure is kept a second time, at `logs/<slug>.failed.log`, and
 file just as a passing night does. It is written only on a failure, so a pass never
 clears it and the next failure is the only thing that replaces it; the header says so,
 because a file whose mtime is a week old is evidence for the event a week old, not for
-this morning's run. One extra bounded file per task that has ever failed.
+this morning's run. One extra bounded file per task that has ever failed. **The event
+names a third copy**, that failure's own under `logs/failed/` (`archive_artifact`): the
+per-job one is the next failure's by the time a sweep reaches an older group of the job.
 
 Colour survives the wrapping. A captured child is talking to a pipe rather than a
 terminal, and most tools drop their colour the moment they notice -- so `FORCE_COLOR`
@@ -87,6 +89,16 @@ FAILED_EVENT = "scheduled-job-failed"
 # the path the ledger event names. See the docstring: the event outlives the artifact,
 # and a triage sweep that reaches it a day later needs the reason, not the next run's.
 FAILED_SUFFIX = ".failed"
+
+# Each failure's own copy, under `logs/failed/`, which is what its ledger row names. The
+# `.failed.log` above is per job, so on 2026-10-08 five groups of one job, each a
+# different cause, were all handed the newest failure's copy as their own evidence
+# (96d2638e, e711daa0). `ARCHIVE_KEEP` newest per job are kept, so the directory is
+# bounded; a row whose copy aged out names a file that is not there, which the fix pass
+# reports as absent rather than as someone else's.
+ARCHIVE_DIR = "failed"
+ARCHIVE_KEEP = 20
+ARCHIVE_STAMP = "%Y%m%d-%H%M%S"
 
 # The head and tail kept when a run is too long to store whole. Both ends matter and
 # the middle rarely does: the head carries what was run and the first thing to go
@@ -147,6 +159,21 @@ COLOR_ENV = {
     "PY_COLORS": "1",
     "PYTHONIOENCODING": "utf-8",
     "PYTHONUNBUFFERED": "1",
+}
+
+# Set, the same way, on an unattended (`--always`) child only: nobody is there to answer
+# a prompt, so a tool that would ask must fail instead, and a transfer that stalls must
+# end. fb1f5465: every Worktree Reconcile run from 01:15 to 05:00 on 2026-10-08 was held
+# to the scheduler's one-hour kill, writing nothing, until a fire was skipped as an
+# overlap. A pass with no boxes spawns only `git fetch` and `gh`, unbounded, and git asks
+# Git Credential Manager, which can wait on a sign-in window. Git aborts a transfer slower
+# than `GIT_HTTP_LOW_SPEED_LIMIT` bytes/s for `GIT_HTTP_LOW_SPEED_TIME` seconds.
+UNATTENDED_ENV = {
+    "GIT_TERMINAL_PROMPT": "0",
+    "GCM_INTERACTIVE": "never",
+    "GH_PROMPT_DISABLED": "1",
+    "GIT_HTTP_LOW_SPEED_LIMIT": "1000",
+    "GIT_HTTP_LOW_SPEED_TIME": "120",
 }
 
 # Windows only. This wrapper has two kinds of caller and the flag is for the unattended
@@ -375,11 +402,39 @@ def write_artifact(root: Path, name: str, body: str, since: float = 0.0) -> Path
     return path
 
 
-def child_env(base: dict[str, str] | None = None) -> dict[str, str]:
+def archive_artifact(
+    root: Path, name: str, body: str, now: _dt.datetime | None = None
+) -> str | None:
+    """Keep `body` as this failure's own copy, `logs/failed/<name>-<stamp>.log`, and prune
+    `name`'s older copies past `ARCHIVE_KEEP`; the path relative to `root`, or None when it
+    could not be written. Best-effort, like `write_artifact`: the copy is evidence, never a
+    reason to change what the job reported."""
+    folder = root / LOGS_DIR / ARCHIVE_DIR
+    stem = f"{name}-{(now or _dt.datetime.now()).strftime(ARCHIVE_STAMP)}"
+    mine = re.compile(rf"^{re.escape(name)}-\d{{8}}-\d{{6}}(?:-\d+)?\.log$")
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{stem}.log"
+        n = 1
+        while path.exists():
+            n += 1
+            path = folder / f"{stem}-{n}.log"
+        path.write_text(body, encoding="utf-8")
+        copies = sorted(
+            (p for p in folder.iterdir() if mine.match(p.name)), key=lambda p: p.stat().st_mtime
+        )
+        for old in copies[:-ARCHIVE_KEEP]:
+            old.unlink(missing_ok=True)
+    except OSError:
+        return None
+    return f"{LOGS_DIR}/{ARCHIVE_DIR}/{path.name}"
+
+
+def child_env(base: dict[str, str] | None = None, unattended: bool = False) -> dict[str, str]:
     """The child's environment, with colour, UTF-8 and unbuffered output forced unless
-    the caller decided."""
+    the caller decided -- and, for an `unattended` child, no prompts (`UNATTENDED_ENV`)."""
     env = dict(os.environ if base is None else base)
-    for key, value in COLOR_ENV.items():
+    for key, value in (COLOR_ENV | (UNATTENDED_ENV if unattended else {})).items():
         env.setdefault(key, value)
     return env
 
@@ -407,8 +462,9 @@ def echo(line: str, out=None) -> None:
         return
 
 
-def stream(command: list[str]) -> tuple[int, str]:
+def stream(command: list[str], env: dict[str, str] | None = None) -> tuple[int, str]:
     """Run `command`, echoing output live while keeping a copy. `(exit code, output)`.
+    `env` is the child's whole environment, `child_env()` when None.
 
     stderr is merged into stdout on purpose. Two pipes would need two readers to avoid
     deadlocking on a full buffer, and the artifact wants the interleaving the operator
@@ -418,6 +474,7 @@ def stream(command: list[str]) -> tuple[int, str]:
     pipe object buffers ahead -- which is invisible in a test and turns a long task's
     terminal into a stall followed by a flood.
     """
+    env = child_env() if env is None else env
     try:
         process = subprocess.Popen(
             command,
@@ -426,7 +483,7 @@ def stream(command: list[str]) -> tuple[int, str]:
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=child_env(),
+            env=env,
             creationflags=NO_WINDOW,
         )
     except FileNotFoundError:
@@ -440,7 +497,7 @@ def stream(command: list[str]) -> tuple[int, str]:
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=child_env(),
+            env=env,
             shell=True,
             creationflags=NO_WINDOW,
         )
@@ -453,7 +510,8 @@ def stream(command: list[str]) -> tuple[int, str]:
     return process.wait(), "".join(captured)
 
 
-def main(argv: list[str] | None = None, run=stream, root: Path | None = None) -> int:
+def main(argv: list[str] | None = None, run=None, root: Path | None = None) -> int:
+    """`run(command)` is `stream` when None, in the environment `--always` asks for."""
     parsed = parse_argv(sys.argv[1:] if argv is None else argv)
     if parsed is None:
         print(
@@ -465,7 +523,10 @@ def main(argv: list[str] | None = None, run=stream, root: Path | None = None) ->
     title, command, always = parsed
 
     started = time.time()
-    code, output = run(command)
+    if run is None:
+        code, output = stream(command, child_env(unattended=always))
+    else:
+        code, output = run(command)
 
     name = slug(title)
     path = write_artifact(
@@ -485,12 +546,10 @@ def main(argv: list[str] | None = None, run=stream, root: Path | None = None) ->
         # `since` is not passed: this file is only ever written by a failure, so it has
         # no retraction to hold back and the concurrency case `write_artifact` guards
         # cannot arise.
-        kept = write_artifact(
-            root or Path.cwd(),
-            name + FAILED_SUFFIX,
-            artifact_body(title, command, code, output, always, kept=True),
-        )
-        artifact = artifact_ref(name, kept=kept is not None)
+        body = artifact_body(title, command, code, output, always, kept=True)
+        kept = write_artifact(root or Path.cwd(), name + FAILED_SUFFIX, body)
+        archived = archive_artifact(root or Path.cwd(), name, body)
+        artifact = archived or artifact_ref(name, kept=kept is not None)
         source = cause_source(output, root or Path.cwd())
         record_failure(failure_message(title, always), command, code, artifact, root, source)
     return code

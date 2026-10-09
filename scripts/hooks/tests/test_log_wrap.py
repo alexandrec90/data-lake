@@ -131,6 +131,42 @@ def test_the_child_s_two_streams_arrive_in_the_order_it_wrote_them(monkeypatch):
     assert (code, output.split()) == (0, ["first", "second", "third"])
 
 
+def test_an_unattended_child_is_told_nobody_will_answer_a_prompt():
+    """fb1f5465: every Worktree Reconcile run from 01:15 to 05:00 on 2026-10-08 was held
+    to the scheduler's one-hour kill with nothing written, so the 05:00 fire was skipped
+    as an overlap. A pass with no boxes spawns only `git fetch` and `gh`, and git asks
+    Git Credential Manager, which waits on a sign-in nobody at 3 a.m. answers."""
+    env = lw.child_env({}, unattended=True)
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert env["GCM_INTERACTIVE"] == "never"
+    assert env["GH_PROMPT_DISABLED"] == "1"
+    # A fetch whose connection stalls is ended rather than waited on for the hour.
+    assert int(env["GIT_HTTP_LOW_SPEED_TIME"]) > 0
+    assert int(env["GIT_HTTP_LOW_SPEED_LIMIT"]) > 0
+
+
+def test_a_clicked_child_may_still_prompt_and_a_caller_s_choice_stands():
+    """A person running a task can answer a sign-in, so only the unattended caller
+    loses the prompt -- and a value already in the environment is kept either way."""
+    assert not set(lw.UNATTENDED_ENV) & set(lw.child_env({}))
+    assert lw.child_env({"GCM_INTERACTIVE": "auto"}, unattended=True)["GCM_INTERACTIVE"] == "auto"
+
+
+def test_always_runs_the_command_with_the_unattended_environment(monkeypatch, tmp_path):
+    seen: dict[str, dict] = {}
+
+    def fake_stream(command, env=None):
+        seen[command[0]] = env or {}
+        return 0, "ok"
+
+    monkeypatch.delenv("GIT_TERMINAL_PROMPT", raising=False)
+    monkeypatch.setattr(lw, "stream", fake_stream)
+    lw.main(["--always", "Nightly", "--", "scheduled"], root=tmp_path)
+    lw.main(["Clicked", "--", "clicked"], root=tmp_path)
+    assert seen["scheduled"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert "GIT_TERMINAL_PROMPT" not in seen["clicked"]
+
+
 # --- capping ------------------------------------------------------------------
 
 
@@ -408,6 +444,48 @@ def test_an_unattended_failure_is_kept_where_the_next_run_cannot_erase_it(tmp_pa
     lw.main(["--always", "Nightly", "--", "x"], run=lambda _c: (0, "all fine"), root=tmp_path)
     assert "the reason" in kept.read_text(encoding="utf-8")
     assert "all fine" in (logs / "nightly.log").read_text(encoding="utf-8")
+
+
+def test_each_failure_names_its_own_copy_not_the_jobs(tmp_path, monkeypatch):
+    """96d2638e / e711daa0: five groups of one job, each a different cause, were handed
+    the newest failure's `.failed.log` as their own evidence. Each row now names a copy
+    of its own failure, which the next failure does not overwrite."""
+    ledger = _ledger(tmp_path, monkeypatch)
+    lw.main(["--always", "Nightly", "--", "x"], run=lambda _c: (2, "first cause"), root=tmp_path)
+    lw.main(["--always", "Nightly", "--", "x"], run=lambda _c: (2, "second cause"), root=tmp_path)
+
+    refs = [fields["artifact"] for fields in _fields(ledger)]
+    assert len(set(refs)) == 2 and all(r.startswith("logs/failed/nightly-") for r in refs)
+    assert "first cause" in (tmp_path / refs[0]).read_text(encoding="utf-8")
+    assert "second cause" in (tmp_path / refs[1]).read_text(encoding="utf-8")
+    assert "second cause" in (tmp_path / "logs" / "nightly.failed.log").read_text(encoding="utf-8")
+
+
+def test_the_per_failure_copies_are_bounded_per_job(tmp_path, monkeypatch):
+    monkeypatch.setattr(lw, "ARCHIVE_KEEP", 2)
+    folder = tmp_path / lw.LOGS_DIR / lw.ARCHIVE_DIR
+    folder.mkdir(parents=True)
+    # Another job whose slug starts the same is not this job's to prune.
+    (folder / "nightly-extra-20260101-000000.log").write_text("other", encoding="utf-8")
+    when = lw._dt.datetime(2026, 10, 8, 12, 30, 0)
+    refs = [lw.archive_artifact(tmp_path, "nightly", f"run {n}", now=when) for n in range(3)]
+
+    assert refs[0] == "logs/failed/nightly-20261008-123000.log"
+    assert refs[1] == "logs/failed/nightly-20261008-123000-2.log", "same second, own file"
+    kept = sorted(p.name for p in folder.iterdir())
+    assert kept == [
+        "nightly-20261008-123000-2.log",
+        "nightly-20261008-123000-3.log",
+        "nightly-extra-20260101-000000.log",
+    ]
+
+
+def test_an_unwritable_archive_falls_back_to_the_kept_copy(tmp_path, monkeypatch):
+    ledger = _ledger(tmp_path, monkeypatch)
+    monkeypatch.setattr(lw, "archive_artifact", lambda *_a, **_k: None)
+    lw.main(["--always", "Nightly", "--", "x"], run=lambda _c: (2, "boom"), root=tmp_path)
+
+    assert "artifact=logs/nightly.failed.log" in ledger.read_text(encoding="utf-8")
 
 
 def test_the_kept_copy_does_not_claim_to_be_this_mornings_run(tmp_path, monkeypatch):
@@ -698,6 +776,7 @@ def test_a_kept_copy_that_could_not_be_written_falls_back_to_the_per_run_path(
     assert lw.artifact_ref("n", kept=False) == "logs/n.log"
     ledger = _ledger(tmp_path, monkeypatch)
     monkeypatch.setattr(lw, "write_artifact", lambda root, name, *_a, **_k: None)
+    monkeypatch.setattr(lw, "archive_artifact", lambda *_a, **_k: None)
 
     lw.main(["--always", "N", "--", "x"], run=lambda _c: (2, "boom"), root=tmp_path)
 
