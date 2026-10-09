@@ -32,6 +32,8 @@ reports/
 *.parquet
 *.csv
 !tests/fixtures/*.csv
+# curated reference data shipped in the package (hatchling honours this file too)
+!src/data_lake/ingestion/market/sp500_renames.csv
 logs/
 *.log
 
