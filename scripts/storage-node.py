@@ -384,6 +384,11 @@ def credentials(home: Path = HOME) -> None:
     print("\n".join(env_lines(node, cred["accessKey"], cred["secretKey"])))
 
 
+def firewall(home: Path = HOME) -> None:
+    print("In an elevated PowerShell (Run as administrator):")
+    print(firewall_script(_weed(home)))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -396,23 +401,18 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("configure-buckets", "credentials", "run", "stop"):
         sub.add_parser(name)
     args = parser.parse_args(argv)
+    # HOME is read here, not bound as each function's default, so a test can move it.
+    commands = {
+        "install": lambda: install(args.role, args.primary, HOME),
+        "firewall": lambda: firewall(HOME),
+        "status": lambda: status(args.primary, HOME),
+        "configure-buckets": lambda: configure_buckets(HOME),
+        "credentials": lambda: credentials(HOME),
+        "run": lambda: run(HOME),
+        "stop": stop,
+    }
     try:
-        # HOME is read here, not bound as each function's default, so a test can move it.
-        if args.cmd == "install":
-            install(args.role, args.primary, HOME)
-        elif args.cmd == "firewall":
-            print("In an elevated PowerShell (Run as administrator):")
-            print(firewall_script(_weed(HOME)))
-        elif args.cmd == "status":
-            status(args.primary, HOME)
-        elif args.cmd == "configure-buckets":
-            configure_buckets(HOME)
-        elif args.cmd == "credentials":
-            credentials(HOME)
-        elif args.cmd == "run":
-            run(HOME)
-        elif args.cmd == "stop":
-            stop()
+        commands[args.cmd]()
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
         _log_failure(f"{args.cmd}: {exc}")
         print(f"storage-node {args.cmd} failed: {exc} (see {LOG_FILE})", file=sys.stderr)

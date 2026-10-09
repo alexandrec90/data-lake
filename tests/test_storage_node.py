@@ -1,14 +1,18 @@
 """Tests for `scripts/storage-node.py`, the SeaweedFS pool behind the archive.
 
-Only the pure half is exercised: no weed binary, no Tailscale, no scheduled task. What is
-pinned is what a plausible edit would break without anything failing until a PC reboots
--- an address the pool would listen on outside the tailnet, a placement that would
-silently drop the archive's second copy, a firewall rule open to the LAN.
+No weed binary, no Tailscale, no scheduled task: the side-effecting commands run against
+faked subprocesses and a temp home. What is pinned is what a plausible edit would break
+without anything failing until a PC reboots -- an address the pool would listen on
+outside the tailnet, a placement that would silently drop the archive's second copy, a
+firewall rule open to the LAN.
 """
 
 from __future__ import annotations
 
+import io
 import json
+import subprocess
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -208,3 +212,143 @@ def test_failure_is_written_to_the_log(tmp_path, monkeypatch):
     assert sn.main(["credentials"]) == 1
     record = json.loads(log.read_text(encoding="utf-8"))
     assert record["error"].startswith("credentials:")
+
+
+# --- commands ---------------------------------------------------------------------
+
+
+def _home(tmp_path: Path, node) -> Path:
+    (tmp_path / "node.json").write_text(json.dumps(asdict(node)), encoding="utf-8")
+    return tmp_path
+
+
+class _Calls:
+    """Stands in for `subprocess.run`, recording each argv and answering with `result`."""
+
+    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+        self.argv: list[list[str]] = []
+        self.inputs: list[str | None] = []
+        self.result = (returncode, stdout, stderr)
+
+    def __call__(self, args, **kwargs):
+        self.argv.append(list(args))
+        self.inputs.append(kwargs.get("input"))
+        return subprocess.CompletedProcess(args, *self.result)
+
+
+def test_install_writes_the_node_and_credentials_once(tmp_path, monkeypatch):
+    calls = _Calls()
+    monkeypatch.setattr(sn, "_tailscale_ip", lambda: PRIMARY.ip)
+    monkeypatch.setattr(sn, "_download", lambda home: home / "weed.exe")
+    monkeypatch.setattr(sn.subprocess, "run", calls)
+    node = sn.install("primary", None, tmp_path)
+    assert node == PRIMARY
+    assert json.loads((tmp_path / "node.json").read_text(encoding="utf-8")) == asdict(PRIMARY)
+    first = (tmp_path / "s3.json").read_text(encoding="utf-8")
+    assert (tmp_path / "storage-node.py").is_file()
+    assert calls.argv[-1][:3] == ["schtasks", "/Run", "/TN"]
+    sn.install("primary", None, tmp_path)
+    # A re-install must not rotate the keys every consumer's .env already holds.
+    assert (tmp_path / "s3.json").read_text(encoding="utf-8") == first
+
+
+def test_install_of_a_volume_node_mints_no_credentials(tmp_path, monkeypatch):
+    monkeypatch.setattr(sn, "_tailscale_ip", lambda: VOLUME.ip)
+    monkeypatch.setattr(sn, "_download", lambda home: home / "weed.exe")
+    monkeypatch.setattr(sn.subprocess, "run", _Calls())
+    assert sn.install("volume", VOLUME.primary, tmp_path) == VOLUME
+    assert not (tmp_path / "s3.json").exists()
+
+
+def test_run_restarts_weed_whenever_it_exits(tmp_path, monkeypatch):
+    home = _home(tmp_path, VOLUME)
+    started: list[list[str]] = []
+
+    class _Exited:
+        def poll(self):
+            return 1
+
+    def popen(args, **kwargs):
+        started.append(args)
+        return _Exited()
+
+    class _Stop(Exception):
+        pass
+
+    def sleep(seconds):
+        if len(started) == 2:
+            raise _Stop
+
+    monkeypatch.setattr(sn.subprocess, "Popen", popen)
+    monkeypatch.setattr(sn.time, "sleep", sleep)
+    with pytest.raises(_Stop):
+        sn.run(home)
+    assert len(started) == 2
+    assert started[0] == [str(sn._weed(home)), *sn.weed_args(VOLUME, home)]
+
+
+def test_stop_ends_the_task_and_every_weed(monkeypatch):
+    calls = _Calls()
+    monkeypatch.setattr(sn.subprocess, "run", calls)
+    sn.stop()
+    assert calls.argv == [
+        ["schtasks", "/End", "/TN", sn.TASK_NAME],
+        ["taskkill", "/F", "/IM", "weed.exe"],
+    ]
+
+
+def test_status_asks_the_named_primary_and_prints_the_topology(monkeypatch, capsys):
+    asked: list[str] = []
+
+    def urlopen(url, timeout):
+        asked.append(url)
+        return io.BytesIO(b"{}")
+
+    monkeypatch.setattr(sn.urllib.request, "urlopen", urlopen)
+    sn.status("100.1.2.3", Path("C:/unused"))
+    assert asked == [f"http://100.1.2.3:{sn.MASTER_PORT}/dir/status"]
+    assert "no volume servers registered" in capsys.readouterr().out
+
+
+def test_configure_buckets_refuses_a_volume_node(tmp_path):
+    with pytest.raises(RuntimeError, match="primary"):
+        sn.configure_buckets(_home(tmp_path, VOLUME))
+
+
+def test_configure_buckets_feeds_the_bucket_script_to_weed_shell(tmp_path, monkeypatch):
+    calls = _Calls(returncode=1, stdout="error: bucket data-lake already exists\n")
+    monkeypatch.setattr(sn.subprocess, "run", calls)
+    home = _home(tmp_path, PRIMARY)
+    sn.configure_buckets(home)
+    assert calls.argv == [sn.shell_args(PRIMARY, home)]
+    assert calls.inputs == [sn.bucket_script(sn.BUCKETS)]
+
+
+def test_configure_buckets_raises_when_weed_shell_reports_an_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(sn.subprocess, "run", _Calls(stdout="error: rpc error\n"))
+    with pytest.raises(RuntimeError):
+        sn.configure_buckets(_home(tmp_path, PRIMARY))
+
+
+def test_credentials_prints_the_env_lines_for_the_stored_keys(tmp_path, capsys):
+    home = _home(tmp_path, PRIMARY)
+    (home / "s3.json").write_text(json.dumps(sn.s3_identities("AK", "SK")), encoding="utf-8")
+    sn.credentials(home)
+    assert capsys.readouterr().out.splitlines() == sn.env_lines(PRIMARY, "AK", "SK")
+
+
+def test_firewall_prints_the_rule_for_this_homes_weed(capsys):
+    sn.firewall(HOME)
+    out = capsys.readouterr().out
+    assert "elevated PowerShell" in out
+    assert sn.firewall_script(sn._weed(HOME)) in out
+
+
+def test_main_dispatches_each_command(monkeypatch, tmp_path):
+    ran: list[str] = []
+    monkeypatch.setattr(sn, "HOME", tmp_path)
+    monkeypatch.setattr(sn, "stop", lambda: ran.append("stop"))
+    monkeypatch.setattr(sn, "status", lambda primary, home: ran.append(f"status {primary}"))
+    assert sn.main(["stop"]) == 0
+    assert sn.main(["status", "--primary", "100.1.2.3"]) == 0
+    assert ran == ["stop", "status 100.1.2.3"]

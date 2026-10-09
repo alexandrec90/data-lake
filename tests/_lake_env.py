@@ -20,4 +20,5 @@ SETTINGS = lake_settings(
     alpha_vantage_key="",
     fmp_key="",
     tiingo_api_key="",
+    sec_user_agent="",
 )

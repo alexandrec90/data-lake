@@ -106,16 +106,23 @@ Two practical consequences worth knowing before you add one:
 ## The archive's storage tier is a SeaweedFS pool across the desktops
 
 `store_from_settings` treats `local` and `s3` as equals, so which one is in use is not
-derivable from this package — it is a per-consumer setting. The intended one is `s3`
-pointed at **a SeaweedFS pool on the user's own PCs**, reached over Tailscale, rather than
-a cloud bucket: one PC's 1 TB drive was not going to hold the historical backfills, and
-pooling the desktops costs nothing. `scripts/storage-node.py` provisions a node — its
-docstring is the layout — and `credentials` on the primary prints the `.env` lines.
+derivable from this package — it is a per-consumer setting, read off that consumer's
+settings, never assumed from here. The intended one is `s3` pointed at **a SeaweedFS
+pool on the user's own PCs**, reached over Tailscale, rather than a cloud bucket: one
+PC's 1 TB drive was not going to hold the historical backfills, and pooling the desktops
+costs nothing. `scripts/storage-node.py` provisions a node — its docstring is the
+layout — and `credentials` on the primary prints the `.env` lines. The local tree,
+`data-lake/data/archive` (gitignored here; `sports_betting` has always defaulted to it),
+is still a valid backend.
 
 | Node | Tailscale IP | Runs |
 | --- | --- | --- |
 | DESKTOP-B9FC8VP | 100.76.121.58 | primary: master, filer, S3 gateway (`:8333`), volume |
 | DESKTOP-ML5F3PJ | 100.100.229.119 | volume |
+
+Consumers read the archive over S3 — `ibkr_trader`'s scheduler container reads
+social-scraper's export from the bucket — so a broken download is a real failure mode:
+`S3ObjectStore.get_bytes` re-fetches an object whose body dies mid-read.
 
 Two buckets with different placements: `data-lake` (the archive) keeps **two copies on
 different PCs** (`001`); `raw-dumps` (downloaded source dumps, re-fetchable) keeps one.
