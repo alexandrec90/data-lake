@@ -77,6 +77,7 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 LOGS_DIR = "logs"
@@ -248,18 +249,33 @@ def strip_ansi(text: str) -> str:
     return ANSI.sub("", text)
 
 
+def _named(line: str) -> str:
+    """`line` up to a "details in <file>" pointer, or `""` when nothing comes before the
+    pointer but a status word (`STATUS_ONLY`).
+
+    A status line that leads with its error -- social-scraper's `FAILED -- export posts:
+    StoreError: ... -- details in <file>` -- names the cause; skipped whole as a pointer,
+    it lost to the last logged warning, and ecf22e00 filed an export deferred for want of
+    time, the consequence, in place of the store refusing every write."""
+    pointer = POINTER.search(line)
+    if pointer is None:
+        return line
+    head = line[: pointer.start()]
+    return "" if STATUS_ONLY.match(head) else head.rstrip(" -;,(")
+
+
 def cause_said(output: str) -> str:
     """The line of a failed run's output that names why, as the run said it: the
     exception, the first failed test, the `error:` line or a logged error or warning,
-    else the last line; `""` for no output. Colour stripped, whitespace folded, bounded
-    by `SAID_WIDTH`."""
+    else the last line; `""` for no output. A line's pointer to a file is no part of
+    it (`_named`). Colour stripped, whitespace folded, bounded by `SAID_WIDTH`."""
     lines = [line.strip() for line in strip_ansi(output).splitlines() if line.strip()]
     found = lines[-1] if lines else ""
     for pattern, which in CAUSE_LINES:
         hits = [
-            line[match.start() :]
+            named[match.start() :]
             for line in lines
-            if not POINTER.search(line) and (match := pattern.search(line))
+            if (named := _named(line)) and (match := pattern.search(named))
         ]
         if hits:
             found = hits[0] if which == "first" else hits[-1]
@@ -551,7 +567,8 @@ def main(argv: list[str] | None = None, run=None, root: Path | None = None) -> i
         archived = archive_artifact(root or Path.cwd(), name, body)
         artifact = archived or artifact_ref(name, kept=kept is not None)
         source = cause_source(output, root or Path.cwd())
-        record_failure(failure_message(title, always), command, code, artifact, root, source)
+        failure = Failure(failure_message(title, always), command, code, artifact, source, started)
+        record_failure(failure, root)
     return code
 
 
@@ -571,16 +588,29 @@ def artifact_ref(name: str, kept: bool = True) -> str:
     return f"{LOGS_DIR}/{name}{FAILED_SUFFIX if kept else ''}.log"
 
 
-def record_failure(
-    message: str,
-    command: list[str],
-    code: int,
-    artifact: str,
-    root: Path | None = None,
-    output: str = "",
-) -> None:
-    """Leave a failure on the harness-events ledger under `message` (`failure_message`),
-    naming `artifact` (`artifact_ref`) as the file that holds its `output`.
+@dataclass(frozen=True)
+class Failure:
+    """One failed run, as its ledger row files it.
+
+    `started` (epoch seconds) is when the run began, filed as `started=` beside the row's
+    own stamp, which is when it ended: the code a job ran is the code on disk when it
+    started, so a run that began before a fix merged and failed after it is the defect
+    the fix was waiting on, not a recurrence (`fix_verify.covered`). 1fad5675: a 04:00Z
+    scrape failed at 04:13Z on code from before social-scraper #68 merged at 04:04Z.
+    """
+
+    message: str
+    command: list[str]
+    code: int
+    artifact: str
+    output: str = ""
+    started: float | None = None
+
+
+def record_failure(failure: Failure, root: Path | None = None) -> None:
+    """Leave `failure` on the harness-events ledger under its `message`
+    (`failure_message`), naming its `artifact` (`artifact_ref`) as the file that holds
+    its `output`.
 
     Best-effort twice over. `harness_events` swallows its own errors by contract, and
     the import is guarded because this module is vendored into projects that may hold a
@@ -596,7 +626,8 @@ def record_failure(
     nightly is one group and a new cause is a new one rather than a false recurrence.
     `said` (`cause_said`) is that line unfolded, filed only where folding changed it.
     """
-    cause, said = failure_cause(output), cause_said(output)
+    cause, said = failure_cause(failure.output), cause_said(failure.output)
+    started = failure.started
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
         import harness_events
@@ -609,15 +640,21 @@ def record_failure(
         FAILED_EVENT,
         (
             ("project", harness_events.project_name(root or Path.cwd())),
-            ("command", " ".join(command)),
-            ("artifact", artifact),
-            ("exit", code),
-            ("message", message),
+            ("command", " ".join(failure.command)),
+            ("artifact", failure.artifact),
+            ("exit", failure.code),
+            ("message", failure.message),
             ("cause", cause or "-"),
             *((("said", said),) if said and said != cause else ()),
+            *((("started", started_stamp(started)),) if started is not None else ()),
         ),
         root=root,
     )
+
+
+def started_stamp(started: float) -> str:
+    """`started` as the ledger spells a moment: UTC ISO 8601 to the second."""
+    return _dt.datetime.fromtimestamp(started, _dt.UTC).isoformat(timespec="seconds")
 
 
 if __name__ == "__main__":
