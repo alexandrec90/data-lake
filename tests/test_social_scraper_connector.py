@@ -466,10 +466,38 @@ def test_describe_falls_back_to_the_store_type():
         (pd.Timestamp("2026-10-01T12:00:00Z"), T0),
         (datetime(2026, 10, 1, 12, 0), T0),  # naive is UTC
         ("text", "text"),
+        ("a\x00b\x00", "ab"),  # Postgres text and jsonb refuse NUL
+        (np.array(["A\x00APL"], dtype=object), ["AAPL"]),
     ],
 )
 def test_plain_turns_parquet_cells_into_python(value, expected):
     assert plain(value) == expected
+
+
+def test_nul_bytes_in_exported_text_never_reach_social_posts(tmp_path):
+    """A 2020 Reddit comment carried a NUL; Postgres refused its whole batch, every run."""
+    store, factory = LocalDirStore(tmp_path), _session_factory()
+    _export(
+        store,
+        [
+            _post(
+                "reddit",
+                "t1_gfygjsv",
+                fetched=T0 - timedelta(minutes=5),
+                title="ti\x00tle",
+                body="bo\x00dy",
+                flair="D\x00D",
+                symbols=["NI\x00O"],
+            )
+        ],
+        now=T0,
+    )
+
+    assert _connector(store, factory).fetch() == 1
+
+    (post,) = _posts(factory)
+    assert (post.title, post.body, post.symbols) == ("title", "body", ["NIO"])
+    assert post.raw["flair"] == "DD"
 
 
 @pytest.mark.parametrize(
