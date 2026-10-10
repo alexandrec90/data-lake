@@ -111,9 +111,14 @@ def plain(value: Any) -> Any:
     Nulls arrive as ``None``, ``NaN`` (an integer column with a gap reads as float) or
     ``NaT``; lists arrive as numpy arrays; numbers as numpy scalars; timestamps as
     ``pd.Timestamp``.
+
+    NUL characters are dropped from text: Postgres ``text`` and ``jsonb`` refuse them, and
+    one scraped 2020 comment carrying a NUL failed its whole batch on every run.
     """
     if value is None or value is pd.NaT:
         return None
+    if isinstance(value, str):
+        return value.replace("\x00", "")
     if isinstance(value, (pd.Timestamp, datetime)):
         return as_utc(value)
     if isinstance(value, (np.ndarray, list, tuple)):
