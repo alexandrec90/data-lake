@@ -354,7 +354,11 @@ def test_missing_dataset_raises_naming_the_store(tmp_path):
     assert isinstance(raised.value, RuntimeError)  # a consumer's job health sees a failure
 
 
-def test_listed_partition_missing_from_store_raises_and_writes_nothing(tmp_path):
+def test_listed_partition_missing_from_store_raises_and_keeps_what_came_before(tmp_path):
+    """Each partition is committed: a run that stops partway -- this error, an OOM kill,
+    a redeploy -- keeps the partitions before it, and the next run resumes after them.
+    ibkr_trader's poll read 17.3M rows in one transaction and was killed before it ever
+    committed, so every restart started the whole backlog again."""
     store, factory = LocalDirStore(tmp_path), _session_factory()
     _export(store, [_post("reddit", "a", fetched=T0 - timedelta(minutes=5))], now=T0)
     (gone,) = _export(
@@ -366,7 +370,42 @@ def test_listed_partition_missing_from_store_raises_and_writes_nothing(tmp_path)
 
     with pytest.raises(RuntimeError, match="no such object"):
         _connector(store, factory).fetch()
-    assert _posts(factory) == []  # the earlier partition rolled back with it
+    assert [p.external_id for p in _posts(factory)] == ["a"]
+
+
+def test_each_partition_is_committed_before_the_next_is_read(tmp_path, monkeypatch):
+    store, factory = LocalDirStore(tmp_path), _session_factory()
+    day = timedelta(days=1)
+    keys = _export(
+        store,
+        [
+            _post("reddit", "a", fetched=T0 - timedelta(minutes=5)),
+            _post("reddit", "b", fetched=T0 - timedelta(minutes=5), created_at=CREATED + day),
+        ],
+        now=T0,
+    )
+    commits: list[str] = []
+    reads: list[str] = []
+
+    @contextmanager
+    def spying_factory() -> Iterator[Session]:
+        with factory() as session:
+            real_commit = session.commit
+            monkeypatch.setattr(
+                session, "commit", lambda: (commits.append(reads[-1]), real_commit())[1]
+            )
+            yield session
+
+    real_get = store.get_bytes
+
+    def spy(key: str) -> bytes:
+        if key.endswith(".parquet"):
+            reads.append(key)
+        return real_get(key)
+
+    monkeypatch.setattr(store, "get_bytes", spy)
+    assert _connector(store, spying_factory).fetch() == 2
+    assert commits[: len(keys)] == keys, "committed after each partition, in read order"
 
 
 class _NoSuchKey(Exception):

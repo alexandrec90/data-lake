@@ -36,6 +36,14 @@ manifest is never removed, so the error cannot flap.
 outage, or a bulk import on social-scraper's side that rewrites many days at once — so each
 is flushed and released before the next is read. Holding every post until the end grew a
 consumer's scheduler to three quarters of its Docker VM's memory.
+
+**Committed per partition.** One bulk import rewrote 3,650 partitions holding 17.3M rows;
+read in one transaction, the run took longer than the consumer's scheduler stayed up, so
+every restart threw the run away and began it again, and its lock set deadlocked the
+consumer's pruning. Resuming is safe because partitions are read oldest export first and a
+row's ``fetched_at`` is stamped before the export that writes it: the watermark a committed
+partition leaves is never past the export stamp of one still to read, so the next run
+selects every partition this one did not finish.
 """
 
 import logging
@@ -212,10 +220,10 @@ class SocialScraperConnector(Connector):
             selected = select_partitions(manifest, _watermarks(session), wanted, lookback)
             for key, entry in selected:
                 count += self._load_partition(session, key, entry, wanted, {})
-                # Write the partition and let go of its posts before reading the next, so
-                # memory stays one partition deep however many a run selects. Still one
-                # transaction: a failure later in the run rolls this partition back too.
-                session.flush()
+                # Commit the partition and let go of its posts before reading the next, so
+                # memory stays one partition deep and a run that stops partway keeps what
+                # it loaded (see "Committed per partition" above).
+                session.commit()
                 session.expunge_all()
         logger.info(
             "social-scraper: %d row(s) upserted from %d of %d partition(s)",
@@ -238,7 +246,7 @@ class SocialScraperConnector(Connector):
         except KeyError:
             raise RuntimeError(
                 f"{DATASET} manifest lists {key!r} but the archive has no such object; "
-                "re-export it from social-scraper (nothing from this run was written)"
+                "re-export it from social-scraper (the partitions before it were kept)"
             ) from None
         rows = [
             row
