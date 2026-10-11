@@ -9,7 +9,9 @@ requires-python = ">=3.11"
 # alphalens-reloaded needs pandas<3). Dependabot moves the lock only; see
 # .github/dependabot.yml.
 dependencies = [
-    "SQLAlchemy>=2.0",
+    # Lowercase, as Dependabot names it: its updater matches the declaration
+    # case-sensitively, and "SQLAlchemy" failed every weekly uv job on sqlalchemy.
+    "sqlalchemy>=2.0",
     "pandas>=2.2",
     "httpx>=0.27",
     # Connector clients. Imported lazily inside the connectors that need them (so importing
