@@ -13,6 +13,17 @@ live response, 2026-10-08). What that response showed, and what the parsing belo
 - ``totalSharesValue`` is ``0`` when unknown, which is stored as None, not as a $0 deal.
 - One company can appear twice in a response (a withdrawn registration and its refiling, same
   day). Rows sharing a key collapse to the latest date, then the more advanced stage.
+
+**History and the row cap.** The free plan serves the calendar back to at least 2010, but one
+response holds at most ``MAX_ROWS_PER_CALL`` rows — the *latest* ones, with nothing saying the
+rest were dropped (checked 2026-10-10: 2020-07-01..2020-12-31 returned 200 rows, the oldest
+dated 2020-10-09). So a window whose response fills the cap is split in half and both halves
+re-asked, down to a single day; a backfill is just ``fetch`` over a long window. Calls are
+paced under the free plan's 60/minute.
+
+Finnhub reports a SPAC under its **unit** ticker (``CONXU``, ``NBA'U``), and some SPAC rows
+carry the name of the company the SPAC later merged with (``SoFi Technologies, Inc.`` under
+``IPOEU``). Rows are stored as Finnhub sends them; ``ipo_pricing`` decides which are listings.
 """
 
 import logging
@@ -22,9 +33,11 @@ from typing import Any
 
 import httpx
 
-from data_lake.ingestion.base import Connector, stable_hash
+from data_lake.ingestion.base import Connector, SessionFactory, stable_hash
 from data_lake.ingestion.market.ipo_common import upsert_ipo_event
+from data_lake.ingestion.market.sec_edgar import Pacer
 from data_lake.ingestion.news.finnhub_news import FinnhubProviderError
+from data_lake.settings import LakeSettings
 
 __all__ = ["FinnhubIpoCalendarConnector", "FinnhubProviderError"]
 
@@ -35,6 +48,15 @@ BASE_URL = "https://finnhub.io/api/v1"
 #: Default window: a week back catches late status changes, 90 days forward the pipeline.
 DEFAULT_LOOKBACK_DAYS = 7
 DEFAULT_LOOKAHEAD_DAYS = 90
+
+#: The most rows one /calendar/ipo response returns; a full response may have dropped some.
+MAX_ROWS_PER_CALL = 200
+
+#: 1.1 s apart: under the free plan's 60 calls/minute with room for clock jitter.
+MIN_REQUEST_INTERVAL_SECONDS = 1.1
+
+#: Module-level on purpose: Finnhub's limit is per key, so every instance shares one budget.
+_PACER = Pacer(MIN_REQUEST_INTERVAL_SECONDS)
 
 #: Finnhub status -> ipo_events.stage. An unlisted status is skipped with a warning rather
 #: than guessed into the vocabulary.
@@ -169,19 +191,55 @@ def _default_window() -> tuple[str, str]:
 class FinnhubIpoCalendarConnector(Connector):
     name = "finnhub"
 
+    def __init__(
+        self,
+        settings: LakeSettings | None = None,
+        session_factory: SessionFactory | None = None,
+        pacer: Pacer | None = None,
+    ) -> None:
+        super().__init__(settings=settings, session_factory=session_factory)
+        self._pacer = pacer or _PACER
+
     def fetch(self, date_from: str = "", date_to: str = "", **kwargs) -> int:
-        """Upsert every calendar row dated within the window. Returns rows upserted."""
+        """Upsert every calendar row dated within the window. Returns rows upserted.
+
+        Any window length works: one that fills a response is split until none does, so a
+        historical backfill is ``fetch(date_from="2013-01-01", date_to=...)``. The whole
+        window is one transaction, written only once every request has succeeded.
+        """
         settings = self.settings
         if not settings.finnhub_key:
             raise RuntimeError("FINNHUB_KEY is not set (see .env.example)")
         default_from, default_to = _default_window()
-        window_from = date_from or default_from
-        window_to = date_to or default_to
         # Validate the format loudly rather than letting Finnhub silently return [].
-        date.fromisoformat(window_from)
-        date.fromisoformat(window_to)
+        window_from = date.fromisoformat(date_from or default_from)
+        window_to = date.fromisoformat(date_to or default_to)
 
-        response = _get_ipo_calendar(window_from, window_to, settings.finnhub_key)
+        rows = _collapse(self._calendar(window_from, window_to, settings.finnhub_key))
+        now = datetime.now(UTC)
+        with self.session() as session:
+            for key, fields in rows.items():
+                upsert_ipo_event(session, self.name, key, fields, now)
+        return len(rows)
+
+    def _calendar(self, date_from: date, date_to: date, api_key: str) -> list[Any]:
+        """Every row dated ``date_from..date_to``, halving any window that fills a response."""
+        items = self._request(date_from, date_to, api_key)
+        if len(items) < MAX_ROWS_PER_CALL:
+            return items
+        if date_from >= date_to:
+            logger.warning(
+                "finnhub ipo calendar: %s alone fills a response; rows may be missing", date_from
+            )
+            return items
+        middle = date_from + (date_to - date_from) // 2
+        return self._calendar(date_from, middle, api_key) + self._calendar(
+            middle + timedelta(days=1), date_to, api_key
+        )
+
+    def _request(self, date_from: date, date_to: date, api_key: str) -> list[Any]:
+        self._pacer.wait()
+        response = _get_ipo_calendar(date_from.isoformat(), date_to.isoformat(), api_key)
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -195,13 +253,7 @@ class FinnhubIpoCalendarConnector(Connector):
         items = payload.get("ipoCalendar") if isinstance(payload, dict) else None
         if not isinstance(items, list):
             raise FinnhubProviderError("unexpected Finnhub IPO-calendar response shape")
-
-        rows = _collapse(items)
-        now = datetime.now(UTC)
-        with self.session() as session:
-            for key, fields in rows.items():
-                upsert_ipo_event(session, self.name, key, fields, now)
-        return len(rows)
+        return items
 
 
 def _get_ipo_calendar(date_from: str, date_to: str, api_key: str) -> httpx.Response:
