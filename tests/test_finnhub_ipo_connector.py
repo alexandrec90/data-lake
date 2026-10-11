@@ -102,6 +102,7 @@ class FakeResponse:
 def finnhub(monkeypatch):
     """Serve queued payloads, recording each request's params."""
     monkeypatch.setattr(SETTINGS, "finnhub_key", "test-key")
+    monkeypatch.setattr(fi, "_PACER", fi.Pacer(0))
     state = SimpleNamespace(payloads=[], calls=[])
 
     def fake_get(url, params, headers, timeout):
@@ -263,6 +264,68 @@ def test_default_and_explicit_windows(finnhub):
     span = date.fromisoformat(default["to"]) - date.fromisoformat(default["from"])
     assert span.days == fi.DEFAULT_LOOKBACK_DAYS + fi.DEFAULT_LOOKAHEAD_DAYS
     assert explicit == {"from": "2026-01-01", "to": "2026-03-31"}
+
+
+def _deals(count: int, day: str, prefix: str) -> list[dict]:
+    return [{**TREX_EXPECTED, "date": day, "name": f"{prefix} Deal {n} Inc."} for n in range(count)]
+
+
+def test_a_full_response_is_split_until_none_is_full(finnhub):
+    """Finnhub silently drops the oldest rows past the cap, so a full window is re-asked."""
+    session_cm = make_session_scope()
+    _serve(finnhub, *_deals(fi.MAX_ROWS_PER_CALL, "2020-12-01", "Late"))  # the truncated whole
+    _serve(finnhub, *_deals(150, "2020-02-01", "Early"))
+    _serve(finnhub, *_deals(120, "2020-12-01", "Late"))
+
+    count = fi.FinnhubIpoCalendarConnector(session_factory=session_cm).fetch(
+        date_from="2020-01-01", date_to="2020-12-31"
+    )
+
+    assert count == 270
+    assert finnhub.calls == [
+        {"from": "2020-01-01", "to": "2020-12-31"},
+        {"from": "2020-01-01", "to": "2020-07-01"},
+        {"from": "2020-07-02", "to": "2020-12-31"},
+    ]
+
+
+def test_a_single_day_that_fills_a_response_is_kept_with_a_warning(finnhub, caplog):
+    _serve(finnhub, *_deals(fi.MAX_ROWS_PER_CALL, "2021-03-01", "Busy"))
+
+    count = fi.FinnhubIpoCalendarConnector(session_factory=make_session_scope()).fetch(
+        date_from="2021-03-01", date_to="2021-03-01"
+    )
+
+    assert count == fi.MAX_ROWS_PER_CALL
+    assert len(finnhub.calls) == 1
+    assert "rows may be missing" in caplog.text
+
+
+def test_a_failed_half_writes_nothing(finnhub):
+    session_cm = make_session_scope()
+    _serve(finnhub, *_deals(fi.MAX_ROWS_PER_CALL, "2020-12-01", "Late"))
+    _serve(finnhub, *_deals(10, "2020-02-01", "Early"))
+    _serve(finnhub, status_code=429)
+
+    with pytest.raises(fi.FinnhubProviderError, match="HTTP 429"):
+        fi.FinnhubIpoCalendarConnector(session_factory=session_cm).fetch(
+            date_from="2020-01-01", date_to="2020-12-31"
+        )
+    assert _rows(session_cm) == []
+
+
+def test_requests_are_paced(finnhub):
+    waits: list[str] = []
+    pacer = SimpleNamespace(wait=lambda: waits.append("wait"))
+    _serve(finnhub, *_deals(fi.MAX_ROWS_PER_CALL, "2020-12-01", "Late"))
+    _serve(finnhub)
+    _serve(finnhub)
+
+    fi.FinnhubIpoCalendarConnector(session_factory=make_session_scope(), pacer=pacer).fetch(
+        date_from="2020-01-01", date_to="2020-12-31"
+    )
+
+    assert waits == ["wait"] * 3
 
 
 def test_bad_date_raises(finnhub):

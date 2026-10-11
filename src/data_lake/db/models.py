@@ -74,6 +74,12 @@ class Instrument(Base):
     # `.info`, refreshed on each fundamentals ingest. Static-ish; not a point-in-time record.
     sector: Mapped[str | None] = mapped_column(String(128))
     industry: Mapped[str | None] = mapped_column(String(128))
+    #: The earliest date this security is known to have traded, under any ticker: a lower
+    #: bound on its age, None when unknown. Written by ``ingestion.market.listing_dates`` and
+    #: ``ingestion.market.ipo_pricing``, only ever moved *earlier*. Too late is the harmful
+    #: error — an old company would pass for a fresh listing — so a source that might be late
+    #: is not used at all, and the value is never later than the instrument's first stored bar.
+    listed_on: Mapped[date | None] = mapped_column(Date)
 
 
 class PriceBar(Base):
@@ -415,6 +421,13 @@ class IpoEvent(Base):
 
     ``stage`` is one of ``filed`` | ``amended`` | ``expected`` | ``priced`` | ``withdrawn``;
     the provider's own status or form type stays in ``raw``/``form_type``.
+
+    Pricing columns, filled by ``ingestion.market.ipo_pricing`` on ``finnhub`` ``priced`` rows
+    and mirroring ``IndexMembership``'s: ``instrument_id`` is the instrument whose bars price
+    the listing (None until resolved); ``resolution`` says how (``yahoo`` |
+    ``tiingo:<ticker>`` | ``unpriced`` | ``excluded:<reason>``, the last for a row that is not
+    a listing of common shares or ADRs — a SPAC, a unit); ``resolved_at`` is when. The IPO
+    cohort is the rows with ``instrument_id`` set.
     """
 
     __tablename__ = "ipo_events"
@@ -446,6 +459,9 @@ class IpoEvent(Base):
     #: "when did we know" that ``filed_at`` (a regulatory date) is not.
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    instrument_id: Mapped[int | None] = mapped_column(ForeignKey("instruments.id"))
+    resolution: Mapped[str | None] = mapped_column(String(64))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class SocialPost(Base):

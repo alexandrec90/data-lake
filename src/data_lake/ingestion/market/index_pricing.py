@@ -79,6 +79,7 @@ __all__ = [
     "covers_partially",
     "final_symbol",
     "load_renames",
+    "probe_yahoo",
     "resolve_index_prices",
 ]
 
@@ -335,7 +336,12 @@ def _ticker_missing(error: BaseException | None) -> bool:
     return isinstance(error, YFTickerMissingError)
 
 
-def _probe_yahoo(symbol: str, start: date, need_to: date) -> list[dict[str, Any]]:
+def probe_yahoo(symbol: str, start: date, need_to: date) -> list[dict[str, Any]]:
+    """Yahoo's adjusted daily bars for ``start..need_to``; ``[]`` for a ticker Yahoo lacks.
+
+    Nothing is stored: a caller judges the series first, so a dead or reused ticker never
+    leaves an instrument behind.
+    """
     yahoo_common.throttle()
     try:
         frame = yahoo._download_within_timeout(
@@ -552,7 +558,7 @@ class _Run:
         self.report.unpriced += 1
 
     def _try_yahoo(self, window: _Window) -> _Candidate | None:
-        values = _probe_yahoo(window.provider_symbol, window.fetch_from, window.need_to)
+        values = probe_yahoo(window.provider_symbol, window.fetch_from, window.need_to)
         fit = window.fit(_values_series(values, window))
         if fit is None:
             return None

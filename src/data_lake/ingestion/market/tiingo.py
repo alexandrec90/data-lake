@@ -17,8 +17,11 @@ Docs: https://www.tiingo.com/documentation/end-of-day
 import csv
 import io
 import json
+import os
+import time
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -137,6 +140,44 @@ def _utcnow() -> datetime:
     return datetime.now(tz=UTC)
 
 
+#: How long to wait for another process's hold on the ledger file before giving up.
+LEDGER_LOCK_TIMEOUT_SECONDS = 10.0
+#: A lock file older than this was left by a process that died holding it.
+LEDGER_LOCK_STALE_SECONDS = 60.0
+
+
+@contextmanager
+def _ledger_lock(path: Path) -> Iterator[None]:
+    """Hold ``<path>.lock`` for the duration: created exclusively, so one process at a time.
+
+    A lock file is the one cross-platform exclusive primitive in the stdlib. A holder only
+    reads and rewrites a small JSON file, so a lock older than ``LEDGER_LOCK_STALE_SECONDS``
+    belongs to a dead process and is broken rather than waited on.
+    """
+    lock = path.with_name(path.name + ".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + LEDGER_LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > LEDGER_LOCK_STALE_SECONDS:
+                    lock.unlink(missing_ok=True)
+                    continue
+            except FileNotFoundError:
+                continue  # released between the open and the stat
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"Tiingo usage ledger lock {lock} is held") from None
+            time.sleep(0.02)
+    try:
+        yield
+    finally:
+        os.close(fd)
+        lock.unlink(missing_ok=True)
+
+
 class TiingoUsage:
     """Request ledger that refuses a call before Tiingo's free-tier quota would.
 
@@ -144,6 +185,10 @@ class TiingoUsage:
     are *rolling* windows, which is stricter than a calendar bucket (45 requests at 10:59
     plus 45 at 11:00 would be 90 inside one hour). Persisted as JSON when ``path`` is set, so
     separate processes on one machine share the budget; in memory otherwise.
+
+    Sharing means re-reading: ``check`` and ``record`` reload the file under a lock file,
+    and ``record`` replaces it atomically, so a CLI run beside the scheduler — two ledgers on
+    one file — adds to the other's counts instead of overwriting them.
     """
 
     def __init__(
@@ -185,7 +230,20 @@ class TiingoUsage:
             "symbols": sorted(self._symbols),
             "requests": [ts.isoformat() for ts in self._requests],
         }
-        self.path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        staging = self.path.with_name(self.path.name + ".tmp")
+        staging.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        os.replace(staging, self.path)  # a reader never sees a half-written ledger
+
+    @contextmanager
+    def _shared(self) -> Iterator[None]:
+        """Hold the file's lock with this ledger refreshed from it (no-op in memory)."""
+        if self.path is None:
+            yield
+            return
+        with _ledger_lock(self.path):
+            if self.path.exists():
+                self._load(self.path)
+            yield
 
     def _roll(self, now: datetime) -> None:
         month = now.strftime("%Y-%m")
@@ -197,6 +255,10 @@ class TiingoUsage:
 
     def check(self, symbol: str) -> None:
         """Raise :class:`TiingoBudgetExhausted` if requesting ``symbol`` now would overrun."""
+        with self._shared():
+            self._check(symbol)
+
+    def _check(self, symbol: str) -> None:
         now = self._clock()
         self._roll(now)
         symbol = symbol.upper()
@@ -216,11 +278,12 @@ class TiingoUsage:
 
     def record(self, symbol: str) -> None:
         """Count one request for ``symbol`` (and the symbol against the monthly budget)."""
-        now = self._clock()
-        self._roll(now)
-        self._symbols.add(symbol.upper())
-        self._requests.append(now)
-        self._save()
+        with self._shared():
+            now = self._clock()
+            self._roll(now)
+            self._symbols.add(symbol.upper())
+            self._requests.append(now)
+            self._save()
 
 
 def _get_prices(ticker: str, params: dict[str, str], token: str) -> httpx.Response:

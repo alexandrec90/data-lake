@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import zipfile
 from datetime import UTC, date, datetime, timedelta
 
@@ -156,6 +157,55 @@ def test_usage_persists_to_json_and_reloads(tmp_path):
     second = tiingo.TiingoUsage(path, monthly_symbols=1, clock=clock)
     with pytest.raises(tiingo.TiingoBudgetExhausted):
         second.check("BBB")
+
+
+def test_two_live_ledgers_on_one_file_keep_both_counts(tmp_path):
+    """A CLI run beside the scheduler: each process holds its own ledger on the same file."""
+    path = tmp_path / "tiingo-usage.json"
+    clock = _Clock(datetime(2026, 10, 6, 10, tzinfo=UTC))
+    scheduler = tiingo.TiingoUsage(path, clock=clock)
+    cli = tiingo.TiingoUsage(path, clock=clock)
+
+    scheduler.record("AAA")
+    cli.record("BBB")
+    scheduler.record("CCC")
+
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert state["symbols"] == ["AAA", "BBB", "CCC"]
+    assert len(state["requests"]) == 3
+
+
+def test_a_ledger_checks_against_what_another_one_recorded(tmp_path):
+    path = tmp_path / "tiingo-usage.json"
+    clock = _Clock(datetime(2026, 10, 6, 10, tzinfo=UTC))
+    scheduler = tiingo.TiingoUsage(path, monthly_symbols=1, clock=clock)
+    cli = tiingo.TiingoUsage(path, monthly_symbols=1, clock=clock)
+
+    cli.record("AAA")
+
+    with pytest.raises(tiingo.TiingoBudgetExhausted, match="monthly"):
+        scheduler.check("BBB")
+
+
+def test_the_ledger_lock_is_released_and_a_stale_one_is_broken(tmp_path):
+    path = tmp_path / "tiingo-usage.json"
+    lock = path.with_name(path.name + ".lock")
+    lock.write_text("", encoding="utf-8")  # left behind by a killed process
+    stale = datetime.now(UTC).timestamp() - tiingo.LEDGER_LOCK_STALE_SECONDS - 1
+    os.utime(lock, (stale, stale))
+
+    tiingo.TiingoUsage(path).record("AAA")
+
+    assert not lock.exists()
+
+
+def test_a_held_ledger_lock_times_out(tmp_path, monkeypatch):
+    path = tmp_path / "tiingo-usage.json"
+    path.with_name(path.name + ".lock").write_text("", encoding="utf-8")
+    monkeypatch.setattr(tiingo, "LEDGER_LOCK_TIMEOUT_SECONDS", 0.05)
+
+    with pytest.raises(TimeoutError, match="ledger lock"):
+        tiingo.TiingoUsage(path).record("AAA")
 
 
 def test_usage_refuses_a_corrupt_ledger(tmp_path):
