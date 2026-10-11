@@ -1,11 +1,17 @@
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 
-from sqlalchemy import create_engine, event, select
+from sqlalchemy import create_engine, event, func, select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from data_lake.db.models import Base, Instrument, PriceBar
-from data_lake.ingestion.market.bars import upsert_daily_bars
+from data_lake.ingestion.market.bars import (
+    LATEST_BAR_LOOKBACKS,
+    bar_ts_since,
+    latest_bar_ts,
+    upsert_daily_bars,
+)
 from data_lake.ingestion.market.yahoo_common import daily_ts
 
 
@@ -114,3 +120,73 @@ def test_empty_values_write_nothing():
     engine = _engine()
     with Session(engine) as session:
         assert upsert_daily_bars(session, _instrument(session), iter([]), source="yahoo") == 0
+
+
+_NOW = datetime(2026, 10, 11, 12, tzinfo=UTC)
+
+
+def _newest_after_seeding(*ages_days: int) -> tuple[datetime | None, list[str]]:
+    """Seed one yahoo bar per age, run ``latest_bar_ts``, return its answer and its SELECTs."""
+    engine = _engine()
+    with Session(engine) as session:
+        instrument_id = _instrument(session)
+        days = [(_NOW - timedelta(days=age)).date() for age in ages_days]
+        upsert_daily_bars(session, instrument_id, [_bar(day, 10.0) for day in days], source="yahoo")
+        session.commit()
+
+        selects: list[str] = []
+
+        @event.listens_for(engine, "before_cursor_execute")
+        def _record(conn, cursor, statement, *args):
+            selects.append(statement)
+
+        newest = latest_bar_ts(
+            session,
+            select(func.max(PriceBar.ts)).where(PriceBar.instrument_id == instrument_id),
+            now=_NOW,
+        )
+    return newest, selects
+
+
+def test_latest_bar_ts_answers_from_the_nearest_window_in_one_query():
+    newest, selects = _newest_after_seeding(3, 20, 900)
+    assert newest is not None
+    assert newest.date() == (_NOW - timedelta(days=3)).date()
+    assert len(selects) == 1
+    cutoff = (_NOW - LATEST_BAR_LOOKBACKS[0]).strftime("%Y-%m-%d %H:%M:%S")
+    assert cutoff in selects[0]  # written into the SQL, not bound: see bar_ts_since
+
+
+def test_latest_bar_ts_widens_the_window_before_it_scans_everything():
+    newest, selects = _newest_after_seeding(200)
+    assert newest is not None
+    assert newest.date() == (_NOW - timedelta(days=200)).date()
+    assert len(selects) == 2
+
+
+def test_latest_bar_ts_falls_back_to_the_unbounded_query():
+    newest, selects = _newest_after_seeding(900)
+    assert newest is not None
+    assert newest.date() == (_NOW - timedelta(days=900)).date()
+    assert len(selects) == len(LATEST_BAR_LOOKBACKS) + 1
+    assert ">=" not in selects[-1]
+
+
+def test_latest_bar_ts_is_none_for_a_series_with_no_bars():
+    newest, selects = _newest_after_seeding()
+    assert newest is None
+    assert len(selects) == len(LATEST_BAR_LOOKBACKS) + 1
+
+
+def test_bar_ts_since_is_a_constant_postgres_can_exclude_chunks_by():
+    cutoff = datetime(2026, 9, 1, tzinfo=UTC)
+    statement = select(func.max(PriceBar.ts)).where(
+        PriceBar.instrument_id == 7, bar_ts_since(cutoff)
+    )
+    sql = str(
+        statement.compile(
+            dialect=postgresql.psycopg.dialect(), compile_kwargs={"render_postcompile": True}
+        )
+    )
+    assert "price_bars.ts >= '2026-09-01 00:00:00+00:00'" in sql
+    assert "%(instrument_id_1)s" in sql  # the other filters stay bound parameters

@@ -50,9 +50,11 @@ a database. `data_lake.testing.lake_settings(**overrides)` gives tests a setting
 
 ## Schema
 
-`data_lake.db.models` declares the shareable tables — instruments, price bars, dividends, share
-counts, fundamentals, earnings, features, news articles, social posts, trend points — against
-`data_lake.db.base.Base`.
+`data_lake.db.models` declares the shareable tables — instruments, price bars, dividends, stock
+splits, share counts, fundamentals, earnings (with EPS estimates and actuals), announced corporate
+events, IPO events, SEC XBRL facts, macro observations, scheduled economic events (FRED release
+calendar, FOMC meetings, Bank of Canada rate announcements), features, news articles, social
+posts, listings, trend points — against `data_lake.db.base.Base`.
 
 **The consumer owns its own migrations.** Declare your private tables against the same `Base` and
 a single `Base.metadata` still covers everything Alembic needs to see.

@@ -22,13 +22,25 @@ With only two storage PCs, a `001` write needs both up: while one is off the arc
 reads but does not accept new files. That was the accepted trade for not running a third
 coordinator.
 
+A bucket can be pinned to one node (`configure-buckets --pin raw-dumps=IP`), so the dumps
+that fill a small drive land on a big one. The pin is kept in `pins.json` beside
+`node.json`, so a later `configure-buckets` re-applies it rather than dropping it. Pin a
+bucket before it has volumes elsewhere: the master hands out an existing writable volume
+before growing one on the pinned node, so until those are deleted every write fails.
+
+The filer's index -- which chunks make up which key -- exists on the primary only, so
+every node's supervisor saves a copy of it daily to its own `meta/`, the volume nodes over
+the tailnet. If the primary's drive dies, a volume node still holds the bytes (`001`) and
+the index: a new primary restores it with `fs.meta.load` in `weed shell`.
+
 Subcommands:
 
     install --role primary|volume [--primary IP]   download weed, write config, start
     firewall                                        print the one admin-only step
     status [--primary IP]                           every node, its volumes and free slots
-    configure-buckets                               primary only: create buckets, placement
+    configure-buckets [--pin BUCKET=IP]             primary only: create buckets, placement
     credentials                                     primary only: the consumer .env lines
+    backup-meta                                     save the filer index to this node now
     run                                             the supervisor the logon task starts
     stop                                            stop the supervisor and weed
 
@@ -80,6 +92,7 @@ DEFAULT_REPLICATION = "001"
 BUCKETS = {"data-lake": "001", "raw-dumps": "000"}
 RESTART_DELAY_S = 10
 META_BACKUP_EVERY_S = 24 * 3600
+META_KEEP = 7
 
 
 @dataclass(frozen=True)
@@ -156,15 +169,38 @@ def new_credentials() -> tuple[str, str]:
     return secrets.token_hex(10).upper(), secrets.token_urlsafe(30)
 
 
-def bucket_script(buckets: dict[str, str]) -> str:
-    """`weed shell` input creating each bucket and pinning its placement."""
+def bucket_script(buckets: dict[str, str], pins: dict[str, str] | None = None) -> str:
+    """`weed shell` input creating each bucket and setting its placement.
+
+    `pins` maps a bucket to the Tailscale IP of the one node its new volumes go to.
+    `fs.configure` replaces a prefix's whole rule, so an unpinned bucket's rule is written
+    without `-dataNode` and a pin removed from `pins` is removed from the pool too.
+    """
+    pins = pins or {}
     lines = []
     for name, replication in buckets.items():
         lines.append(f"s3.bucket.create -name {name}")
-        lines.append(
-            f"fs.configure -locationPrefix=/buckets/{name}/ -replication={replication} -apply"
-        )
+        rule = f"fs.configure -locationPrefix=/buckets/{name}/ -replication={replication}"
+        if name in pins:
+            rule += f" -dataNode={pins[name]}:{VOLUME_PORT}"
+        lines.append(f"{rule} -apply")
     return "\n".join(lines) + "\n"
+
+
+def merge_pins(
+    saved: dict[str, str], requested: list[str], buckets: dict[str, str]
+) -> dict[str, str]:
+    """Apply `--pin BUCKET=IP` arguments to the saved pins; `BUCKET=` removes one."""
+    pins = dict(saved)
+    for item in requested:
+        name, sep, ip = item.partition("=")
+        if not sep or name not in buckets:
+            raise ValueError(f"--pin wants BUCKET=IP with BUCKET one of {sorted(buckets)}")
+        if ip:
+            pins[name] = ip
+        else:
+            pins.pop(name, None)
+    return pins
 
 
 def env_lines(node: Node, access_key: str, secret_key: str) -> list[str]:
@@ -286,7 +322,7 @@ def install(role: str, primary: str | None, home: Path = HOME) -> Node:
 
 
 def shell_args(node: Node, home: Path) -> list[str]:
-    """`weed shell` against this primary, naming the filer rather than discovering it.
+    """`weed shell` against the primary, naming the filer rather than discovering it.
 
     Discovery asks the master for a registered filer, and one that has not registered yet
     -- the first half-minute after a start -- fails as "dial tcp: missing address".
@@ -294,8 +330,8 @@ def shell_args(node: Node, home: Path) -> list[str]:
     return [
         str(_weed(home)),
         "shell",
-        f"-master={node.ip}:{MASTER_PORT}",
-        f"-filer={node.ip}:{FILER_PORT}",
+        f"-master={node.primary}:{MASTER_PORT}",
+        f"-filer={node.primary}:{FILER_PORT}",
     ]
 
 
@@ -313,11 +349,22 @@ def shell_failed(returncode: int, output: str) -> bool:
     return any(not line.endswith("already exists") for line in errors)
 
 
-def _backup_meta(node: Node, home: Path) -> None:
-    """Save the filer's metadata: without it the volumes are chunks with no names."""
+def stale_backups(meta_dir: Path, keep: int = META_KEEP) -> list[Path]:
+    """The saved indexes past the newest `keep`, oldest first."""
+    return sorted(meta_dir.glob("filer-*.meta"))[:-keep]
+
+
+def backup_meta(home: Path = HOME) -> Path:
+    """Save the filer's index to this node: without it the volumes are chunks with no names.
+
+    On a volume node this pulls over the tailnet, which is the point -- the copy is then
+    on a different drive from the primary's filer. A failed save leaves no file behind, so
+    a broken run never displaces a good copy from the ones kept.
+    """
+    node = _read_node(home)
     out = home / "meta" / f"filer-{time.strftime('%Y%m%d')}.meta"
     out.parent.mkdir(exist_ok=True)
-    subprocess.run(
+    result = subprocess.run(
         shell_args(node, home),
         # weed shell reads a backslash as an escape, so a Windows path loses every one.
         input=f"fs.meta.save -o={out.as_posix()}\n",
@@ -326,8 +373,13 @@ def _backup_meta(node: Node, home: Path) -> None:
         timeout=3600,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
-    for old in sorted(out.parent.glob("filer-*.meta"))[:-7]:
+    output = result.stdout + result.stderr
+    if shell_failed(result.returncode, output) or not out.is_file() or not out.stat().st_size:
+        out.unlink(missing_ok=True)
+        raise RuntimeError(f"fs.meta.save from {node.primary} failed: {output.strip()[-500:]}")
+    for old in stale_backups(out.parent):
         old.unlink()
+    return out
 
 
 def run(home: Path = HOME) -> None:
@@ -339,12 +391,13 @@ def run(home: Path = HOME) -> None:
         proc = subprocess.Popen(args, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         while proc.poll() is None:
             time.sleep(5)
-            if node.role == "primary" and time.monotonic() >= next_backup:
+            if time.monotonic() >= next_backup:
                 next_backup = time.monotonic() + META_BACKUP_EVERY_S
                 try:
-                    _backup_meta(node, home)
-                except (OSError, subprocess.SubprocessError):
-                    pass  # the next day's run tries again; the pool itself is unaffected
+                    backup_meta(home)
+                except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                    # The next day's run tries again; the pool itself is unaffected.
+                    _log_failure(f"backup-meta: {exc}")
         time.sleep(RESTART_DELAY_S)
 
 
@@ -361,13 +414,17 @@ def status(primary: str | None, home: Path = HOME) -> None:
         print(line)
 
 
-def configure_buckets(home: Path = HOME) -> None:
+def configure_buckets(pin: list[str], home: Path = HOME) -> None:
     node = _read_node(home)
     if node.role != "primary":
         raise RuntimeError("configure-buckets runs on the primary")
+    pins_file = home / "pins.json"
+    saved = json.loads(pins_file.read_text(encoding="utf-8")) if pins_file.exists() else {}
+    pins = merge_pins(saved, pin, BUCKETS)
+    pins_file.write_text(json.dumps(pins, indent=2), encoding="utf-8")
     out = subprocess.run(
         shell_args(node, home),
-        input=bucket_script(BUCKETS),
+        input=bucket_script(BUCKETS, pins),
         capture_output=True,
         text=True,
         timeout=120,
@@ -398,7 +455,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("firewall")
     p_status = sub.add_parser("status")
     p_status.add_argument("--primary")
-    for name in ("configure-buckets", "credentials", "run", "stop"):
+    p_buckets = sub.add_parser("configure-buckets")
+    p_buckets.add_argument(
+        "--pin", action="append", default=[], help="BUCKET=IP; BUCKET= unpins (repeatable)"
+    )
+    for name in ("credentials", "backup-meta", "run", "stop"):
         sub.add_parser(name)
     args = parser.parse_args(argv)
     # HOME is read here, not bound as each function's default, so a test can move it.
@@ -406,8 +467,9 @@ def main(argv: list[str] | None = None) -> int:
         "install": lambda: install(args.role, args.primary, HOME),
         "firewall": lambda: firewall(HOME),
         "status": lambda: status(args.primary, HOME),
-        "configure-buckets": lambda: configure_buckets(HOME),
+        "configure-buckets": lambda: configure_buckets(args.pin, HOME),
         "credentials": lambda: credentials(HOME),
+        "backup-meta": lambda: print(backup_meta(HOME)),
         "run": lambda: run(HOME),
         "stop": stop,
     }

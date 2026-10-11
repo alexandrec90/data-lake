@@ -125,7 +125,12 @@ social-scraper's export from the bucket — so a broken download is a real failu
 `S3ObjectStore.get_bytes` re-fetches an object whose body dies mid-read.
 
 Two buckets with different placements: `data-lake` (the archive) keeps **two copies on
-different PCs** (`001`); `raw-dumps` (downloaded source dumps, re-fetchable) keeps one.
+different PCs** (`001`); `raw-dumps` (downloaded source dumps, re-fetchable) keeps one,
+pinned to ML5F3PJ (`configure-buckets --pin`, saved in `pins.json`) so the dumps fill the
+larger drive. A pin only takes effect once the bucket has no writable volume on any other
+node: the master hands out an existing volume before it grows one on the pinned node, so
+pinning a bucket that already has volumes elsewhere fails writes as `no writable volumes`
+until the empty ones are deleted.
 
 What that costs, worth re-reading before assuming the pool is a backup:
 
@@ -133,8 +138,10 @@ What that costs, worth re-reading before assuming the pool is a backup:
   one node away, so writes to `data-lake` fail — loudly, as an S3 `InternalError` —
   while either desktop is off. Reads keep working. A third storage PC removes this.
 - **The filer index lives on the primary only.** The volumes hold the bytes on both PCs,
-  but the key → chunk mapping is the primary's; the supervisor saves it daily to
-  `%LOCALAPPDATA%/seaweedfs/meta`, which is on the same drive.
+  but the key → chunk mapping is the primary's. Every node's supervisor saves a copy daily
+  to its own `%LOCALAPPDATA%/seaweedfs/meta` (a volume node pulls it over the tailnet), so
+  losing the primary's drive costs at most a day of keys: a new primary restores the
+  newest copy with `fs.meta.load`.
 - **Verify-then-delete deletes for real.** `archive/bars.py` drops the rows once it has
   read the object back, so the archive is the only copy of everything past the window.
 
