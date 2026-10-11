@@ -22,11 +22,12 @@ from datetime import UTC, datetime, time, timedelta
 from typing import Any
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from data_lake.db.models import Instrument, PriceBar
 from data_lake.ingestion.base import Connector, SessionFactory, resolve_session_factory
+from data_lake.ingestion.market.bars import bar_ts_since
 
 logger = logging.getLogger(__name__)
 
@@ -234,10 +235,13 @@ def read_tickers_file(path: str) -> list[str]:
 def _has_fresh_bars(session: Session, av_symbol: str, refresh_after_days: float) -> bool:
     """True when the newest stored alpha_vantage bar for the symbol is younger than the
     cutoff — a re-fetch would only overwrite what's already there. ``what_to_show`` is
-    ignored on purpose: adjusted and fallback-unadjusted bars both count as downloaded."""
+    ignored on purpose: adjusted and fallback-unadjusted bars both count as downloaded.
+
+    Asks only whether a bar exists past the cutoff, bounded by :func:`bar_ts_since`, so it never
+    plans over the whole ``price_bars`` history (see :mod:`data_lake.ingestion.market.bars`)."""
     symbol, exchange, currency = _instrument_defaults(av_symbol)
-    newest = session.scalar(
-        select(func.max(PriceBar.ts))
+    fresh = session.scalar(
+        select(PriceBar.id)
         .join(Instrument, PriceBar.instrument_id == Instrument.id)
         .where(
             Instrument.symbol == symbol,
@@ -245,13 +249,11 @@ def _has_fresh_bars(session: Session, av_symbol: str, refresh_after_days: float)
             Instrument.currency == currency,
             PriceBar.bar_size == BAR_SIZE,
             PriceBar.source == AlphaVantageConnector.name,
+            bar_ts_since(datetime.now(UTC) - timedelta(days=refresh_after_days)),
         )
+        .limit(1)
     )
-    if newest is None:
-        return False
-    if newest.tzinfo is None:  # SQLite drops tzinfo on readback (Postgres keeps it)
-        newest = newest.replace(tzinfo=UTC)
-    return newest >= datetime.now(UTC) - timedelta(days=refresh_after_days)
+    return fresh is not None
 
 
 def fetch_universe(

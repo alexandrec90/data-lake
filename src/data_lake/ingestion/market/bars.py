@@ -1,20 +1,60 @@
-"""Bulk daily-bar upsert shared by the price connectors.
+"""Daily-bar reads and writes shared by the price connectors.
 
 A per-bar ``SELECT`` is fine for a daily incremental poll of a handful of symbols, and far too
 slow for a backfill of ~850 symbols x ~4,000 bars. :func:`upsert_daily_bars` instead preloads
 every existing row in the incoming range with one query and then updates or inserts in memory.
+
+:func:`latest_bar_ts` is the "where did this series stop" lookup every incremental poll starts
+from. On TimescaleDB, ``price_bars`` is a hypertable of ~790 monthly chunks (1961 onwards), and
+a query with no constant ``ts`` bound plans over every one of them: the backend opens each chunk,
+its compressed twin and their indexes, and keeps that catalog cache until it disconnects. One
+unbounded ``max(ts)`` grew a backend from 1.4 MB to 63 MB and took 14.8 s; the same lookup bounded
+to the last 35 days took 2 MB and 0.03 s. Four such backends at once got the 768m db container
+OOM-killed six times on 2026-10-10/11.
 """
 
 from collections.abc import Iterable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, DateTime, Select, literal, select
 from sqlalchemy.orm import Session
 
 from data_lake.db.models import PriceBar
 
-__all__ = ["upsert_daily_bars"]
+__all__ = ["LATEST_BAR_LOOKBACKS", "bar_ts_since", "latest_bar_ts", "upsert_daily_bars"]
+
+#: The windows :func:`latest_bar_ts` tries, nearest first, before it scans the whole history.
+#: A series polled on schedule always has a bar in the first; the second catches one paused for
+#: months. Only a series idle for over a year, or never stored, pays the unbounded scan.
+LATEST_BAR_LOOKBACKS = (timedelta(days=45), timedelta(days=400))
+
+
+def bar_ts_since(cutoff: datetime) -> ColumnElement[bool]:
+    """``PriceBar.ts >= cutoff``, with ``cutoff`` written into the SQL as a literal.
+
+    A literal, not a bound parameter, because chunk exclusion at plan time needs a constant: a
+    driver that prepares a repeated statement (psycopg does from its fifth run) can get a
+    generic plan, which plans over every chunk whatever the parameter's value.
+    """
+    return PriceBar.ts >= literal(cutoff, DateTime(timezone=True), literal_execute=True)
+
+
+def latest_bar_ts(
+    session: Session, query: Select[datetime], *, now: datetime | None = None
+) -> datetime | None:
+    """Run ``query`` -- a ``select(func.max(PriceBar.ts))`` with its filters -- cheaply.
+
+    Tries each of :data:`LATEST_BAR_LOOKBACKS` in turn, bounded by :func:`bar_ts_since`, and
+    falls back to ``query`` as given only when none of them holds a bar. The answer is the same
+    as running ``query`` alone; only the cost differs.
+    """
+    now = now or datetime.now(UTC)
+    for lookback in LATEST_BAR_LOOKBACKS:
+        found = session.scalar(query.where(bar_ts_since(now - lookback)))
+        if found is not None:
+            return found
+    return session.scalar(query)
 
 
 def _ts_key(ts: datetime) -> datetime:

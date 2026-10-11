@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from data_lake.db.models import Instrument, PriceBar
 from data_lake.ingestion.base import Connector
+from data_lake.ingestion.market.bars import latest_bar_ts
 
 BASE_URL = "https://financialmodelingprep.com/stable"
 FULL_EOD_PATH = "/historical-price-eod/full"
@@ -109,13 +110,14 @@ def _next_missing_date(
     source: str,
     what_to_show: str,
 ) -> date | None:
-    latest_ts = session.scalar(
+    latest_ts = latest_bar_ts(
+        session,
         select(func.max(PriceBar.ts)).where(
             PriceBar.instrument_id == instrument.id,
             PriceBar.bar_size == bar_size,
             PriceBar.source == source,
             PriceBar.what_to_show == what_to_show,
-        )
+        ),
     )
     if latest_ts is None:
         return None
