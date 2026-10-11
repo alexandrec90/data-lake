@@ -21,6 +21,7 @@ from sqlalchemy import func, select
 
 from data_lake.db.models import Instrument, PriceBar
 from data_lake.ingestion.base import Connector, SessionFactory, resolve_session_factory
+from data_lake.ingestion.market.bars import latest_bar_ts
 from data_lake.ingestion.market.fmp_fx import DEFAULT_PAIR, get_or_create_fx_instrument
 from data_lake.ingestion.market.yahoo import (
     _bar_values,
@@ -37,7 +38,8 @@ WHAT_TO_SHOW = "TRADES"
 def _next_missing_date(pair: str, session_factory: SessionFactory | None = None) -> date | None:
     """Day after the newest yahoo-source bar of the pair's CASH instrument (None = no bars)."""
     with resolve_session_factory(session_factory)() as session:
-        latest_ts = session.scalar(
+        latest_ts = latest_bar_ts(
+            session,
             select(func.max(PriceBar.ts))
             .join(Instrument, Instrument.id == PriceBar.instrument_id)
             .where(
@@ -46,7 +48,7 @@ def _next_missing_date(pair: str, session_factory: SessionFactory | None = None)
                 PriceBar.bar_size == BAR_SIZE,
                 PriceBar.source == "yahoo",
                 PriceBar.what_to_show == WHAT_TO_SHOW,
-            )
+            ),
         )
     if latest_ts is None:
         return None

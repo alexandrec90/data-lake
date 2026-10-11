@@ -30,7 +30,7 @@ from sqlalchemy.orm import Session
 
 from data_lake.db.models import Instrument, PriceBar
 from data_lake.ingestion.base import Connector, SessionFactory
-from data_lake.ingestion.market.bars import upsert_daily_bars
+from data_lake.ingestion.market.bars import latest_bar_ts, upsert_daily_bars
 from data_lake.ingestion.market.yahoo_common import daily_ts
 from data_lake.settings import LakeSettings
 
@@ -372,12 +372,13 @@ class TiingoConnector(Connector):
             instrument = find_instrument(session, ticker, exchange)
             if instrument is None:
                 return EARLIEST_DATE
-            latest = session.scalar(
+            latest = latest_bar_ts(
+                session,
                 select(func.max(PriceBar.ts)).where(
                     PriceBar.instrument_id == instrument.id,
                     PriceBar.source == self.name,
                     PriceBar.what_to_show == "ADJUSTED_LAST",
                     PriceBar.bar_size == "1 day",
-                )
+                ),
             )
         return latest.date() + timedelta(days=1) if latest else EARLIEST_DATE
