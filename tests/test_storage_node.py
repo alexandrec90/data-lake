@@ -110,10 +110,37 @@ def test_bucket_script_creates_then_places_each_bucket():
     ]
 
 
-def test_shell_names_the_filer_instead_of_discovering_it():
-    args = sn.shell_args(PRIMARY, HOME)
-    assert _flag(args, "filer") == f"{PRIMARY.ip}:{sn.FILER_PORT}"
-    assert _flag(args, "master") == f"{PRIMARY.ip}:{sn.MASTER_PORT}"
+def test_bucket_script_pins_only_the_named_bucket_to_its_node():
+    script = sn.bucket_script({"a": "001", "b": "000"}, {"b": "100.1.2.3"}).splitlines()
+    assert script[1] == "fs.configure -locationPrefix=/buckets/a/ -replication=001 -apply"
+    assert script[3] == (
+        "fs.configure -locationPrefix=/buckets/b/ -replication=000 "
+        f"-dataNode=100.1.2.3:{sn.VOLUME_PORT} -apply"
+    )
+
+
+def test_pins_are_added_replaced_and_removed():
+    buckets = {"a": "001", "b": "000"}
+    pins = sn.merge_pins({}, ["b=100.1.1.1"], buckets)
+    assert pins == {"b": "100.1.1.1"}
+    assert sn.merge_pins(pins, ["b=100.2.2.2"], buckets) == {"b": "100.2.2.2"}
+    assert sn.merge_pins(pins, ["b="], buckets) == {}
+    # No argument keeps what was saved: a plain re-run must not drop a pin.
+    assert sn.merge_pins(pins, [], buckets) == pins
+
+
+@pytest.mark.parametrize("item", ["b", "c=100.1.1.1"])
+def test_a_pin_on_no_known_bucket_is_refused(item):
+    with pytest.raises(ValueError, match="BUCKET=IP"):
+        sn.merge_pins({}, [item], {"a": "001", "b": "000"})
+
+
+@pytest.mark.parametrize("node", [PRIMARY, VOLUME])
+def test_shell_names_the_primarys_filer_instead_of_discovering_it(node):
+    """A volume node's shell goes to the primary too: that is how it pulls the index."""
+    args = sn.shell_args(node, HOME)
+    assert _flag(args, "filer") == f"{node.primary}:{sn.FILER_PORT}"
+    assert _flag(args, "master") == f"{node.primary}:{sn.MASTER_PORT}"
 
 
 @pytest.mark.parametrize(
@@ -312,22 +339,133 @@ def test_status_asks_the_named_primary_and_prints_the_topology(monkeypatch, caps
 
 def test_configure_buckets_refuses_a_volume_node(tmp_path):
     with pytest.raises(RuntimeError, match="primary"):
-        sn.configure_buckets(_home(tmp_path, VOLUME))
+        sn.configure_buckets([], _home(tmp_path, VOLUME))
 
 
 def test_configure_buckets_feeds_the_bucket_script_to_weed_shell(tmp_path, monkeypatch):
     calls = _Calls(returncode=1, stdout="error: bucket data-lake already exists\n")
     monkeypatch.setattr(sn.subprocess, "run", calls)
     home = _home(tmp_path, PRIMARY)
-    sn.configure_buckets(home)
+    sn.configure_buckets([], home)
     assert calls.argv == [sn.shell_args(PRIMARY, home)]
     assert calls.inputs == [sn.bucket_script(sn.BUCKETS)]
+
+
+def test_configure_buckets_keeps_a_pin_across_re_runs(tmp_path, monkeypatch):
+    """fs.configure replaces a rule whole, so a re-run that forgot the pin would undo it."""
+    calls = _Calls()
+    monkeypatch.setattr(sn.subprocess, "run", calls)
+    home = _home(tmp_path, PRIMARY)
+    sn.configure_buckets(["raw-dumps=100.100.229.119"], home)
+    sn.configure_buckets([], home)
+    pinned = sn.bucket_script(sn.BUCKETS, {"raw-dumps": "100.100.229.119"})
+    assert calls.inputs == [pinned, pinned]
+    assert json.loads((home / "pins.json").read_text(encoding="utf-8")) == {
+        "raw-dumps": "100.100.229.119"
+    }
 
 
 def test_configure_buckets_raises_when_weed_shell_reports_an_error(tmp_path, monkeypatch):
     monkeypatch.setattr(sn.subprocess, "run", _Calls(stdout="error: rpc error\n"))
     with pytest.raises(RuntimeError):
-        sn.configure_buckets(_home(tmp_path, PRIMARY))
+        sn.configure_buckets([], _home(tmp_path, PRIMARY))
+
+
+# --- filer index backup -----------------------------------------------------------
+
+
+def _saving(size: int, **result):
+    """A `subprocess.run` stand-in that writes `size` bytes where fs.meta.save was told to."""
+    calls = _Calls(**result)
+
+    def run(args, **kwargs):
+        target = kwargs["input"].split("-o=", 1)[1].strip()
+        Path(target).write_bytes(b"x" * size)
+        return calls(args, **kwargs)
+
+    return run, calls
+
+
+def test_backup_meta_pulls_the_primarys_index_onto_a_volume_node(tmp_path, monkeypatch):
+    run, calls = _saving(10)
+    monkeypatch.setattr(sn.subprocess, "run", run)
+    out = sn.backup_meta(_home(tmp_path, VOLUME))
+    assert out.parent == tmp_path / "meta" and out.stat().st_size == 10
+    assert calls.argv == [sn.shell_args(VOLUME, tmp_path)]
+    assert _flag(calls.argv[0], "filer").startswith(VOLUME.primary)
+
+
+@pytest.mark.parametrize(
+    ("size", "result"),
+    [(10, {"stdout": "error: rpc error: connection refused\n"}), (0, {})],
+)
+def test_a_failed_backup_raises_and_leaves_no_file(tmp_path, monkeypatch, size, result):
+    """An empty or errored save must not count as one of the copies kept."""
+    run, _ = _saving(size, **result)
+    monkeypatch.setattr(sn.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="fs.meta.save"):
+        sn.backup_meta(_home(tmp_path, VOLUME))
+    assert list((tmp_path / "meta").iterdir()) == []
+
+
+def test_only_the_newest_backups_are_kept(tmp_path):
+    for day in range(1, 11):
+        (tmp_path / f"filer-202610{day:02}.meta").write_bytes(b"x")
+    stale = sn.stale_backups(tmp_path, keep=7)
+    assert [p.name for p in stale] == [f"filer-202610{d:02}.meta" for d in (1, 2, 3)]
+
+
+def test_run_backs_up_the_index_on_a_volume_node_too(tmp_path, monkeypatch):
+    home = _home(tmp_path, VOLUME)
+    backed_up: list[Path] = []
+
+    class _Running:
+        def poll(self):
+            return None
+
+    class _Stop(Exception):
+        pass
+
+    def backup(h):
+        backed_up.append(h)
+        raise _Stop
+
+    monkeypatch.setattr(sn.subprocess, "Popen", lambda args, **kwargs: _Running())
+    monkeypatch.setattr(sn.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(sn.time, "monotonic", iter([0, 3600, 3600]).__next__)
+    monkeypatch.setattr(sn, "backup_meta", backup)
+    with pytest.raises(_Stop):
+        sn.run(home)
+    assert backed_up == [home]
+
+
+def test_run_logs_a_failed_backup_and_keeps_going(tmp_path, monkeypatch):
+    home = _home(tmp_path, VOLUME)
+    log = tmp_path / "logs" / "storage-node.log"
+    monkeypatch.setattr(sn, "LOG_FILE", log)
+    polls = iter([None, 1])
+
+    class _Once:
+        def poll(self):
+            return next(polls)
+
+    class _Stop(Exception):
+        pass
+
+    def sleep(seconds):
+        if seconds == sn.RESTART_DELAY_S:
+            raise _Stop
+
+    def backup(h):
+        raise RuntimeError("fs.meta.save from 100.76.121.58 failed: refused")
+
+    monkeypatch.setattr(sn.subprocess, "Popen", lambda args, **kwargs: _Once())
+    monkeypatch.setattr(sn.time, "sleep", sleep)
+    monkeypatch.setattr(sn.time, "monotonic", iter([0, 3600, 3600]).__next__)
+    monkeypatch.setattr(sn, "backup_meta", backup)
+    with pytest.raises(_Stop):
+        sn.run(home)
+    assert json.loads(log.read_text(encoding="utf-8"))["error"].startswith("backup-meta:")
 
 
 def test_credentials_prints_the_env_lines_for_the_stored_keys(tmp_path, capsys):
@@ -349,6 +487,10 @@ def test_main_dispatches_each_command(monkeypatch, tmp_path):
     monkeypatch.setattr(sn, "HOME", tmp_path)
     monkeypatch.setattr(sn, "stop", lambda: ran.append("stop"))
     monkeypatch.setattr(sn, "status", lambda primary, home: ran.append(f"status {primary}"))
+    monkeypatch.setattr(sn, "configure_buckets", lambda pin, home: ran.append(f"pin {pin}"))
+    monkeypatch.setattr(sn, "backup_meta", lambda home: ran.append("backup") or home)
     assert sn.main(["stop"]) == 0
     assert sn.main(["status", "--primary", "100.1.2.3"]) == 0
-    assert ran == ["stop", "status 100.1.2.3"]
+    assert sn.main(["configure-buckets", "--pin", "raw-dumps=100.1.1.1"]) == 0
+    assert sn.main(["backup-meta"]) == 0
+    assert ran == ["stop", "status 100.1.2.3", "pin ['raw-dumps=100.1.1.1']", "backup"]
