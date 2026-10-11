@@ -32,18 +32,22 @@ health reads a returned 0 as "ran fine, nothing new". An archive with no
 pipeline delivers nothing, and only an error makes that visible. Once the dataset exists its
 manifest is never removed, so the error cannot flap.
 
-**Memory is one partition deep.** A run can select many partitions — a backlog after an
-outage, or a bulk import on social-scraper's side that rewrites many days at once — so each
-is flushed and released before the next is read. Holding every post until the end grew a
-consumer's scheduler to three quarters of its Docker VM's memory.
+**Memory is one batch deep.** A run can select many partitions — a backlog after an
+outage, or a bulk import on social-scraper's side that rewrites many days at once — and one
+partition can be huge: a day of one platform, and r/wallstreetbets' 2021-01-28 is 195,771
+posts, ~650 MiB of row dicts and ORM objects. So a partition is decoded, preloaded, written
+and released ``BATCH_ROWS`` rows at a time. Holding every post of a run grew a consumer's
+scheduler to three quarters of its Docker VM; holding every post of a partition got its
+1.5 GiB app container OOM-killed on every run that reached those days.
 
-**Committed per partition.** One bulk import rewrote 3,650 partitions holding 17.3M rows;
+**Committed per batch.** One bulk import rewrote 3,650 partitions holding 17.3M rows;
 read in one transaction, the run took longer than the consumer's scheduler stayed up, so
 every restart threw the run away and began it again, and its lock set deadlocked the
 consumer's pruning. Resuming is safe because partitions are read oldest export first and a
 row's ``fetched_at`` is stamped before the export that writes it: the watermark a committed
-partition leaves is never past the export stamp of one still to read, so the next run
-selects every partition this one did not finish.
+batch leaves is never past the export stamp of its own partition or of one still to read,
+so the next run selects every partition this one did not finish, a partly loaded one
+included.
 """
 
 import logging
@@ -59,7 +63,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from data_lake.archive.catalog import DatasetManifest, PartitionEntry, load_manifest
-from data_lake.archive.parquet_io import as_utc, chunked, parquet_bytes_to_frame
+from data_lake.archive.parquet_io import as_utc, chunked, parquet_bytes_to_frames
 from data_lake.archive.store import ObjectStore, store_from_settings
 from data_lake.db.models import SocialPost
 from data_lake.ingestion.base import Connector, SessionFactory
@@ -72,6 +76,10 @@ DATASET = "social_scraper_posts"
 
 #: How far before the watermark a partition's export stamp may fall and still be re-read.
 DEFAULT_LOOKBACK = timedelta(hours=1)
+
+#: Posts decoded, preloaded, written and committed together: ~17 MiB of Python objects at
+#: the ~3.3 KiB a post measured, and ten ``IN`` lists of ``SQL_IN_CHUNK`` for the preload.
+BATCH_ROWS = 5_000
 
 #: Columns social-scraper exports beyond this table's own, kept in ``raw`` because nothing
 #: else stores them. A fixed, small set — never the whole row (the ``url`` and author reach
@@ -224,12 +232,13 @@ class SocialScraperConnector(Connector):
         with self.session() as session:
             selected = select_partitions(manifest, _watermarks(session), wanted, lookback)
             for key, entry in selected:
-                count += self._load_partition(session, key, entry, wanted, {})
-                # Commit the partition and let go of its posts before reading the next, so
-                # memory stays one partition deep and a run that stops partway keeps what
-                # it loaded (see "Committed per partition" above).
-                session.commit()
-                session.expunge_all()
+                for rows in self._partition_batches(key, entry, wanted):
+                    count += _load_batch(session, rows)
+                    # Commit the batch and let go of its posts before decoding the next, so
+                    # memory stays one batch deep and a run that stops partway keeps what
+                    # it loaded (see "Committed per batch" above).
+                    session.commit()
+                    session.expunge_all()
         logger.info(
             "social-scraper: %d row(s) upserted from %d of %d partition(s)",
             count,
@@ -238,14 +247,10 @@ class SocialScraperConnector(Connector):
         )
         return count
 
-    def _load_partition(
-        self,
-        session: Session,
-        key: str,
-        entry: PartitionEntry,
-        platforms: set[str] | None,
-        known: dict[_Key, SocialPost],
-    ) -> int:
+    def _partition_batches(
+        self, key: str, entry: PartitionEntry, platforms: set[str] | None
+    ) -> Iterator[list[dict[str, Any]]]:
+        """The partition's wanted rows, at most ``BATCH_ROWS`` decoded at a time."""
         try:
             data = self.store.get_bytes(key)
         except KeyError:
@@ -253,13 +258,23 @@ class SocialScraperConnector(Connector):
                 f"{DATASET} manifest lists {key!r} but the archive has no such object; "
                 "re-export it from social-scraper (the partitions before it were kept)"
             ) from None
-        rows = [
-            row
-            for row in _rows(parquet_bytes_to_frame(data), entry.updated_at)
-            if platforms is None or row["platform"] in platforms
-        ]
-        _preload(session, rows, known)
-        return sum(_upsert(session, row, known) for row in rows)
+        for frame in parquet_bytes_to_frames(data, BATCH_ROWS):
+            yield [
+                row
+                for row in _rows(frame, entry.updated_at)
+                if platforms is None or row["platform"] in platforms
+            ]
+
+
+def _load_batch(session: Session, rows: list[dict[str, Any]]) -> int:
+    """Insert or refresh one batch of rows; returns how many were written.
+
+    ``known`` lives for one batch: a key repeated in a later batch finds the copy this one
+    committed through that batch's own preload, so dedup is the same at any batch size.
+    """
+    known: dict[_Key, SocialPost] = {}
+    _preload(session, rows, known)
+    return sum(_upsert(session, row, known) for row in rows)
 
 
 def _preload(session: Session, rows: list[dict[str, Any]], known: dict[_Key, SocialPost]) -> None:

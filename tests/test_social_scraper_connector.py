@@ -12,12 +12,16 @@ from datetime import UTC, datetime, timedelta
 import numpy as np
 import pandas as pd
 import pytest
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from data_lake.archive.catalog import DatasetManifest, DatasetSpec, PartitionEntry, record_partition
-from data_lake.archive.parquet_io import frame_to_parquet_bytes, parquet_bytes_to_frame
+from data_lake.archive.parquet_io import (
+    frame_to_parquet_bytes,
+    parquet_bytes_to_frame,
+    parquet_bytes_to_frames,
+)
 from data_lake.archive.store import LocalDirStore, S3ObjectStore
 from data_lake.db.models import Base, SocialPost
 from data_lake.ingestion.base import stable_hash
@@ -314,6 +318,127 @@ def test_a_loaded_partition_is_released_before_the_next_is_read(tmp_path, monkey
 
     assert held_at_read == dict.fromkeys(keys, 0)
     assert [p.external_id for p in _posts(factory)] == ["a", "b", "c"]
+
+
+def _spy_preloads(monkeypatch) -> list[tuple[int, int]]:
+    """Record ``(rows handed to _preload, objects the session holds)`` at each call."""
+    calls: list[tuple[int, int]] = []
+    real_preload = social_scraper._preload
+
+    def spy(session, rows, known):
+        calls.append((len(rows), len(list(session))))
+        return real_preload(session, rows, known)
+
+    monkeypatch.setattr(social_scraper, "_preload", spy)
+    return calls
+
+
+def test_one_partition_is_loaded_in_bounded_batches(tmp_path, monkeypatch):
+    """Memory is bounded by a batch, not by how many posts one partition holds.
+
+    A partition is a day of one platform, and days are not alike: r/wallstreetbets on
+    2021-01-28 is 195,771 posts in one partition, ~650 MiB of row dicts and ORM objects
+    before a flush. ibkr_trader's app container (1.5 GiB) was OOM-killed on every
+    ``social`` run once the run reached those days.
+    """
+    monkeypatch.setattr(social_scraper, "BATCH_ROWS", 3, raising=False)
+    store, factory = LocalDirStore(tmp_path), _session_factory()
+    fetched = T0 - timedelta(minutes=5)
+    (key,) = _export(store, [_post("reddit", f"p{i}", fetched=fetched) for i in range(7)], now=T0)
+    with factory() as session:  # already stored, older: refreshed in whichever batch it falls
+        session.add(
+            SocialPost(
+                platform="reddit",
+                channel="stocks",
+                external_id="p5",
+                created_at=CREATED,
+                score=1,
+                fetched_at=fetched - timedelta(hours=1),
+            )
+        )
+    calls = _spy_preloads(monkeypatch)
+
+    assert _connector(store, factory).fetch() == 7
+
+    assert [rows for rows, _ in calls] == [3, 3, 1]
+    assert [held for _, held in calls] == [0, 0, 0], "each batch released before the next"
+    posts = _posts(factory)
+    assert [p.external_id for p in posts] == [f"p{i}" for i in range(7)]
+    assert {p.score for p in posts} == {10}  # p5 refreshed, nothing duplicated
+
+
+def test_a_partition_stopped_partway_is_read_again_and_finished(tmp_path, monkeypatch):
+    """Batches are committed, and a partly loaded partition stays selected: its rows'
+    ``fetched_at`` never passes its own export stamp, so the watermark cannot skip it."""
+    monkeypatch.setattr(social_scraper, "BATCH_ROWS", 2, raising=False)
+    store, factory = LocalDirStore(tmp_path), _session_factory()
+    fetched = T0 - timedelta(minutes=5)
+    _export(store, [_post("reddit", f"p{i}", fetched=fetched) for i in range(5)], now=T0)
+    real_preload = social_scraper._preload
+    calls = 0
+
+    def killed_on_second_batch(session, rows, known):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("OOM-killed")
+        return real_preload(session, rows, known)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(social_scraper, "_preload", killed_on_second_batch)
+        with pytest.raises(RuntimeError, match="OOM-killed"):
+            _connector(store, factory).fetch()
+    assert [p.external_id for p in _posts(factory)] == ["p0", "p1"]
+
+    assert _connector(store, factory).fetch() == 3
+    assert [p.external_id for p in _posts(factory)] == [f"p{i}" for i in range(5)]
+
+
+def test_preload_reads_only_the_stored_copies_of_the_batch_in_hand(tmp_path):
+    """The ``social_posts`` table holds 13M rows: the preload reads the batch's keys, never
+    the table, so its cost does not grow with it."""
+    factory = _session_factory()
+    with factory() as session:
+        for platform, external_id in [("reddit", "a"), ("reddit", "b"), ("x", "a"), ("x", "c")]:
+            session.add(
+                SocialPost(
+                    platform=platform,
+                    channel="stocks",
+                    external_id=external_id,
+                    created_at=CREATED,
+                    fetched_at=T0,
+                )
+            )
+    batch = [{"platform": "reddit", "external_id": "a"}, {"platform": "x", "external_id": "c"}]
+    statements: list[str] = []
+    known: dict = {}
+    with factory() as session:
+        engine = session.get_bind()
+
+        def record(conn, cursor, statement, parameters, context, executemany):
+            statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", record)
+        try:
+            social_scraper._preload(session, batch, known)
+        finally:
+            event.remove(engine, "before_cursor_execute", record)
+
+    assert set(known) == {("reddit", "a"), ("x", "c")}
+    assert statements and all(" IN (" in statement for statement in statements)
+
+
+def test_parquet_bytes_to_frames_splits_rows_and_keeps_their_types():
+    whole = pd.DataFrame([_post("reddit", f"p{i}", fetched=T0) for i in range(5)])
+    data = frame_to_parquet_bytes(whole)
+
+    frames = list(parquet_bytes_to_frames(data, 2))
+
+    assert [len(frame) for frame in frames] == [2, 2, 1]
+    rejoined = pd.concat(frames, ignore_index=True)
+    pd.testing.assert_frame_equal(rejoined, parquet_bytes_to_frame(data))
+    assert str(rejoined["fetched_at"].dtype).endswith("UTC]")
+    assert list(parquet_bytes_to_frames(frame_to_parquet_bytes(whole.iloc[:0]), 2)) == []
 
 
 def test_select_partitions_holds_each_platform_to_its_own_watermark():
