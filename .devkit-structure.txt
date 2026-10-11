@@ -40,12 +40,16 @@ function_params::src/data_lake/ingestion/news/finnhub_backfill.py::run_backfill 
 nesting_depth::src/data_lake/archive/raw.py::restore_raw_payloads = 5
 orphan::src/data_lake/archive/lens.py = 1
 orphan::src/data_lake/db/adoption.py = 1
+orphan::src/data_lake/ingestion/macro/bank_of_canada.py = 1
+orphan::src/data_lake/ingestion/macro/fomc.py = 1
+orphan::src/data_lake/ingestion/macro/fred.py = 1
 orphan::src/data_lake/ingestion/market/alpha_vantage.py = 1
+orphan::src/data_lake/ingestion/market/finnhub_earnings.py = 1
 orphan::src/data_lake/ingestion/market/finnhub_ipo.py = 1
 orphan::src/data_lake/ingestion/market/finnhub_market.py = 1
 orphan::src/data_lake/ingestion/market/ibkr_historical.py = 1
 orphan::src/data_lake/ingestion/market/index_pricing.py = 1
-orphan::src/data_lake/ingestion/market/sec_edgar.py = 1
+orphan::src/data_lake/ingestion/market/sec_xbrl.py = 1
 orphan::src/data_lake/ingestion/market/yahoo_fundamentals.py = 1
 orphan::src/data_lake/ingestion/market/yahoo_fx.py = 1
 orphan::src/data_lake/ingestion/news/finnhub_backfill.py = 1
@@ -73,3 +77,10 @@ todos::src/data_lake/ingestion/market/ibkr_historical.py = 1
 # 2026-10-08  recorded: library connectors: their only importer is the consumer (ibkr_trader's ipo_poll scheduler job), outside this scan -- the same standing as the other ingestion orphan lines here
 #   orphan::src/data_lake/ingestion/market/finnhub_ipo.py -> 1
 #   orphan::src/data_lake/ingestion/market/sec_edgar.py -> 1
+
+# 2026-10-11  recorded: library connectors: their only importer is the consumer (ibkr_trader's event-calendar scheduler jobs and events CLI), outside this scan -- the same standing as the other ingestion orphan lines here
+#   orphan::src/data_lake/ingestion/macro/bank_of_canada.py -> 1
+#   orphan::src/data_lake/ingestion/macro/fomc.py -> 1
+#   orphan::src/data_lake/ingestion/macro/fred.py -> 1
+#   orphan::src/data_lake/ingestion/market/finnhub_earnings.py -> 1
+#   orphan::src/data_lake/ingestion/market/sec_xbrl.py -> 1

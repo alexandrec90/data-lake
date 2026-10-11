@@ -25,7 +25,9 @@ What is stored: every ``S-1``/``F-1``/``DRS`` (``filed``), their ``/A`` amendmen
 (``amended``), ``424B4`` (``priced``) and ``RW`` (``withdrawn``). These forms are also used for
 resales, SPACs and follow-ons — telling them apart is the consumer's job, so a new row's
 ``raw`` carries the filer's SIC code and any listed tickers, from
-``data.sec.gov/submissions/CIK##########.json`` (one request per new filer per run).
+``data.sec.gov/submissions/CIK##########.json`` (one request per new filer per run), and
+``is_spac`` is set from that SIC (6770, "blank checks"). Both are looked up on insert only; a
+refresh never blanks them.
 
 A run is one transaction. With no explicit ``since``, it restarts ``OVERLAP_DAYS`` before the
 newest ``fetched_at`` it wrote, so a failed run — which commits nothing — is retried in full.
@@ -45,7 +47,7 @@ from sqlalchemy.orm import Session
 
 from data_lake.db.models import IpoEvent
 from data_lake.ingestion.base import Connector
-from data_lake.ingestion.market.ipo_common import upsert_ipo_event
+from data_lake.ingestion.market.ipo_common import is_blank_check, upsert_ipo_event
 from data_lake.settings import LakeSettings
 from data_lake.runtime import SessionFactory
 
@@ -220,6 +222,7 @@ class EdgarRegistrationConnector(Connector):
                     profile = self._profile(entry.cik, user_agent, profiles)
                     fields["symbol"] = (profile.get("tickers") or [None])[0]
                     fields["exchange"] = (profile.get("exchanges") or [None])[0]
+                    fields["is_spac"] = is_blank_check(profile.get("sic"))
                     fields["raw"].update(profile)
                 upsert_ipo_event(session, self.name, accession, fields, now)
         return len(entries)

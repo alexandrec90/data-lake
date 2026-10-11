@@ -36,8 +36,22 @@ UPDATABLE = (
     "shares",
     "deal_value_usd",
     "url",
+    "is_spac",
     "raw",
 )
+
+#: SEC Standard Industrial Classification for "blank checks" -- SPACs.
+BLANK_CHECK_SIC = "6770"
+
+
+def is_blank_check(sic: object) -> bool | None:
+    """True for SIC 6770, False for any other known SIC, None when the SIC is unknown."""
+    if sic is None or isinstance(sic, bool):
+        return None
+    code = str(sic).strip()
+    if not code:
+        return None
+    return code == BLANK_CHECK_SIC
 
 
 def upsert_ipo_event(

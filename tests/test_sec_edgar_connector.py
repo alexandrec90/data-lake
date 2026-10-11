@@ -267,7 +267,31 @@ def test_failed_profile_lookup_is_not_fatal(edgar, caplog):
     s1 = _rows(session_cm)["0001193125-26-324170"]
     assert s1.symbol is None
     assert "sic" not in s1.raw
+    assert s1.is_spac is None  # unknown SIC: unknown, not "not a SPAC"
     assert "0002048951" in caplog.text
+
+
+def test_is_spac_comes_from_the_sic_and_survives_a_refresh(edgar):
+    session_cm = make_session_scope()
+    _serve_july_29(edgar)
+    edgar.route(se.SUBMISSIONS_URL.format(cik="0002111846"), _submissions("6770", [], []))
+
+    _connector(session_cm).fetch(since="2026-07-28", until="2026-07-30")
+    _connector(session_cm).fetch(since="2026-07-28", until="2026-07-30")  # no profile lookups
+
+    rows = _rows(session_cm)
+    assert rows["0001213900-26-082494"].is_spac is True  # SIC 6770, blank checks
+    assert rows["0001193125-26-324170"].is_spac is False
+    assert rows["0001999371-26-016275"].is_spac is False
+
+
+def test_is_spac_stays_unknown_without_enrichment(edgar):
+    session_cm = make_session_scope()
+    _serve_july_29(edgar)
+
+    _connector(session_cm, enrich=False).fetch(since="2026-07-29", until="2026-07-29")
+
+    assert {row.is_spac for row in _rows(session_cm).values()} == {None}
 
 
 def test_a_listed_day_that_fails_aborts_the_whole_run(edgar):

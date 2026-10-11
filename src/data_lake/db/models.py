@@ -20,7 +20,11 @@ Conventions:
   never requires re-fetching.
 - Upsert keys: (source, external_id) for text content; (platform, external_id) for scraped
   listings; (instrument, ts, bar_size, source, what_to_show) for bars; (index_code, symbol,
-  start_date, source) for index membership spans; (source, external_id) for IPO events.
+  start_date, source) for index membership spans; (source, external_id) for IPO events,
+  scheduled economic events and SEC XBRL facts; (source, series_id, date) for macro series;
+  (instrument, kind, event_date, source) for announced corporate events.
+- ``first_seen_at`` is written on insert and never updated: it is the point-in-time "when did
+  we know" hook, distinct from whatever date the provider attaches to the record.
 - Privacy (Québec Law 25): people are stored as hashes, never names — social authors and
   listing sellers alike.
 """
@@ -37,6 +41,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Index,
+    Integer,
     Numeric,
     String,
     Text,
@@ -177,19 +182,178 @@ class FundamentalSnapshot(Base):
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))  # updated each refresh
 
 
-class EarningsEvent(Base):
-    """Earnings report timestamps (yfinance `get_earnings_dates`, back to ~2001).
+class StockSplit(Base):
+    """Stock splits per instrument (yfinance `Ticker.splits`).
 
-    Used to lag statements to their real availability date (point-in-time correctness).
+    ``ratio`` is new shares per old share: a 4-for-1 split is ``4.0``, a 1-for-10 reverse
+    split ``0.1``.
+    """
+
+    __tablename__ = "stock_splits"
+    __table_args__ = (UniqueConstraint("instrument_id", "ex_date", "source"),)
+
+    id: Mapped[int] = mapped_column(SqliteFriendlyBigInt, primary_key=True)
+    instrument_id: Mapped[int] = mapped_column(ForeignKey("instruments.id"))
+    ex_date: Mapped[date] = mapped_column(Date)
+    ratio: Mapped[float] = mapped_column(Float)
+    source: Mapped[str] = mapped_column(String(32))  # yahoo
+
+
+class EarningsEvent(Base):
+    """Earnings report timestamps, with the estimate and the result when the provider has them.
+
+    Two sources, kept as separate rows: ``yahoo`` (yfinance `get_earnings_dates`, back to
+    ~2001, ``report_ts`` carrying the announcement time) and ``finnhub`` (the earnings
+    calendar, ``report_ts`` the date at 00:00 UTC with ``hour`` saying ``bmo``/``amc``/``dmh``).
+
+    Used to lag statements to their real availability date (point-in-time correctness). Both
+    sources list **upcoming** reports too, with null actuals; a re-dated report is deleted at
+    its old timestamp rather than left behind as a ghost. ``first_seen_at`` is null on rows
+    written before the column existed.
     """
 
     __tablename__ = "earnings_events"
-    __table_args__ = (UniqueConstraint("instrument_id", "report_ts", "source"),)
+    __table_args__ = (
+        UniqueConstraint("instrument_id", "report_ts", "source"),
+        Index("ix_earnings_events_report_ts", "report_ts"),
+    )
 
     id: Mapped[int] = mapped_column(SqliteFriendlyBigInt, primary_key=True)
     instrument_id: Mapped[int] = mapped_column(ForeignKey("instruments.id"))
     report_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    source: Mapped[str] = mapped_column(String(32))  # yahoo | finnhub
+    eps_estimate: Mapped[float | None] = mapped_column(Float)
+    eps_actual: Mapped[float | None] = mapped_column(Float)
+    surprise_pct: Mapped[float | None] = mapped_column(Float)
+    revenue_estimate: Mapped[float | None] = mapped_column(Float)
+    revenue_actual: Mapped[float | None] = mapped_column(Float)
+    hour: Mapped[str | None] = mapped_column(String(8))  # bmo | amc | dmh
+    first_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class CorporateEvent(Base):
+    """An announced, upcoming per-instrument event (yfinance `Ticker.calendar`).
+
+    ``kind`` is ``ex_dividend`` | ``dividend_payment``. Only dates on or after the fetch day are
+    stored — past ex-dates live in ``dividends`` — and a future event the provider stops
+    announcing is deleted, so this table answers "what is scheduled", not "what was".
+    """
+
+    __tablename__ = "corporate_events"
+    __table_args__ = (
+        UniqueConstraint("instrument_id", "kind", "event_date", "source"),
+        Index("ix_corporate_events_event_date", "event_date"),
+    )
+
+    id: Mapped[int] = mapped_column(SqliteFriendlyBigInt, primary_key=True)
+    instrument_id: Mapped[int] = mapped_column(ForeignKey("instruments.id"))
+    kind: Mapped[str] = mapped_column(String(32))
+    event_date: Mapped[date] = mapped_column(Date)
     source: Mapped[str] = mapped_column(String(32))  # yahoo
+    raw: Mapped[dict | None] = mapped_column(JSON)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class MacroObservation(Base):
+    """One observation of one macroeconomic series (``ingestion.macro``).
+
+    Sources: ``fred`` (series ids such as ``CPIAUCSL``) and ``bankofcanada`` (Valet series ids
+    such as ``V39079``, the policy rate).
+
+    **Latest vintage, not point in time.** A revised figure overwrites ``value`` in place;
+    this is not ALFRED's vintage history, so a backtest reading ``value`` sees revisions it
+    could not have known. ``first_seen_at`` (never updated) is the point-in-time hook: it is
+    when the observation first entered this table.
+    """
+
+    __tablename__ = "macro_observations"
+    __table_args__ = (
+        UniqueConstraint("source", "series_id", "date"),
+        Index("ix_macro_observations_series_date", "series_id", "date"),
+    )
+
+    id: Mapped[int] = mapped_column(SqliteFriendlyBigInt, primary_key=True)
+    source: Mapped[str] = mapped_column(String(32))  # fred | bankofcanada
+    series_id: Mapped[str] = mapped_column(String(64))
+    date: Mapped[date] = mapped_column(Date)
+    value: Mapped[float] = mapped_column(Float)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class EconomicEvent(Base):
+    """One scheduled macroeconomic event: a data release, a rate decision.
+
+    ``kind`` / ``source`` / ``external_id``:
+
+    - ``data_release`` / ``fred`` / ``"{release_id}:{date}"`` — FRED's release calendar,
+      ``release_id`` set.
+    - ``fomc_meeting`` / ``federalreserve`` / ``"fomc:{decision date}"`` — ``start_date`` is
+      day one, ``event_date`` the decision day; ``raw`` carries ``sep`` (a Summary of Economic
+      Projections) and ``notation_vote``.
+    - ``boc_rate_announcement`` / ``bankofcanada`` / ``"boc:{date}"`` — ``raw`` carries
+      ``mpr`` (published with a Monetary Policy Report).
+
+    A future event its source stops listing is deleted (a rescheduled release would otherwise
+    leave a ghost at its old date); past events are kept.
+    """
+
+    __tablename__ = "economic_events"
+    __table_args__ = (
+        UniqueConstraint("source", "external_id"),
+        Index("ix_economic_events_event_date", "event_date"),
+    )
+
+    id: Mapped[int] = mapped_column(SqliteFriendlyBigInt, primary_key=True)
+    source: Mapped[str] = mapped_column(String(32))  # fred | federalreserve | bankofcanada
+    external_id: Mapped[str] = mapped_column(String(256))
+    kind: Mapped[str] = mapped_column(String(32))
+    name: Mapped[str] = mapped_column(Text)
+    country: Mapped[str] = mapped_column(String(2))  # US | CA
+    event_date: Mapped[date] = mapped_column(Date)  # the release or decision day
+    start_date: Mapped[date | None] = mapped_column(Date)  # FOMC day one
+    release_id: Mapped[int | None] = mapped_column(Integer)  # FRED release id
+    raw: Mapped[dict | None] = mapped_column(JSON)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class SecFact(Base):
+    """One XBRL fact from SEC's company-concept API (``ingestion.market.sec_xbrl``).
+
+    Every fact is kept, including the same period restated by later filings — the accession
+    number is part of ``external_id`` (``"{accn}:{taxonomy}:{concept}:{unit}:{start}:{end}"``,
+    ``start`` empty for an instant). 10-Q cash-flow values are **year-to-date** as filed, not
+    per quarter. ``frame`` is set on only one fact per period (SEC's pick for that calendar
+    frame). ``instrument_id`` is null when no instrument carries the filer's ticker.
+    """
+
+    __tablename__ = "sec_facts"
+    __table_args__ = (
+        UniqueConstraint("source", "external_id"),
+        Index("ix_sec_facts_instrument_concept_period", "instrument_id", "concept", "period_end"),
+    )
+
+    id: Mapped[int] = mapped_column(SqliteFriendlyBigInt, primary_key=True)
+    source: Mapped[str] = mapped_column(String(32))  # sec_xbrl
+    external_id: Mapped[str] = mapped_column(String(256))
+    cik: Mapped[str] = mapped_column(String(10))  # zero-padded to 10 digits
+    instrument_id: Mapped[int | None] = mapped_column(ForeignKey("instruments.id"))
+    taxonomy: Mapped[str] = mapped_column(String(16))  # us-gaap
+    concept: Mapped[str] = mapped_column(String(128))
+    unit: Mapped[str] = mapped_column(String(16))  # USD | shares
+    period_start: Mapped[date | None] = mapped_column(Date)  # None for an instant
+    period_end: Mapped[date] = mapped_column(Date)
+    value: Mapped[float] = mapped_column(Float)
+    fiscal_year: Mapped[int | None] = mapped_column(Integer)
+    fiscal_period: Mapped[str | None] = mapped_column(String(4))  # FY | Q1 | Q2 | Q3
+    form: Mapped[str] = mapped_column(String(16))  # 10-K | 10-Q | 8-K ...
+    filed: Mapped[date] = mapped_column(Date)
+    frame: Mapped[str | None] = mapped_column(String(16))  # e.g. CY2025Q3
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class Feature(Base):
@@ -242,7 +406,8 @@ class IpoEvent(Base):
       ``424B4`` ``priced``, ``RW`` ``withdrawn``. These forms are also used for resales, SPACs
       and follow-ons; every one is stored, and ``raw`` carries the SIC code so a consumer can
       filter. ``filed_at`` is EDGAR's "Date Filed" at 00:00 UTC — for a confidential ``DRS``
-      that is the submission date, weeks before it became public.
+      that is the submission date, weeks before it became public. ``is_spac`` comes from the
+      same SIC: True for 6770 ("blank checks"), False for any other, None when EDGAR gave none.
     - ``finnhub`` (``ingestion.market.finnhub_ipo``) — one row per deal on Finnhub's calendar.
       The calendar gives no id, and a deal's date, symbol and exchange all move as it
       progresses (``exchange`` is null until a deal is scheduled), so the key is a hash of the
@@ -275,6 +440,7 @@ class IpoEvent(Base):
     shares: Mapped[int | None] = mapped_column(BigInteger)
     deal_value_usd: Mapped[float | None] = mapped_column(Float)
     url: Mapped[str | None] = mapped_column(Text)  # EDGAR filing index page
+    is_spac: Mapped[bool | None] = mapped_column(Boolean)  # sec_edgar only; None = unknown
     raw: Mapped[dict | None] = mapped_column(JSON)
     #: Never updated after insert — an alert dedupes on it, and it is the point-in-time
     #: "when did we know" that ``filed_at`` (a regulatory date) is not.
