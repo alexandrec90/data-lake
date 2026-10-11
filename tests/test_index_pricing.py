@@ -21,9 +21,11 @@ from data_lake.ingestion.market.index_pricing import (
     covers_partially,
     final_symbol,
     load_renames,
+    probe_yahoo,
     resolve_index_prices,
 )
 from data_lake.ingestion.market.tiingo import TiingoListing
+from data_lake.ingestion.market.yahoo_common import YahooProviderError
 
 SINCE = date(2020, 1, 1)
 TODAY = date(2024, 6, 30)
@@ -218,6 +220,33 @@ def test_yahoo_download_that_does_not_cover_creates_no_instrument(monkeypatch, s
     with scope() as session:
         assert session.scalars(select(Instrument)).all() == []
         assert session.scalars(select(PriceBar)).all() == []
+
+
+def test_probe_yahoo_returns_bars_through_need_to_and_stores_nothing(monkeypatch, scope):
+    calls = _yahoo(monkeypatch, {"AAPL": _frame(date(2024, 1, 2), date(2024, 1, 3))})
+
+    bars = probe_yahoo("AAPL", date(2024, 1, 1), date(2024, 1, 3))
+
+    assert [bar["ts"] for bar in bars] == [
+        yahoo_common.daily_ts(date(2024, 1, 2)),
+        yahoo_common.daily_ts(date(2024, 1, 3)),
+    ]
+    assert calls == [("AAPL", date(2024, 1, 1), date(2024, 1, 4), True)]  # `end` is exclusive
+    with scope() as session:
+        assert session.scalars(select(Instrument)).all() == []
+
+
+def test_probe_yahoo_answers_empty_for_a_ticker_yahoo_lacks(monkeypatch):
+    _yahoo(monkeypatch, {"SIVB": YFTzMissingError("SIVB")})
+
+    assert probe_yahoo("SIVB", date(2024, 1, 1), date(2024, 1, 3)) == []
+
+
+def test_probe_yahoo_raises_an_outage(monkeypatch):
+    _yahoo(monkeypatch, {"AAPL": RuntimeError("connection reset")})
+
+    with pytest.raises(YahooProviderError):
+        probe_yahoo("AAPL", date(2024, 1, 1), date(2024, 1, 3))
 
 
 def test_delisted_yahoo_ticker_falls_through_to_the_tiingo_q_ticker(monkeypatch, scope):

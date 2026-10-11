@@ -48,7 +48,7 @@ orphan::src/data_lake/ingestion/market/finnhub_earnings.py = 1
 orphan::src/data_lake/ingestion/market/finnhub_ipo.py = 1
 orphan::src/data_lake/ingestion/market/finnhub_market.py = 1
 orphan::src/data_lake/ingestion/market/ibkr_historical.py = 1
-orphan::src/data_lake/ingestion/market/index_pricing.py = 1
+orphan::src/data_lake/ingestion/market/ipo_pricing.py = 1
 orphan::src/data_lake/ingestion/market/sec_xbrl.py = 1
 orphan::src/data_lake/ingestion/market/yahoo_fundamentals.py = 1
 orphan::src/data_lake/ingestion/market/yahoo_fx.py = 1
@@ -84,3 +84,6 @@ todos::src/data_lake/ingestion/market/ibkr_historical.py = 1
 #   orphan::src/data_lake/ingestion/macro/fred.py -> 1
 #   orphan::src/data_lake/ingestion/market/finnhub_earnings.py -> 1
 #   orphan::src/data_lake/ingestion/market/sec_xbrl.py -> 1
+
+# 2026-10-11  recorded: library entry point: its only importer is the consumer (ibkr_trader's scheduler, its ipo-prices job), outside this scan; it now imports index_pricing.probe_yahoo, which is why index_pricing's orphan line left -- the same standing as the other ingestion orphan lines here
+#   orphan::src/data_lake/ingestion/market/ipo_pricing.py -> 1

@@ -17,6 +17,7 @@ from data_lake.ingestion.market.ipo_pricing import (
     SPAC_MIN_BARS,
     SPAC_WINDOW_BARS,
     IpoPricingOptions,
+    IpoPricingReport,
     exclusion,
     provider_symbol,
     resolve_ipo_prices,
@@ -647,5 +648,5 @@ def test_a_second_run_is_a_no_op(scope, monkeypatch):
 
     report = _run(scope)
 
-    assert report == type(report)()
+    assert report == IpoPricingReport()
     assert len(calls) == 1

@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 
 from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
 from data_lake.db.models import Instrument, IpoEvent, PriceBar
 from data_lake.ingestion.base import SessionFactory, resolve_session_factory
@@ -83,6 +84,29 @@ def _day(ts: datetime) -> date:
     return ts.date()
 
 
+def _first_bars(session: Session) -> dict[int, date]:
+    """Each instrument's first stored bar, as a date."""
+    return {
+        instrument_id: _day(first)
+        for instrument_id, first in session.execute(
+            select(PriceBar.instrument_id, func.min(PriceBar.ts)).group_by(PriceBar.instrument_id)
+        )
+    }
+
+
+def _ipo_dates(session: Session) -> dict[int, date]:
+    """Each cohort instrument's earliest IPO date."""
+    ipo_dates: dict[int, date] = {}
+    for instrument_id, ipo_date in session.execute(
+        select(IpoEvent.instrument_id, IpoEvent.expected_date).where(
+            IpoEvent.instrument_id.is_not(None), IpoEvent.expected_date.is_not(None)
+        )
+    ):
+        if instrument_id is not None and ipo_date is not None:  # the query's own filter
+            ipo_dates[instrument_id] = min(ipo_date, ipo_dates.get(instrument_id, ipo_date))
+    return ipo_dates
+
+
 def resolve_listing_dates(
     *,
     tiingo_listings: Mapping[str, list[TiingoListing]] | None = None,
@@ -96,23 +120,8 @@ def resolve_listing_dates(
     factory = resolve_session_factory(session_factory)
     report = ListingDatesReport()
     with factory() as session:
-        first_bars = {
-            instrument_id: _day(first)
-            for instrument_id, first in session.execute(
-                select(PriceBar.instrument_id, func.min(PriceBar.ts)).group_by(
-                    PriceBar.instrument_id
-                )
-            )
-        }
-        ipo_dates: dict[int, date] = {}
-        for instrument_id, ipo_date in session.execute(
-            select(IpoEvent.instrument_id, IpoEvent.expected_date).where(
-                IpoEvent.instrument_id.is_not(None), IpoEvent.expected_date.is_not(None)
-            )
-        ):
-            if instrument_id is not None and ipo_date is not None:  # the query's own filter
-                ipo_dates[instrument_id] = min(ipo_date, ipo_dates.get(instrument_id, ipo_date))
-
+        first_bars = _first_bars(session)
+        ipo_dates = _ipo_dates(session)
         for instrument in session.scalars(
             select(Instrument).where(Instrument.id.in_(first_bars.keys() | ipo_dates.keys()))
         ):
