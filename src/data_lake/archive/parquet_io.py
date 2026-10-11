@@ -50,6 +50,21 @@ def parquet_bytes_to_frame(data: bytes) -> pd.DataFrame:
     return pd.read_parquet(BytesIO(data), engine="pyarrow")
 
 
+def parquet_bytes_to_frames(data: bytes, batch_rows: int) -> Iterator[pd.DataFrame]:
+    """``data``'s rows as frames of at most ``batch_rows``, decoded one batch at a time.
+
+    For a caller whose per-row cost dwarfs the Parquet's: one frame of a whole object would
+    hold every row as Python objects at once.
+    """
+    _require_pyarrow()
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    for batch in pq.ParquetFile(BytesIO(data)).iter_batches(batch_size=batch_rows):
+        # Through a Table, so pandas metadata is honoured exactly as parquet_bytes_to_frame.
+        yield pa.Table.from_batches([batch]).to_pandas()
+
+
 def as_utc(value: datetime | pd.Timestamp) -> datetime:
     """Normalize to a tz-aware UTC ``datetime`` (SQLite returns naive UTC timestamps)."""
     if isinstance(value, pd.Timestamp):
