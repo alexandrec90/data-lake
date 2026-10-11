@@ -5,7 +5,7 @@ from sqlalchemy import select
 
 from _db import make_session_scope
 from data_lake.db.models import IpoEvent
-from data_lake.ingestion.market.ipo_common import upsert_ipo_event
+from data_lake.ingestion.market.ipo_common import is_blank_check, upsert_ipo_event
 
 T0 = datetime(2026, 10, 1, tzinfo=UTC)
 T1 = datetime(2026, 10, 2, tzinfo=UTC)
@@ -53,3 +53,25 @@ def test_stage_outside_the_vocabulary_raises(stage):
 def test_identity_and_unknown_columns_are_refused(column):
     with make_session_scope()() as session, pytest.raises(ValueError, match=column):
         upsert_ipo_event(session, "src", "k", _fields(**{column: "x"}), T0)
+
+
+@pytest.mark.parametrize(
+    ("sic", "expected"),
+    [("6770", True), (" 6770 ", True), (6770, True), ("7374", False), (None, None), ("", None)]
+    + [(True, None)],
+)
+def test_is_blank_check(sic, expected):
+    assert is_blank_check(sic) is expected
+
+
+def test_a_known_spac_flag_is_never_blanked_by_a_refresh():
+    session_cm = make_session_scope()
+    with session_cm() as session:
+        upsert_ipo_event(session, "src", "k", _fields(is_spac=True), T0)
+        upsert_ipo_event(session, "src", "k", _fields(is_spac=None), T1)
+        upsert_ipo_event(session, "src", "j", _fields(is_spac=None), T0)
+        upsert_ipo_event(session, "src", "j", _fields(is_spac=False), T1)
+
+    with session_cm() as session:
+        rows = {row.external_id: row.is_spac for row in session.scalars(select(IpoEvent))}
+    assert rows == {"k": True, "j": False}
