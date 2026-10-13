@@ -88,7 +88,7 @@ def test_yahoo_fetch_upserts_price_bars_and_maps_to_suffix(monkeypatch):
         assert bars[1].volume is None
 
 
-def test_yahoo_fetch_starts_from_next_missing_date(monkeypatch):
+def test_yahoo_fetch_resumes_from_the_newest_stored_day(monkeypatch):
     frames = [
         _frame(
             {"Open": [30.0], "High": [30.6], "Low": [29.8], "Close": [30.4], "Volume": [1.0]},
@@ -111,9 +111,107 @@ def test_yahoo_fetch_starts_from_next_missing_date(monkeypatch):
     assert yahoo.YahooConnector(session_factory=session_cm).fetch(symbol="XEQT.TO") == 1
     assert yahoo.YahooConnector(session_factory=session_cm).fetch(symbol="XEQT.TO") == 1
 
-    assert starts == [None, date(2024, 1, 3)]
+    assert starts == [None, date(2024, 1, 2)]  # the newest stored day, not the day after
     with session_cm() as session:
         assert len(session.scalars(select(PriceBar)).all()) == 2
+
+
+_OHLCV = ("Open", "High", "Low", "Close", "Volume")
+
+
+def _serve(days: dict[str, tuple[float, ...]], starts: list):
+    """A fake ``_download_history`` over ``days`` that honours ``start``/``end`` as yfinance
+    does (``end`` exclusive), so a resume date that skips a day really never sees it again."""
+
+    def fake_download(symbol, start, end, auto_adjust):
+        starts.append(start)
+        served = sorted(
+            day
+            for day in days
+            if (start is None or date.fromisoformat(day) >= start)
+            and (end is None or date.fromisoformat(day) < end)
+        )
+        columns = {col: [days[day][i] for day in served] for i, col in enumerate(_OHLCV)}
+        return _frame(columns, served)
+
+    return fake_download
+
+
+def _stored_bars(session_cm) -> dict[date, tuple[float, ...]]:
+    with session_cm() as session:
+        return {
+            bar.ts.date(): (bar.open, bar.high, bar.low, bar.close, bar.volume)
+            for bar in session.scalars(select(PriceBar))
+        }
+
+
+def test_partial_session_bar_from_2026_10_08_is_replaced_on_next_poll(monkeypatch):
+    """Incident 2026-10-08: a poll during US market hours stored that day's unfinished bar,
+    and resuming the *day after* the newest bar meant no later poll ever fetched it again.
+    The next poll must re-download the newest stored day and overwrite it with final values."""
+    partial = (100.0, 101.0, 99.5, 100.8, 1_000.0)
+    final = (100.0, 103.0, 99.0, 102.6, 4_000.0)
+    days = {"2026-10-07": (98.0, 99.0, 97.0, 98.5, 5_000.0), "2026-10-08": partial}
+    starts: list = []
+    session_cm = _make_session_scope()
+    monkeypatch.setattr(yahoo, "_download_history", _serve(days, starts))
+    connector = yahoo.YahooConnector(session_factory=session_cm)
+
+    assert connector.fetch(symbol="GOOG") == 2  # mid-session poll on 2026-10-08
+    assert _stored_bars(session_cm)[date(2026, 10, 8)] == partial
+
+    days["2026-10-08"] = final  # the session closed
+    days["2026-10-09"] = (102.6, 104.0, 102.0, 103.5, 3_000.0)
+    connector.fetch(symbol="GOOG")
+
+    assert starts == [None, date(2026, 10, 8)]
+    stored = _stored_bars(session_cm)
+    assert stored[date(2026, 10, 8)] == final
+    assert stored[date(2026, 10, 9)] == days["2026-10-09"]
+    assert len(stored) == 3
+
+
+def test_yahoo_fetch_refetches_a_bar_stored_today(monkeypatch):
+    """Newest bar is today's: the resume start is today with an open end — a non-empty range
+    (yfinance's ``end`` defaults to now) — and today's bar is overwritten, not skipped."""
+    from datetime import UTC, datetime
+
+    today = datetime.now(tz=UTC).date()
+    days = {today.isoformat(): (30.0, 30.6, 29.8, 30.4, 1.0)}
+    starts: list = []
+    session_cm = _make_session_scope()
+    monkeypatch.setattr(yahoo, "_download_history", _serve(days, starts))
+    connector = yahoo.YahooConnector(session_factory=session_cm)
+    connector.fetch(symbol="XEQT.TO", date_from=today.isoformat())
+
+    days[today.isoformat()] = (30.0, 31.2, 29.5, 31.0, 9.0)
+    assert connector.fetch(symbol="XEQT.TO") == 1
+
+    assert starts == [today, today]
+    assert _stored_bars(session_cm) == {today: (30.0, 31.2, 29.5, 31.0, 9.0)}
+
+
+def test_yahoo_fetch_refetches_the_newest_day_when_it_is_date_to(monkeypatch):
+    """Stored through ``date_to`` exactly: that day is fetched again, as ``[D, D+1)``."""
+    calls: list[tuple] = []
+    session_cm = _make_session_scope()
+    days = {"2024-01-02": (30.0, 30.6, 29.8, 30.4, 1.0)}
+    monkeypatch.setattr(yahoo, "_download_history", _serve(days, []))
+    yahoo.YahooConnector(session_factory=session_cm).fetch(symbol="XEQT.TO")
+
+    def fake_download(symbol, start, end, auto_adjust):
+        calls.append((start, end))
+        values = (30.0, 30.9, 29.8, 30.7, 2.0)
+        return _frame({col: [v] for col, v in zip(_OHLCV, values, strict=True)}, ["2024-01-02"])
+
+    monkeypatch.setattr(yahoo, "_download_history", fake_download)
+    count = yahoo.YahooConnector(session_factory=session_cm).fetch(
+        symbol="XEQT.TO", date_to="2024-01-02"
+    )
+
+    assert count == 1
+    assert calls == [(date(2024, 1, 2), date(2024, 1, 3))]
+    assert _stored_bars(session_cm)[date(2024, 1, 2)] == (30.0, 30.9, 29.8, 30.7, 2.0)
 
 
 def test_yahoo_fetch_updates_existing_price_bar(monkeypatch):
@@ -146,11 +244,11 @@ def test_yahoo_fetch_updates_existing_price_bar(monkeypatch):
         assert bars[0].close == 30.5
 
 
-def test_yahoo_fetch_skips_request_when_local_data_covers_date_to(monkeypatch):
+def test_yahoo_fetch_skips_request_when_local_data_runs_past_date_to(monkeypatch):
     session_cm = _make_session_scope()
 
     def fail_download(*args, **kwargs):
-        raise AssertionError("Yahoo should not be called when local data already covers date_to")
+        raise AssertionError("Yahoo should not be called when local data runs past date_to")
 
     monkeypatch.setattr(yahoo, "_download_history", fail_download)
 
@@ -161,7 +259,7 @@ def test_yahoo_fetch_skips_request_when_local_data_covers_date_to(monkeypatch):
         session.add(
             PriceBar(
                 instrument_id=instrument.id,
-                ts=yahoo._daily_ts(date(2024, 1, 2)),
+                ts=yahoo._daily_ts(date(2024, 1, 3)),
                 bar_size="1 day",
                 source="yahoo",
                 what_to_show="ADJUSTED_LAST",
@@ -212,18 +310,19 @@ def test_yahoo_fetch_trades_disables_auto_adjust_and_passes_exclusive_end(monkey
         assert bar.what_to_show == "TRADES"
 
 
-def test_yahoo_fetch_skips_request_when_already_current(monkeypatch):
-    """DB current through today → next missing date is in the future → don't call Yahoo."""
-    from datetime import UTC, datetime
+def test_yahoo_fetch_skips_request_when_the_newest_bar_is_in_the_future(monkeypatch):
+    """A bar dated ahead of today's UTC date (an exchange east of UTC) → resume start in the
+    future, which Yahoo rejects → return 0 without calling it."""
+    from datetime import UTC, datetime, timedelta
 
     session_cm = _make_session_scope()
 
     def fail_download(*args, **kwargs):
-        raise AssertionError("Yahoo should not be called when the next missing date is future")
+        raise AssertionError("Yahoo should not be called when the resume date is future")
 
     monkeypatch.setattr(yahoo, "_download_history", fail_download)
 
-    today = datetime.now(tz=UTC).date()
+    tomorrow = datetime.now(tz=UTC).date() + timedelta(days=1)
     with session_cm() as session:
         instrument = Instrument(symbol="XEQT", exchange="TSX", currency="CAD")
         session.add(instrument)
@@ -231,7 +330,7 @@ def test_yahoo_fetch_skips_request_when_already_current(monkeypatch):
         session.add(
             PriceBar(
                 instrument_id=instrument.id,
-                ts=yahoo._daily_ts(today),
+                ts=yahoo._daily_ts(tomorrow),
                 bar_size="1 day",
                 source="yahoo",
                 what_to_show="ADJUSTED_LAST",

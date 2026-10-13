@@ -294,7 +294,7 @@ def test_find_instrument_matches_only_the_listing_exchange():
         assert tiingo.find_instrument(session, "DO", "NASDAQ") is None
 
 
-def test_fetch_resumes_after_the_last_stored_bar(monkeypatch, keyed):
+def test_fetch_resumes_on_the_day_of_the_last_stored_bar(monkeypatch, keyed):
     scope = make_session_scope()
     starts = []
 
@@ -306,9 +306,38 @@ def test_fetch_resumes_after_the_last_stored_bar(monkeypatch, keyed):
     connector = tiingo.TiingoConnector(session_factory=scope)
     connector.fetch(symbol="AAA")
     connector.fetch(symbol="AAA")
-    assert starts == [tiingo.EARLIEST_DATE.isoformat(), "2024-01-03"]
+    assert starts == [tiingo.EARLIEST_DATE.isoformat(), "2024-01-02"]
     with scope() as session:
         assert session.scalar(select(Instrument.exchange)) == "TIINGO"
+
+
+def test_partial_session_bar_from_2026_10_08_is_replaced_on_next_poll(monkeypatch, keyed):
+    """Incident 2026-10-08 (Yahoo poll; Tiingo resumed the same way): a bar stored before
+    the day's final values (Tiingo also corrects EOD rows after its first publish) must be
+    requested again by the next poll and overwritten."""
+    closes = {"2026-10-07": 98.5, "2026-10-08": 100.8}
+    starts = []
+    scope = make_session_scope()
+
+    def fake_get(ticker, params, token):
+        starts.append(params["startDate"])
+        return _response(
+            200, [_row(day, close) for day, close in closes.items() if day >= params["startDate"]]
+        )
+
+    monkeypatch.setattr(tiingo, "_get_prices", fake_get)
+    connector = tiingo.TiingoConnector(session_factory=scope)
+    assert connector.fetch(symbol="AAA") == 2
+    closes["2026-10-08"] = 102.6
+    connector.fetch(symbol="AAA")
+
+    assert starts[1] == "2026-10-08"
+    with scope() as session:
+        bars = session.scalars(select(PriceBar).order_by(PriceBar.ts)).all()
+        assert [(b.ts.date(), b.close) for b in bars] == [
+            (date(2026, 10, 7), 98.5),
+            (date(2026, 10, 8), 102.6),
+        ]
 
 
 def test_fetch_skips_an_empty_range_without_a_request(monkeypatch, keyed):

@@ -128,7 +128,40 @@ def test_fmp_fetch_updates_existing_price_bar(monkeypatch):
         assert bars[0].close == 189.5
 
 
-def test_fmp_fetch_starts_from_next_missing_date(monkeypatch):
+def test_partial_session_bar_from_2026_10_08_is_replaced_on_next_poll(monkeypatch):
+    """Incident 2026-10-08 (Yahoo poll; FMP resumed the same way): FMP's EOD feed carries
+    the current day while it trades, so a mid-session poll stores an unfinished bar. The next
+    poll must request that day again and overwrite it with the final values."""
+    days = {
+        "2026-10-07": {"open": 98.0, "high": 99.0, "low": 97.0, "close": 98.5},
+        "2026-10-08": {"open": 100.0, "high": 101.0, "low": 99.5, "close": 100.8},
+    }
+    params_seen: list[dict[str, str]] = []
+    session_cm = _make_session_scope()
+
+    def fake_get(url, params, headers, timeout):
+        params_seen.append(dict(params))
+        since = params.get("from", "")
+        return FakeResponse([{"date": d, **row} for d, row in days.items() if d >= since])
+
+    monkeypatch.setattr(SETTINGS, "fmp_key", "test-fmp-key")
+    monkeypatch.setattr(fmp.httpx, "get", fake_get)
+    connector = fmp.FmpConnector(session_factory=session_cm)
+
+    assert connector.fetch(symbol="AAPL") == 2
+    days["2026-10-08"] = {"open": 100.0, "high": 103.0, "low": 99.0, "close": 102.6}
+    connector.fetch(symbol="AAPL")
+
+    assert params_seen[1]["from"] == "2026-10-08"
+    with session_cm() as session:
+        bars = session.scalars(select(PriceBar).order_by(PriceBar.ts)).all()
+        assert [(b.ts.date().isoformat(), b.high, b.close) for b in bars] == [
+            ("2026-10-07", 99.0, 98.5),
+            ("2026-10-08", 103.0, 102.6),
+        ]
+
+
+def test_fmp_fetch_resumes_from_the_newest_stored_day(monkeypatch):
     first_payload = [
         {"date": "2024-01-02", "open": 187.1, "high": 189.4, "low": 186.8, "close": 188.9}
     ]
@@ -150,7 +183,7 @@ def test_fmp_fetch_starts_from_next_missing_date(monkeypatch):
     assert fmp.FmpConnector(session_factory=session_cm).fetch(symbol="AAPL") == 1
 
     assert "from" not in params_seen[0]
-    assert params_seen[1]["from"] == "2024-01-03"
+    assert params_seen[1]["from"] == "2024-01-02"  # the newest stored day, not the day after
     with session_cm() as session:
         assert len(session.scalars(select(PriceBar)).all()) == 2
 
@@ -159,7 +192,7 @@ def test_fmp_fetch_skips_request_when_incremental_range_is_after_date_to(monkeyp
     session_cm = _make_session_scope()
 
     def fail_get(url, params, headers, timeout):
-        raise AssertionError("FMP should not be called when local data already covers date_to")
+        raise AssertionError("FMP should not be called when local data runs past date_to")
 
     monkeypatch.setattr(SETTINGS, "fmp_key", "test-fmp-key")
     monkeypatch.setattr(fmp.httpx, "get", fail_get)
@@ -171,7 +204,7 @@ def test_fmp_fetch_skips_request_when_incremental_range_is_after_date_to(monkeyp
         session.add(
             PriceBar(
                 instrument_id=instrument.id,
-                ts=fmp._daily_ts("2024-01-02"),
+                ts=fmp._daily_ts("2024-01-03"),
                 bar_size="1 day",
                 source="fmp",
                 what_to_show="TRADES",

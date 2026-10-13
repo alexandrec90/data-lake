@@ -35,8 +35,12 @@ BAR_SIZE = "1 day"
 WHAT_TO_SHOW = "TRADES"
 
 
-def _next_missing_date(pair: str, session_factory: SessionFactory | None = None) -> date | None:
-    """Day after the newest yahoo-source bar of the pair's CASH instrument (None = no bars)."""
+def _resume_date(pair: str, session_factory: SessionFactory | None = None) -> date | None:
+    """Day of the newest yahoo-source bar of the pair's CASH instrument (None = no bars).
+
+    That day itself, not the one after: a bar stored before the day closed must be fetched
+    again so the upsert replaces it (see ``yahoo._resume_date``).
+    """
     with resolve_session_factory(session_factory)() as session:
         latest_ts = latest_bar_ts(
             session,
@@ -50,9 +54,7 @@ def _next_missing_date(pair: str, session_factory: SessionFactory | None = None)
                 PriceBar.what_to_show == WHAT_TO_SHOW,
             ),
         )
-    if latest_ts is None:
-        return None
-    return latest_ts.date() + timedelta(days=1)
+    return None if latest_ts is None else latest_ts.date()
 
 
 class YahooFxConnector(Connector):
@@ -67,7 +69,8 @@ class YahooFxConnector(Connector):
     ) -> int:
         """Upsert daily FX bars for ``pair`` (e.g. USDCAD, close = CAD per 1 USD).
 
-        Without ``date_from``, resumes from the newest stored yahoo-source bar — or fetches
+        Without ``date_from``, resumes from the newest stored yahoo-source bar's day, inclusive
+        — or fetches
         Yahoo's full history (``period="max"``) when this source has none yet, which is the
         one-time deep backfill.
         """
@@ -78,10 +81,10 @@ class YahooFxConnector(Connector):
         start: date | None = (
             _date_from_ymd(date_from)
             if date_from
-            else _next_missing_date(fx_symbol, self.session_factory)
+            else _resume_date(fx_symbol, self.session_factory)
         )
         if start and start > datetime.now(tz=UTC).date():
-            return 0  # already current — Yahoo rejects a start date in the future
+            return 0  # Yahoo rejects a start date in the future; today is a valid range
 
         end: date | None = None
         if date_to:
