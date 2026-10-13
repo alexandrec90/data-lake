@@ -18,6 +18,7 @@ throttle, hard per-request timeout.
 from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
 from data_lake.db.models import Instrument, PriceBar
 from data_lake.ingestion.base import Connector, SessionFactory, resolve_session_factory
@@ -106,40 +107,44 @@ class YahooFxConnector(Connector):
             instrument = get_or_create_fx_instrument(session, fx_symbol)
             count = 0
             for values in _bar_values(frame):
-                # Yahoo's older FX bars occasionally report close outside [low, high] (up to
-                # ~1% in 2004-2010 USDCAD). The simulator only ever reads FX close, so widen
-                # high/low to contain open/close instead of storing an inconsistent candle.
-                values["high"] = max(values["high"], values["open"], values["close"])
-                values["low"] = min(values["low"], values["open"], values["close"])
-                existing = session.scalar(
-                    select(PriceBar).where(
-                        PriceBar.instrument_id == instrument.id,
-                        PriceBar.ts == values["ts"],
-                        PriceBar.bar_size == BAR_SIZE,
-                        PriceBar.source == self.name,
-                        PriceBar.what_to_show == WHAT_TO_SHOW,
-                    )
-                )
-                if existing:
-                    existing.open = values["open"]
-                    existing.high = values["high"]
-                    existing.low = values["low"]
-                    existing.close = values["close"]
-                    existing.volume = values["volume"]
-                else:
-                    session.add(
-                        PriceBar(
-                            instrument_id=instrument.id,
-                            ts=values["ts"],
-                            bar_size=BAR_SIZE,
-                            source=self.name,
-                            what_to_show=WHAT_TO_SHOW,
-                            open=values["open"],
-                            high=values["high"],
-                            low=values["low"],
-                            close=values["close"],
-                            volume=values["volume"],
-                        )
-                    )
+                self._upsert_bar(session, instrument.id, values)
                 count += 1
             return count
+
+    def _upsert_bar(self, session: Session, instrument_id: int, values: dict) -> None:
+        """Insert one daily bar, or overwrite the OHLCV of the stored bar at its ``ts``."""
+        # Yahoo's older FX bars occasionally report close outside [low, high] (up to
+        # ~1% in 2004-2010 USDCAD). The simulator only ever reads FX close, so widen
+        # high/low to contain open/close instead of storing an inconsistent candle.
+        values["high"] = max(values["high"], values["open"], values["close"])
+        values["low"] = min(values["low"], values["open"], values["close"])
+        existing = session.scalar(
+            select(PriceBar).where(
+                PriceBar.instrument_id == instrument_id,
+                PriceBar.ts == values["ts"],
+                PriceBar.bar_size == BAR_SIZE,
+                PriceBar.source == self.name,
+                PriceBar.what_to_show == WHAT_TO_SHOW,
+            )
+        )
+        if existing:
+            existing.open = values["open"]
+            existing.high = values["high"]
+            existing.low = values["low"]
+            existing.close = values["close"]
+            existing.volume = values["volume"]
+        else:
+            session.add(
+                PriceBar(
+                    instrument_id=instrument_id,
+                    ts=values["ts"],
+                    bar_size=BAR_SIZE,
+                    source=self.name,
+                    what_to_show=WHAT_TO_SHOW,
+                    open=values["open"],
+                    high=values["high"],
+                    low=values["low"],
+                    close=values["close"],
+                    volume=values["volume"],
+                )
+            )
