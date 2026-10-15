@@ -18,6 +18,7 @@ throttle, hard per-request timeout.
 from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
 from data_lake.db.models import Instrument, PriceBar
 from data_lake.ingestion.base import Connector, SessionFactory, resolve_session_factory
@@ -35,8 +36,12 @@ BAR_SIZE = "1 day"
 WHAT_TO_SHOW = "TRADES"
 
 
-def _next_missing_date(pair: str, session_factory: SessionFactory | None = None) -> date | None:
-    """Day after the newest yahoo-source bar of the pair's CASH instrument (None = no bars)."""
+def _resume_date(pair: str, session_factory: SessionFactory | None = None) -> date | None:
+    """Day of the newest yahoo-source bar of the pair's CASH instrument (None = no bars).
+
+    That day itself, not the one after: a bar stored before the day closed must be fetched
+    again so the upsert replaces it (see ``yahoo._resume_date``).
+    """
     with resolve_session_factory(session_factory)() as session:
         latest_ts = latest_bar_ts(
             session,
@@ -50,9 +55,7 @@ def _next_missing_date(pair: str, session_factory: SessionFactory | None = None)
                 PriceBar.what_to_show == WHAT_TO_SHOW,
             ),
         )
-    if latest_ts is None:
-        return None
-    return latest_ts.date() + timedelta(days=1)
+    return None if latest_ts is None else latest_ts.date()
 
 
 class YahooFxConnector(Connector):
@@ -67,7 +70,8 @@ class YahooFxConnector(Connector):
     ) -> int:
         """Upsert daily FX bars for ``pair`` (e.g. USDCAD, close = CAD per 1 USD).
 
-        Without ``date_from``, resumes from the newest stored yahoo-source bar — or fetches
+        Without ``date_from``, resumes from the newest stored yahoo-source bar's day, inclusive
+        — or fetches
         Yahoo's full history (``period="max"``) when this source has none yet, which is the
         one-time deep backfill.
         """
@@ -78,10 +82,10 @@ class YahooFxConnector(Connector):
         start: date | None = (
             _date_from_ymd(date_from)
             if date_from
-            else _next_missing_date(fx_symbol, self.session_factory)
+            else _resume_date(fx_symbol, self.session_factory)
         )
         if start and start > datetime.now(tz=UTC).date():
-            return 0  # already current — Yahoo rejects a start date in the future
+            return 0  # Yahoo rejects a start date in the future; today is a valid range
 
         end: date | None = None
         if date_to:
@@ -103,40 +107,44 @@ class YahooFxConnector(Connector):
             instrument = get_or_create_fx_instrument(session, fx_symbol)
             count = 0
             for values in _bar_values(frame):
-                # Yahoo's older FX bars occasionally report close outside [low, high] (up to
-                # ~1% in 2004-2010 USDCAD). The simulator only ever reads FX close, so widen
-                # high/low to contain open/close instead of storing an inconsistent candle.
-                values["high"] = max(values["high"], values["open"], values["close"])
-                values["low"] = min(values["low"], values["open"], values["close"])
-                existing = session.scalar(
-                    select(PriceBar).where(
-                        PriceBar.instrument_id == instrument.id,
-                        PriceBar.ts == values["ts"],
-                        PriceBar.bar_size == BAR_SIZE,
-                        PriceBar.source == self.name,
-                        PriceBar.what_to_show == WHAT_TO_SHOW,
-                    )
-                )
-                if existing:
-                    existing.open = values["open"]
-                    existing.high = values["high"]
-                    existing.low = values["low"]
-                    existing.close = values["close"]
-                    existing.volume = values["volume"]
-                else:
-                    session.add(
-                        PriceBar(
-                            instrument_id=instrument.id,
-                            ts=values["ts"],
-                            bar_size=BAR_SIZE,
-                            source=self.name,
-                            what_to_show=WHAT_TO_SHOW,
-                            open=values["open"],
-                            high=values["high"],
-                            low=values["low"],
-                            close=values["close"],
-                            volume=values["volume"],
-                        )
-                    )
+                self._upsert_bar(session, instrument.id, values)
                 count += 1
             return count
+
+    def _upsert_bar(self, session: Session, instrument_id: int, values: dict) -> None:
+        """Insert one daily bar, or overwrite the OHLCV of the stored bar at its ``ts``."""
+        # Yahoo's older FX bars occasionally report close outside [low, high] (up to
+        # ~1% in 2004-2010 USDCAD). The simulator only ever reads FX close, so widen
+        # high/low to contain open/close instead of storing an inconsistent candle.
+        values["high"] = max(values["high"], values["open"], values["close"])
+        values["low"] = min(values["low"], values["open"], values["close"])
+        existing = session.scalar(
+            select(PriceBar).where(
+                PriceBar.instrument_id == instrument_id,
+                PriceBar.ts == values["ts"],
+                PriceBar.bar_size == BAR_SIZE,
+                PriceBar.source == self.name,
+                PriceBar.what_to_show == WHAT_TO_SHOW,
+            )
+        )
+        if existing:
+            existing.open = values["open"]
+            existing.high = values["high"]
+            existing.low = values["low"]
+            existing.close = values["close"]
+            existing.volume = values["volume"]
+        else:
+            session.add(
+                PriceBar(
+                    instrument_id=instrument_id,
+                    ts=values["ts"],
+                    bar_size=BAR_SIZE,
+                    source=self.name,
+                    what_to_show=WHAT_TO_SHOW,
+                    open=values["open"],
+                    high=values["high"],
+                    low=values["low"],
+                    close=values["close"],
+                    volume=values["volume"],
+                )
+            )

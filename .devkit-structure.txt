@@ -33,7 +33,6 @@ dependency::pyproject.toml::sqlalchemy = 1
 dependency::pyproject.toml::yfinance = 1
 function_lines::src/data_lake/archive/bars.py::restore_price_bars = 88
 function_lines::src/data_lake/ingestion/market/fmp.py::fetch = 93
-function_lines::src/data_lake/ingestion/market/yahoo_fx.py::fetch = 82
 function_lines::src/data_lake/ingestion/news/newsapi.py::fetch = 82
 function_params::src/data_lake/ingestion/news/finnhub_backfill.py::backfill_symbols = 9
 function_params::src/data_lake/ingestion/news/finnhub_backfill.py::run_backfill = 7

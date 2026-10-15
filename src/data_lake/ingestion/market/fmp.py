@@ -4,7 +4,7 @@ Free tier ~250 req/day. Docs:
 https://site.financialmodelingprep.com/developer/docs/stable/historical-price-eod-full
 """
 
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time
 from typing import Any
 
 import httpx
@@ -103,13 +103,15 @@ def _get_instrument(session: Session, fmp_symbol: str) -> Instrument | None:
     )
 
 
-def _next_missing_date(
+def _resume_date(
     session: Session,
     instrument: Instrument,
     bar_size: str,
     source: str,
     what_to_show: str,
 ) -> date | None:
+    """The newest stored day, inclusive: FMP's EOD feed carries the current day while it
+    trades, so a bar stored mid-session must be fetched again for the update to replace it."""
     latest_ts = latest_bar_ts(
         session,
         select(func.max(PriceBar.ts)).where(
@@ -119,9 +121,7 @@ def _next_missing_date(
             PriceBar.what_to_show == what_to_show,
         ),
     )
-    if latest_ts is None:
-        return None
-    return latest_ts.date() + timedelta(days=1)
+    return None if latest_ts is None else latest_ts.date()
 
 
 class FmpConnector(Connector):
@@ -149,15 +149,15 @@ class FmpConnector(Connector):
             with self.session() as session:
                 instrument = _get_instrument(session, fmp_symbol)
                 if instrument:
-                    next_missing_date = _next_missing_date(
+                    resume_date = _resume_date(
                         session=session,
                         instrument=instrument,
                         bar_size=bar_size,
                         source=self.name,
                         what_to_show=what_to_show,
                     )
-                    if next_missing_date:
-                        effective_date_from = next_missing_date.isoformat()
+                    if resume_date:
+                        effective_date_from = resume_date.isoformat()
 
         if effective_date_from:
             params["from"] = effective_date_from

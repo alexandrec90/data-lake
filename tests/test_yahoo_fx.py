@@ -2,7 +2,7 @@
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pandas as pd
 import pytest
@@ -125,11 +125,75 @@ def test_fetch_reuses_existing_fmp_cash_instrument_and_resumes_from_yahoo_bars(m
     monkeypatch.setattr(yahoo_fx, "_download_within_timeout", fake_download)
 
     assert yahoo_fx.YahooFxConnector(session_factory=session_cm).fetch(pair="USDCAD") == 1
-    assert calls[0][1] == datetime(2026, 7, 3, tzinfo=UTC).date()  # yahoo newest (Jul 2) + 1
+    assert calls[0][1] == date(2026, 7, 2)  # yahoo newest (Jul 2) itself, not fmp's Jul 10
 
     with session_cm() as session:
         instruments = session.scalars(select(Instrument)).all()
         assert len(instruments) == 1  # shared CASH row, no duplicate
+
+
+_OHLCV = ("Open", "High", "Low", "Close", "Volume")
+
+
+def _serve(days: dict[str, tuple[float, ...]], starts: list):
+    """A fake download over ``days`` honouring ``start``/``end`` (exclusive) like yfinance."""
+
+    def fake_download(symbol, start, end, auto_adjust, timeout):
+        starts.append(start)
+        served = sorted(
+            day
+            for day in days
+            if (start is None or date.fromisoformat(day) >= start)
+            and (end is None or date.fromisoformat(day) < end)
+        )
+        columns = {col: [days[day][i] for day in served] for i, col in enumerate(_OHLCV)}
+        return _frame(columns, served)
+
+    return fake_download
+
+
+def _stored_bars(session_cm) -> dict[date, tuple[float, ...]]:
+    with session_cm() as session:
+        return {
+            bar.ts.date(): (bar.open, bar.high, bar.low, bar.close, bar.volume)
+            for bar in session.scalars(select(PriceBar))
+        }
+
+
+def test_partial_session_bar_from_2026_10_08_is_replaced_on_next_poll(monkeypatch):
+    """Incident 2026-10-08 (equity poll; FX resumed the same way): a bar stored mid-session
+    must be fetched again by the next poll and overwritten with the final values."""
+    partial = (1.38, 1.385, 1.378, 1.381, 0.0)
+    final = (1.38, 1.392, 1.376, 1.389, 0.0)
+    days = {"2026-10-07": (1.37, 1.381, 1.369, 1.38, 0.0), "2026-10-08": partial}
+    starts: list = []
+    session_cm = _make_session_scope()
+    monkeypatch.setattr(yahoo_fx, "_download_within_timeout", _serve(days, starts))
+    connector = yahoo_fx.YahooFxConnector(session_factory=session_cm)
+
+    assert connector.fetch(pair="USDCAD") == 2
+    days["2026-10-08"] = final
+    connector.fetch(pair="USDCAD")
+
+    assert starts == [None, date(2026, 10, 8)]
+    assert _stored_bars(session_cm)[date(2026, 10, 8)] == final
+
+
+def test_fetch_refetches_a_bar_stored_today(monkeypatch):
+    """Newest bar is today's: resume start is today with an open end, not a skip."""
+    today = datetime.now(tz=UTC).date()
+    days = {today.isoformat(): (1.38, 1.385, 1.378, 1.381, 0.0)}
+    starts: list = []
+    session_cm = _make_session_scope()
+    monkeypatch.setattr(yahoo_fx, "_download_within_timeout", _serve(days, starts))
+    connector = yahoo_fx.YahooFxConnector(session_factory=session_cm)
+    connector.fetch(pair="USDCAD", date_from=today.isoformat())
+
+    days[today.isoformat()] = (1.38, 1.39, 1.375, 1.388, 0.0)
+    assert connector.fetch(pair="USDCAD") == 1
+
+    assert starts == [today, today]
+    assert _stored_bars(session_cm) == {today: (1.38, 1.39, 1.375, 1.388, 0.0)}
 
 
 def test_fetch_upserts_on_repeat_and_rejects_blank_pair(monkeypatch):

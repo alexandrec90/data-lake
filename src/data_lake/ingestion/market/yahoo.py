@@ -99,13 +99,19 @@ def _bar_values(frame: pd.DataFrame) -> list[dict[str, Any]]:
     return values
 
 
-def _next_missing_date(
+def _resume_date(
     session: Session,
     instrument: Instrument,
     bar_size: str,
     source: str,
     what_to_show: str,
 ) -> date | None:
+    """The newest stored day — not the day after — so every poll fetches it again.
+
+    A poll during a trading session stores that day's unfinished bar; resuming the day after
+    it would leave it there for good (2026-10-08: 174 such bars broke a consumer's price
+    validation). Re-fetching it lets the upsert overwrite it with the final values.
+    """
     latest_ts = latest_bar_ts(
         session,
         select(func.max(PriceBar.ts)).where(
@@ -115,9 +121,7 @@ def _next_missing_date(
             PriceBar.what_to_show == what_to_show,
         ),
     )
-    if latest_ts is None:
-        return None
-    return latest_ts.date() + timedelta(days=1)
+    return None if latest_ts is None else latest_ts.date()
 
 
 class YahooConnector(Connector):
@@ -136,6 +140,9 @@ class YahooConnector(Connector):
 
         ``what_to_show="ADJUSTED_LAST"`` (default) stores dividend/split-adjusted bars —
         what the long-term backtest prefers; pass ``"TRADES"`` for raw prices.
+
+        Without ``date_from``, resumes from the newest stored bar's day, inclusive (see
+        :func:`_resume_date`), so the number returned counts that day again.
         """
         yahoo_symbol = symbol.strip().upper()
         if not yahoo_symbol:
@@ -148,7 +155,7 @@ class YahooConnector(Connector):
             with self.session() as session:
                 instrument = _get_instrument(session, yahoo_symbol)
                 if instrument:
-                    start = _next_missing_date(
+                    start = _resume_date(
                         session=session,
                         instrument=instrument,
                         bar_size=bar_size,
@@ -156,8 +163,10 @@ class YahooConnector(Connector):
                         what_to_show=what_to_show,
                     )
 
+        # A start of today is a valid range (``end`` left open means "now"); only a future
+        # one — a bar dated ahead of UTC, from an exchange east of it — is skipped.
         if start and start > datetime.now(tz=UTC).date():
-            return 0  # already current — Yahoo rejects a start date in the future
+            return 0  # Yahoo rejects a start date in the future
 
         end: date | None = None
         if date_to:

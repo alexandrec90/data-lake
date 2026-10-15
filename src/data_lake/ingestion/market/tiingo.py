@@ -388,7 +388,7 @@ class TiingoConnector(Connector):
     ) -> int:
         """Upsert adjusted daily bars for one Tiingo ticker; returns bars written.
 
-        With no ``date_from`` the fetch resumes the day after the last stored Tiingo bar, or
+        With no ``date_from`` the fetch resumes on the day of the last stored Tiingo bar, or
         starts at :data:`EARLIEST_DATE`. An unknown ticker (HTTP 404) returns 0 and creates
         no instrument.
         """
@@ -430,7 +430,12 @@ class TiingoConnector(Connector):
             return upsert_daily_bars(session, instrument.id, values, source=self.name)
 
     def _resume_date(self, ticker: str, exchange: str) -> date:
-        """The day after the last stored Tiingo bar, or :data:`EARLIEST_DATE` if none."""
+        """The day of the last stored Tiingo bar, or :data:`EARLIEST_DATE` if none.
+
+        That day itself, not the one after, so a bar stored before its final values (or
+        before Tiingo's after-hours corrections) is requested again and overwritten. It
+        costs no extra request.
+        """
         with self.session() as session:
             instrument = find_instrument(session, ticker, exchange)
             if instrument is None:
@@ -444,4 +449,4 @@ class TiingoConnector(Connector):
                     PriceBar.bar_size == "1 day",
                 ),
             )
-        return latest.date() + timedelta(days=1) if latest else EARLIEST_DATE
+        return latest.date() if latest else EARLIEST_DATE
