@@ -24,7 +24,7 @@ dependencies = [
 # Parquet cold storage. Guarded-import pattern: archive/ imports without these, and raises a
 # clear install hint when a command actually needs to read or write Parquet.
 archive = [
-    "pyarrow>=17",
+    "pyarrow>=26.0.0",
     "boto3>=1.43.114",
 ]
 # Read-only DuckDB research lens over the archived Parquet.
