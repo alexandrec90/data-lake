@@ -142,6 +142,12 @@ What that costs, worth re-reading before assuming the pool is a backup:
   to its own `%LOCALAPPDATA%/seaweedfs/meta` (a volume node pulls it over the tailnet), so
   losing the primary's drive costs at most a day of keys: a new primary restores the
   newest copy with `fs.meta.load`.
+- **No PC is the pool for good.** `storage-node.py promote` on the volume node makes it the
+  primary over the volumes and index copy it holds, and `point-consumers` repoints each
+  sibling checkout's `.env` — consumers name the endpoint by IP, and a MagicDNS name
+  belongs to one machine, so there is no alias to move instead. A one-node pool keeps one
+  copy (`000`) until a second PC joins. The runbook, planned retirement and sudden loss,
+  is in the script's docstring.
 - **Verify-then-delete deletes for real.** `archive/bars.py` drops the rows once it has
   read the object back, so the archive is the only copy of everything past the window.
 

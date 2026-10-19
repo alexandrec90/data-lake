@@ -13,6 +13,7 @@ import io
 import json
 import subprocess
 from dataclasses import asdict
+from email.message import Message
 from pathlib import Path
 
 import pytest
@@ -487,10 +488,586 @@ def test_main_dispatches_each_command(monkeypatch, tmp_path):
     monkeypatch.setattr(sn, "HOME", tmp_path)
     monkeypatch.setattr(sn, "stop", lambda: ran.append("stop"))
     monkeypatch.setattr(sn, "status", lambda primary, home: ran.append(f"status {primary}"))
-    monkeypatch.setattr(sn, "configure_buckets", lambda pin, home: ran.append(f"pin {pin}"))
+    monkeypatch.setattr(
+        sn, "configure_buckets", lambda pin, home, rep: ran.append(f"pin {pin} {rep}")
+    )
     monkeypatch.setattr(sn, "backup_meta", lambda home: ran.append("backup") or home)
+    monkeypatch.setattr(sn, "promote", lambda home, root: ran.append(f"promote {root}"))
+    monkeypatch.setattr(sn, "demote", lambda primary, home: ran.append(f"demote {primary}"))
+    monkeypatch.setattr(
+        sn,
+        "point_consumers",
+        lambda to, root, apply: ran.append(f"point {to} {root.name} {apply}"),
+    )
+    _home(tmp_path, VOLUME)
     assert sn.main(["stop"]) == 0
     assert sn.main(["status", "--primary", "100.1.2.3"]) == 0
     assert sn.main(["configure-buckets", "--pin", "raw-dumps=100.1.1.1"]) == 0
+    assert sn.main(["configure-buckets", "--replication", "001"]) == 0
     assert sn.main(["backup-meta"]) == 0
-    assert ran == ["stop", "status 100.1.2.3", "pin ['raw-dumps=100.1.1.1']", "backup"]
+    assert sn.main(["promote", "--root", str(tmp_path / "vs")]) == 0
+    assert sn.main(["demote", "--primary", "100.1.2.3"]) == 0
+    assert sn.main(["point-consumers", "--root", str(tmp_path / "vs")]) == 0
+    assert sn.main(["point-consumers", "--to", "100.4.4.4", "--root", "vs", "--apply"]) == 0
+    assert ran == [
+        "stop",
+        "status 100.1.2.3",
+        "pin ['raw-dumps=100.1.1.1'] None",
+        "pin [] 001",
+        "backup",
+        f"promote {tmp_path / 'vs'}",
+        "demote 100.1.2.3",
+        # The default target is the primary node.json names.
+        f"point {VOLUME.primary} vs False",
+        "point 100.4.4.4 vs True",
+    ]
+
+
+def test_point_consumers_from_the_supervisors_copy_needs_a_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(sn, "HOME", _home(tmp_path, VOLUME))
+    monkeypatch.setattr(sn, "LOG_FILE", tmp_path / "logs" / "storage-node.log")
+    monkeypatch.setattr(sn, "CONSUMER_ROOT", None)
+    assert sn.main(["point-consumers"]) == 1
+    assert "--root" in json.loads(sn.LOG_FILE.read_text(encoding="utf-8"))["error"]
+
+
+# --- losing or retiring the primary: the pure parts -----------------------------------
+
+PROMOTED = sn.Node(role="primary", ip=VOLUME.ip, primary=VOLUME.ip, replication="000")
+
+
+def test_a_node_json_from_before_replication_reads_as_two_copies():
+    node = sn.Node(**{"role": "primary", "ip": PRIMARY.ip, "primary": PRIMARY.ip})
+    assert node.replication == "001"
+
+
+def test_a_replication_the_pool_cannot_express_is_refused():
+    with pytest.raises(ValueError, match="replication"):
+        sn.Node(role="primary", ip="100.1.1.1", primary="100.1.1.1", replication="010")
+
+
+def test_promoted_node_is_its_own_primary_with_one_copy():
+    assert sn.promoted(VOLUME) == PROMOTED
+
+
+def test_demoted_node_registers_with_the_new_primary():
+    assert sn.demoted(PRIMARY, VOLUME.ip) == sn.Node(
+        role="volume", ip=PRIMARY.ip, primary=VOLUME.ip
+    )
+
+
+def test_a_promoted_primary_runs_the_primary_services_over_its_own_volume_dir():
+    """The volumes it holds must register: same -dir as when it was a volume node."""
+    args = sn.weed_args(PROMOTED, HOME)
+    assert "server" in args and "-filer" in args and "-s3" in args
+    assert _flag(args, "ip") == VOLUME.ip
+    assert _flag(args, "dir") == _flag(sn.weed_args(VOLUME, HOME), "dir")
+    # One node cannot place a second copy, so its default must not ask for one.
+    assert _flag(args, "master.defaultReplication") == "000"
+
+
+def test_a_one_node_pool_writes_every_bucket_as_one_copy():
+    assert sn.bucket_replication(sn.BUCKETS, "000") == {"data-lake": "000", "raw-dumps": "000"}
+    assert sn.bucket_replication(sn.BUCKETS, "001") == sn.BUCKETS
+
+
+def test_pins_naming_the_lost_node_are_dropped_and_named():
+    pins = {"raw-dumps": VOLUME.ip, "data-lake": PRIMARY.ip}
+    assert sn.drop_pins(pins, PRIMARY.ip) == ({"raw-dumps": VOLUME.ip}, ["data-lake"])
+    assert sn.drop_pins(pins, "100.9.9.9") == (pins, [])
+
+
+def test_meta_load_script_names_the_file_with_forward_slashes():
+    assert sn.meta_load_script(Path("C:/seaweed/meta/filer-20261017.meta")) == (
+        "fs.meta.load C:/seaweed/meta/filer-20261017.meta\n"
+    )
+
+
+def test_reprotect_script_restores_the_copies_of_multi_copy_buckets_only():
+    assert sn.reprotect_script(sn.BUCKETS).splitlines() == [
+        "lock",
+        "volume.configure.replication -collectionPattern=data-lake -replication=001",
+        "volume.fix.replication -collectionPattern=data-lake -apply",
+        "unlock",
+    ]
+    assert sn.reprotect_script({"raw-dumps": "000"}) == ""
+
+
+def test_newest_meta_skips_empty_saves(tmp_path):
+    assert sn.newest_meta(tmp_path) is None
+    (tmp_path / "filer-20261016.meta").write_bytes(b"x")
+    (tmp_path / "filer-20261017.meta").write_bytes(b"")
+    assert sn.newest_meta(tmp_path) == tmp_path / "filer-20261016.meta"
+
+
+def _topology(*urls: str) -> dict:
+    nodes = [{"Url": url, "Volumes": 1, "Max": 2} for url in urls]
+    return {"Topology": {"DataCenters": [{"Racks": [{"DataNodes": nodes}]}]}}
+
+
+def test_topology_hosts_strip_the_port():
+    payload = _topology(f"{PRIMARY.ip}:8080", f"{VOLUME.ip}:8080")
+    assert sn.topology_hosts(payload) == [PRIMARY.ip, VOLUME.ip]
+    assert sn.topology_hosts({}) == []
+
+
+def test_peers_accumulate_and_never_include_this_node():
+    """A peer that stops reporting is kept: a peer gone quiet is the case being checked."""
+    merged = sn.merge_peers(["100.3.3.3"], [PRIMARY.ip, VOLUME.ip], PRIMARY.ip)
+    assert sorted(merged) == sorted(["100.3.3.3", VOLUME.ip])
+
+
+def test_a_primary_is_superseded_by_a_peer_running_a_master():
+    assert sn.superseded_by(PRIMARY, [VOLUME.ip], lambda ip: True) == VOLUME.ip
+    assert sn.superseded_by(PRIMARY, [VOLUME.ip], lambda ip: False) is None
+    # Its own master answering is not a rival.
+    assert sn.superseded_by(PRIMARY, [PRIMARY.ip], lambda ip: True) is None
+
+
+def test_a_volume_node_is_never_superseded():
+    """Its primary runs a master by design; asking would demote nothing but cost a probe."""
+    asked: list[str] = []
+    assert sn.superseded_by(VOLUME, [PRIMARY.ip], lambda ip: asked.append(ip) or True) is None
+    assert asked == []
+
+
+# --- consumer .env files ------------------------------------------------------------
+
+NEW_URL = f"http://{VOLUME.ip}:{sn.S3_PORT}"
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        (
+            f"ARCHIVE_S3_ENDPOINT_URL=http://{PRIMARY.ip}:8333\n",
+            f"ARCHIVE_S3_ENDPOINT_URL={NEW_URL}\n",
+        ),
+        (
+            f'export ARCHIVE_S3_ENDPOINT_URL="http://{PRIMARY.ip}:8333"  # pool\r\n',
+            f'export ARCHIVE_S3_ENDPOINT_URL="{NEW_URL}"  # pool\r\n',
+        ),
+        (
+            f"ARCHIVE_S3_ENDPOINT_URL = http://{PRIMARY.ip}:8333/",
+            f"ARCHIVE_S3_ENDPOINT_URL = {NEW_URL}",
+        ),
+    ],
+)
+def test_rewrite_endpoint_changes_only_the_value(before, after):
+    assert sn.rewrite_endpoint(before, NEW_URL) == (after, 1)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # The note the consumers keep of their R2 days names the key; it is a comment.
+        "# R2, before the pool: ARCHIVE_S3_ENDPOINT_URL=https://acct.r2.cloudflarestorage.com\n",
+        # A consumer on R2 is not pointed at the pool.
+        "ARCHIVE_S3_ENDPOINT_URL=https://acct.r2.cloudflarestorage.com\n",
+        f"ARCHIVE_S3_ENDPOINT_URL={NEW_URL}\n",
+        f"OTHER_URL=http://{PRIMARY.ip}:8333\n",
+    ],
+)
+def test_rewrite_endpoint_leaves_everything_else(line):
+    assert sn.rewrite_endpoint(line, NEW_URL) == (line, 0)
+
+
+def test_rewrite_endpoint_keeps_every_other_byte():
+    text = (
+        "# header\r\n"
+        "ARCHIVE_BACKEND=s3\r\n"
+        "# R2, before the pool: ARCHIVE_S3_ENDPOINT_URL=https://x.r2.cloudflarestorage.com\r\n"
+        f"ARCHIVE_S3_ENDPOINT_URL=http://{PRIMARY.ip}:8333\r\n"
+        "ARCHIVE_S3_SECRET_ACCESS_KEY=abc=def\r\n"
+        "\r\n"
+        "TAIL=1"
+    )
+    new, count = sn.rewrite_endpoint(text, NEW_URL)
+    assert count == 1
+    assert new == text.replace(f"=http://{PRIMARY.ip}:8333\r\n", f"={NEW_URL}\r\n")
+
+
+def test_pool_keys_come_only_from_a_env_pointing_at_the_pool():
+    pool = (
+        f"ARCHIVE_S3_ENDPOINT_URL=http://{PRIMARY.ip}:8333\n"
+        "ARCHIVE_S3_ACCESS_KEY_ID=AK\nARCHIVE_S3_SECRET_ACCESS_KEY=SK\n"
+    )
+    assert sn.pool_keys(pool) == ("AK", "SK")
+    r2 = pool.replace(f"http://{PRIMARY.ip}:8333", "https://acct.r2.cloudflarestorage.com")
+    assert sn.pool_keys(r2) is None
+    assert sn.pool_keys(pool.replace("SK", "")) is None
+
+
+def test_pool_url_is_the_s3_gateway_over_plain_http():
+    assert sn.pool_url(PRIMARY.ip) == f"http://{PRIMARY.ip}:{sn.S3_PORT}"
+
+
+def test_env_values_reads_assignments_the_last_one_winning():
+    text = (
+        "# ARCHIVE_BACKEND=local\n"
+        "ARCHIVE_BACKEND=local\n"
+        'export ARCHIVE_S3_BUCKET="data-lake"  # the archive\r\n'
+        "\n"
+        "ARCHIVE_BACKEND = s3\n"
+    )
+    assert sn.env_values(text) == {"ARCHIVE_BACKEND": "s3", "ARCHIVE_S3_BUCKET": "data-lake"}
+    assert sn.env_values("# only a comment\n") == {}
+
+
+def _consumers(root: Path) -> dict[str, Path]:
+    envs = {
+        "ibkr_trader": (
+            "# R2, before the pool: ARCHIVE_S3_ENDPOINT_URL=https://x.r2.cloudflarestorage.com\r\n"
+            f"ARCHIVE_S3_ENDPOINT_URL=http://{PRIMARY.ip}:8333\r\n"
+            "ARCHIVE_S3_ACCESS_KEY_ID=AK\r\nARCHIVE_S3_SECRET_ACCESS_KEY=SK\r\n"
+        ),
+        "on-r2": "ARCHIVE_S3_ENDPOINT_URL=https://acct.r2.cloudflarestorage.com\n",
+    }
+    paths = {}
+    for name, text in envs.items():
+        (root / name).mkdir(parents=True)
+        paths[name] = root / name / ".env"
+        paths[name].write_bytes(text.encode("utf-8"))
+    return paths
+
+
+def test_point_consumers_is_a_dry_run_until_applied(tmp_path, capsys):
+    envs = _consumers(tmp_path)
+    before = {name: path.read_bytes() for name, path in envs.items()}
+    assert sn.point_consumers(VOLUME.ip, tmp_path, apply=False) == [envs["ibkr_trader"]]
+    assert {name: path.read_bytes() for name, path in envs.items()} == before
+    assert "--apply" in capsys.readouterr().out
+    sn.point_consumers(VOLUME.ip, tmp_path, apply=True)
+    assert envs["ibkr_trader"].read_bytes() == before["ibkr_trader"].replace(
+        f"http://{PRIMARY.ip}:8333\r\n".encode(), f"{NEW_URL}\r\n".encode()
+    )
+    assert envs["on-r2"].read_bytes() == before["on-r2"]
+    # Applied twice is applied once.
+    assert sn.point_consumers(VOLUME.ip, tmp_path, apply=True) == []
+
+
+# --- promote, demote and the supervisor -----------------------------------------------
+
+
+def _promotion(tmp_path: Path, monkeypatch, old_up: bool = False):
+    """A volume node's home with a saved index, and every side effect of promote faked."""
+    home = tmp_path / "home"
+    home.mkdir()
+    _home(home, VOLUME)
+    (home / "meta").mkdir()
+    saved = home / "meta" / "filer-20261017.meta"
+    saved.write_bytes(b"index")
+    restarts: list[dict] = []
+
+    def restart(h):
+        restarts.append(json.loads((h / "node.json").read_text(encoding="utf-8")))
+
+    monkeypatch.setattr(sn, "_restart_supervisor", restart)
+    monkeypatch.setattr(sn, "_wait_for_filer", lambda node, timeout_s=180: None)
+    monkeypatch.setattr(sn, "_master_answers", lambda ip: old_up and ip == PRIMARY.ip)
+    calls = _Calls()
+    monkeypatch.setattr(sn.subprocess, "run", calls)
+    return home, saved, restarts, calls
+
+
+def test_promote_after_a_sudden_loss_restores_the_newest_saved_index(tmp_path, monkeypatch, capsys):
+    home, saved, restarts, calls = _promotion(tmp_path, monkeypatch)
+    root = tmp_path / "vs-code"
+    _consumers(root)
+    (home / "pins.json").write_text(
+        json.dumps({"raw-dumps": VOLUME.ip, "data-lake": PRIMARY.ip}), encoding="utf-8"
+    )
+    (home / "peers.json").write_text(json.dumps([PRIMARY.ip, "100.3.3.3"]), encoding="utf-8")
+
+    assert sn.promote(home, root) == PROMOTED
+
+    # node.json said primary before the supervisor was restarted on it.
+    assert restarts == [asdict(PROMOTED)]
+    assert calls.argv == [sn.shell_args(PROMOTED, home)] * 2
+    assert calls.inputs == [
+        sn.meta_load_script(saved),
+        sn.bucket_script({"data-lake": "000", "raw-dumps": "000"}, {"raw-dumps": VOLUME.ip}),
+    ]
+    assert json.loads((home / "pins.json").read_text(encoding="utf-8")) == {"raw-dumps": VOLUME.ip}
+    # The old primary is no rival to this node, even while it is still up.
+    assert json.loads((home / "peers.json").read_text(encoding="utf-8")) == ["100.3.3.3"]
+    # The consumers' own keys, so their .env changes only the endpoint.
+    ident = json.loads((home / "s3.json").read_text(encoding="utf-8"))["identities"][0]
+    assert ident["credentials"][0] == {
+        "accessKey": "AK",
+        "secretKey": "SK",  # pragma: allowlist secret - fixture .env keys, no pool exists
+    }
+    assert not (home / "promote-pending.json").exists()
+    err = capsys.readouterr().err
+    assert "Keys written after that are lost" in err
+    assert "data-lake was pinned" in err
+    assert "--replication 001" in err
+
+
+def test_a_planned_promote_pulls_a_fresh_index_from_the_live_primary(tmp_path, monkeypatch, capsys):
+    home, _, _, calls = _promotion(tmp_path, monkeypatch, old_up=True)
+    fresh = home / "meta" / "filer-20261018.meta"
+
+    def backup(h):
+        fresh.write_bytes(b"fresh")
+        return fresh
+
+    monkeypatch.setattr(sn, "backup_meta", backup)
+    sn.promote(home, None)
+    assert calls.inputs[0] == sn.meta_load_script(fresh)
+    out = capsys.readouterr()
+    assert "Keys written after" not in out.err
+    assert f"demote --primary {VOLUME.ip}" in out.out
+
+
+def test_promote_keeps_an_s3_json_copied_over(tmp_path, monkeypatch):
+    home, _, _, _ = _promotion(tmp_path, monkeypatch)
+    copied = json.dumps(sn.s3_identities("OLD", "KEYS"))
+    (home / "s3.json").write_text(copied, encoding="utf-8")
+    sn.promote(home, None)
+    assert (home / "s3.json").read_text(encoding="utf-8") == copied
+
+
+def test_promote_with_no_keys_anywhere_mints_new_ones_and_says_so(tmp_path, monkeypatch, capsys):
+    home, _, _, _ = _promotion(tmp_path, monkeypatch)
+    sn.promote(home, None)
+    assert json.loads((home / "s3.json").read_text(encoding="utf-8"))["identities"]
+    assert "minted new ones" in capsys.readouterr().err
+
+
+def test_promote_refuses_the_primary(tmp_path):
+    """Loading a saved index over a live filer would undo every write since the save."""
+    with pytest.raises(RuntimeError, match="primary already"):
+        sn.promote(_home(tmp_path, PRIMARY))
+
+
+def test_promote_without_any_index_changes_nothing(tmp_path, monkeypatch):
+    home, saved, restarts, _ = _promotion(tmp_path, monkeypatch)
+    saved.unlink()
+    with pytest.raises(RuntimeError, match="no saved index"):
+        sn.promote(home, None)
+    assert sn._read_node(home) == VOLUME
+    assert restarts == []
+
+
+def test_a_re_run_resumes_an_interrupted_promotion(tmp_path, monkeypatch):
+    home, saved, restarts, calls = _promotion(tmp_path, monkeypatch)
+    failing = _Calls(stdout="error: rpc error: filer not ready\n")
+    monkeypatch.setattr(sn.subprocess, "run", failing)
+    with pytest.raises(RuntimeError):
+        sn.promote(home, None)
+    assert sn._read_node(home) == PROMOTED
+    monkeypatch.setattr(sn.subprocess, "run", calls)
+    assert sn.promote(home, None) == PROMOTED
+    # The supervisor was switched once; the resumed run only loads and configures.
+    assert len(restarts) == 1
+    assert calls.inputs[0] == sn.meta_load_script(saved)
+    assert not (home / "promote-pending.json").exists()
+
+
+def test_demote_rewrites_the_node_and_restarts_the_supervisor(tmp_path, monkeypatch):
+    home = _home(tmp_path, PRIMARY)
+    restarts: list[Path] = []
+    monkeypatch.setattr(sn, "_restart_supervisor", restarts.append)
+    assert sn.demote(VOLUME.ip, home) == sn.demoted(PRIMARY, VOLUME.ip)
+    assert sn._read_node(home) == sn.demoted(PRIMARY, VOLUME.ip)
+    assert restarts == [home]
+
+
+def test_restart_supervisor_ends_the_running_one_before_starting_again(tmp_path, monkeypatch):
+    """The task ignores a start while one runs, so without the end nothing would switch."""
+    calls = _Calls()
+    monkeypatch.setattr(sn.subprocess, "run", calls)
+    sn._restart_supervisor(tmp_path)
+    assert (tmp_path / "storage-node.py").is_file()
+    assert calls.argv == [
+        ["schtasks", "/End", "/TN", sn.TASK_NAME],
+        ["taskkill", "/F", "/IM", "weed.exe"],
+        ["schtasks", "/Run", "/TN", sn.TASK_NAME],
+    ]
+
+
+def test_install_keeps_a_one_node_primarys_single_copy(tmp_path, monkeypatch):
+    home = _home(tmp_path, PROMOTED)
+    monkeypatch.setattr(sn, "_tailscale_ip", lambda: PROMOTED.ip)
+    monkeypatch.setattr(sn, "_download", lambda home: home / "weed.exe")
+    monkeypatch.setattr(sn.subprocess, "run", _Calls())
+    assert sn.install("primary", None, home).replication == "000"
+
+
+class _Stop(Exception):
+    pass
+
+
+def test_a_returning_primary_that_was_superseded_runs_as_a_volume_node(tmp_path, monkeypatch):
+    home = _home(tmp_path, PRIMARY)
+    (home / "peers.json").write_text(json.dumps([VOLUME.ip]), encoding="utf-8")
+    monkeypatch.setattr(sn, "LOG_FILE", tmp_path / "logs" / "storage-node.log")
+    monkeypatch.setattr(sn, "_master_answers", lambda ip: ip == VOLUME.ip)
+    started: list[list[str]] = []
+
+    class _Exited:
+        def poll(self):
+            return 1
+
+    def popen(args, **kwargs):
+        started.append(args)
+        return _Exited()
+
+    def sleep(seconds):
+        raise _Stop
+
+    monkeypatch.setattr(sn.subprocess, "Popen", popen)
+    monkeypatch.setattr(sn.time, "sleep", sleep)
+    with pytest.raises(_Stop):
+        sn.run(home)
+    rejoined = sn.demoted(PRIMARY, VOLUME.ip)
+    assert started == [[str(sn._weed(home)), *sn.weed_args(rejoined, home)]]
+    assert sn._read_node(home) == rejoined
+    assert "superseded" in json.loads(sn.LOG_FILE.read_text(encoding="utf-8"))["error"]
+
+
+def test_a_primary_with_no_rival_runs_as_the_primary(tmp_path, monkeypatch):
+    home = _home(tmp_path, PRIMARY)
+    (home / "peers.json").write_text(json.dumps([VOLUME.ip]), encoding="utf-8")
+    monkeypatch.setattr(sn, "_master_answers", lambda ip: False)
+    started: list[list[str]] = []
+
+    class _Exited:
+        def poll(self):
+            return 1
+
+    def popen(args, **kwargs):
+        started.append(args)
+        return _Exited()
+
+    def sleep(seconds):
+        raise _Stop
+
+    monkeypatch.setattr(sn.subprocess, "Popen", popen)
+    monkeypatch.setattr(sn.time, "sleep", sleep)
+    with pytest.raises(_Stop):
+        sn.run(home)
+    assert started == [[str(sn._weed(home)), *sn.weed_args(PRIMARY, home)]]
+
+
+def test_a_running_primary_records_its_peers_and_stops_when_superseded(tmp_path, monkeypatch):
+    """The peer list is what lets a primary that was away notice it was replaced."""
+    home = _home(tmp_path, PRIMARY)
+    monkeypatch.setattr(sn, "LOG_FILE", tmp_path / "logs" / "storage-node.log")
+    monkeypatch.setattr(
+        sn,
+        "_get_json",
+        lambda url, timeout=10: _topology(f"{PRIMARY.ip}:8080", f"{VOLUME.ip}:8080"),
+    )
+    monkeypatch.setattr(sn, "_master_answers", lambda ip: ip == VOLUME.ip)
+    events: list[str] = []
+
+    class _Running:
+        def poll(self):
+            return 1 if "terminate" in events else None
+
+        def terminate(self):
+            events.append("terminate")
+
+        def wait(self):
+            events.append("wait")
+
+    def sleep(seconds):
+        if seconds == sn.RESTART_DELAY_S:
+            raise _Stop
+
+    monkeypatch.setattr(sn.subprocess, "Popen", lambda args, **kwargs: _Running())
+    monkeypatch.setattr(sn.time, "sleep", sleep)
+    monkeypatch.setattr(sn.time, "monotonic", iter([0, sn.SUPERSEDE_CHECK_EVERY_S]).__next__)
+    with pytest.raises(_Stop):
+        sn.run(home)
+    assert events == ["terminate", "wait"]
+    assert json.loads((home / "peers.json").read_text(encoding="utf-8")) == [VOLUME.ip]
+    assert sn._read_node(home) == sn.demoted(PRIMARY, VOLUME.ip)
+
+
+@pytest.mark.parametrize(
+    ("body", "answers"),
+    [(b'{"IsLeader": true}', True), (b'{"Leader": "100.1.1.1:9333"}', True), (b"{}", False)],
+)
+def test_master_answers_reads_the_cluster_status(monkeypatch, body, answers):
+    monkeypatch.setattr(sn.urllib.request, "urlopen", lambda url, timeout: io.BytesIO(body))
+    assert sn._master_answers("100.1.1.1") is answers
+
+
+def test_a_node_with_no_master_does_not_answer(monkeypatch):
+    def refused(url, timeout):
+        raise sn.urllib.error.URLError("refused")
+
+    monkeypatch.setattr(sn.urllib.request, "urlopen", refused)
+    assert sn._master_answers("100.1.1.1") is False
+
+
+def test_wait_for_filer_returns_once_it_answers_even_with_an_error(monkeypatch):
+    answers = iter(
+        [
+            sn.urllib.error.URLError("refused"),
+            sn.urllib.error.HTTPError("u", 404, "not found", Message(), None),
+        ]
+    )
+
+    def urlopen(url, timeout):
+        raise next(answers)
+
+    monkeypatch.setattr(sn.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(sn.time, "sleep", lambda s: None)
+    sn._wait_for_filer(PROMOTED)
+
+
+def test_wait_for_filer_gives_up_at_the_deadline(monkeypatch):
+    def urlopen(url, timeout):
+        raise sn.urllib.error.URLError("refused")
+
+    monkeypatch.setattr(sn.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(sn.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sn.time, "monotonic", iter([0, 10, 1000]).__next__)
+    with pytest.raises(RuntimeError, match="did not answer"):
+        sn._wait_for_filer(PROMOTED, timeout_s=180)
+
+
+# --- configure-buckets --replication ----------------------------------------------------
+
+
+def test_a_one_node_pool_configures_every_bucket_as_one_copy(tmp_path, monkeypatch, capsys):
+    calls = _Calls()
+    monkeypatch.setattr(sn.subprocess, "run", calls)
+    sn.configure_buckets([], _home(tmp_path, PROMOTED))
+    assert calls.inputs == [sn.bucket_script({"data-lake": "000", "raw-dumps": "000"})]
+    assert "one copy" in capsys.readouterr().err
+
+
+def test_two_copies_are_refused_while_the_master_sees_one_node(tmp_path, monkeypatch):
+    home = _home(tmp_path, PROMOTED)
+    monkeypatch.setattr(sn, "_get_json", lambda url, timeout=10: _topology(f"{VOLUME.ip}:8080"))
+    with pytest.raises(RuntimeError, match="second storage node"):
+        sn.configure_buckets([], home, "001")
+    assert sn._read_node(home) == PROMOTED
+
+
+def test_back_to_two_copies_restarts_the_master_and_recopies_the_volumes(tmp_path, monkeypatch):
+    home = _home(tmp_path, PROMOTED)
+    monkeypatch.setattr(
+        sn,
+        "_get_json",
+        lambda url, timeout=10: _topology(f"{VOLUME.ip}:8080", "100.3.3.3:8080"),
+    )
+    restarts: list[str] = []
+    monkeypatch.setattr(
+        sn,
+        "_restart_supervisor",
+        lambda h: restarts.append(sn._read_node(h).replication),
+    )
+    monkeypatch.setattr(sn, "_wait_for_filer", lambda node, timeout_s=180: None)
+    calls = _Calls()
+    monkeypatch.setattr(sn.subprocess, "run", calls)
+    sn.configure_buckets([], home, "001")
+    assert sn._read_node(home).replication == "001"
+    # The master's default is a start flag: the restart must see the new node.json.
+    assert restarts == ["001"]
+    assert calls.inputs == [sn.bucket_script(sn.BUCKETS, {}), sn.reprotect_script(sn.BUCKETS)]
