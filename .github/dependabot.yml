@@ -32,8 +32,10 @@ updates:
       - alexandrec90
     # Bump uv.lock, never the pyproject floors. Unset, Dependabot raised this library's
     # `pandas>=2.2` to `pandas>=3.0.6` in PR #40, and ibkr_trader, which needs pandas<3,
-    # could no longer resolve against it.
-    versioning-strategy: increase-if-necessary
+    # could no longer resolve against it. `increase-if-necessary` did not stop it either:
+    # PR #76 still rewrote `pyarrow>=17` as `pyarrow>=26.0.0`, and ibkr_trader's mlflow
+    # caps `pyarrow<26`. `lockfile-only` is the one strategy that never edits pyproject.
+    versioning-strategy: lockfile-only
     groups:
       minor-and-patch:
         update-types:
