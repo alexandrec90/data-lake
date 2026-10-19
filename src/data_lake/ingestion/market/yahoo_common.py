@@ -100,15 +100,25 @@ def tracked_yahoo_symbols(session: Session) -> list[str]:
     This is the "refresh what we track" universe for the scheduled price poll: it never
     guesses ticker formats or reads universe files — an instrument enters it via a first
     manual/batch Yahoo ingest and stays current from then on.
+
+    An EXISTS per instrument, not a join + DISTINCT: the join reads every yahoo bar in the
+    ``price_bars`` hypertable to find a few thousand instruments, while EXISTS stops at each
+    one's first match (see ``listing_dates._first_bars``). Keep it **one statement over**
+    ``instruments``, never a loop per instrument or over small batches: planning over the
+    hypertable's ~790 chunks costs ~4 s per statement on the collector (measured 2026-10-19),
+    so per-instrument statements would take hours.
     """
+    has_yahoo_bars = (
+        select(PriceBar.id)
+        .where(PriceBar.instrument_id == Instrument.id, PriceBar.source == "yahoo")
+        .exists()
+    )
     instruments = session.scalars(
         select(Instrument)
-        .join(PriceBar, PriceBar.instrument_id == Instrument.id)
         # CASH (FX) instruments also carry yahoo-source bars, but their Yahoo ticker is
         # "PAIR=X", not the equity format — they are refreshed by scheduler.poll_fx via
         # yahoo_fx.YahooFxConnector, never by the equity price poll.
-        .where(PriceBar.source == "yahoo", Instrument.sec_type != "CASH")
-        .distinct()
+        .where(has_yahoo_bars, Instrument.sec_type != "CASH")
         .order_by(Instrument.symbol)
     ).all()
     return [yahoo_symbol(instrument) for instrument in instruments]

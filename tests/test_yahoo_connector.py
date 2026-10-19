@@ -4,7 +4,7 @@ from datetime import date
 
 import pandas as pd
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -435,6 +435,49 @@ def test_tracked_yahoo_symbols_returns_only_yahoo_sourced_instruments():
     # TSX names get their Yahoo suffix back; fmp-only, bar-less and CASH (FX) instruments
     # are excluded
     assert symbols == ["AAPL", "XEQT.TO"]
+
+
+def test_tracked_yahoo_symbols_does_not_dedupe_all_of_price_bars_2026_10_19():
+    """A join + DISTINCT reads every yahoo bar in the hypertable to find a few thousand
+    instruments -- the full-table shape that got the collector's Postgres OOM-killed through
+    ``listing_dates``. An EXISTS asks each instrument for one row instead."""
+    session_cm = _make_session_scope()
+    with session_cm() as session:
+        tracked = Instrument(symbol="AAPL", exchange="SMART", currency="USD")
+        session.add(tracked)
+        session.flush()
+        session.add(
+            PriceBar(
+                instrument_id=tracked.id,
+                ts=yahoo._daily_ts(date(2024, 1, 2)),
+                bar_size="1 day",
+                source="yahoo",
+                what_to_show="ADJUSTED_LAST",
+                open=1.0,
+                high=1.0,
+                low=1.0,
+                close=1.0,
+                volume=1.0,
+            )
+        )
+        engine = session.get_bind()
+
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, *args):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        with session_cm() as session:
+            assert yahoo_common.tracked_yahoo_symbols(session) == ["AAPL"]
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    [statement] = [s for s in statements if "price_bars" in s]
+    assert "DISTINCT" not in statement.upper()
+    assert "GROUP BY" not in statement.upper()
+    assert "EXISTS" in statement.upper()
 
 
 def test_yahoo_symbol_round_trips_instrument_defaults():
