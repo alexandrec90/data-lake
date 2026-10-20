@@ -27,7 +27,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from data_lake.db.models import Instrument, IpoEvent, PriceBar
@@ -85,12 +85,35 @@ def _day(ts: datetime) -> date:
 
 
 def _first_bars(session: Session) -> dict[int, date]:
-    """Each instrument's first stored bar, as a date."""
+    """Each instrument's first stored bar, of any source, bar size or what_to_show, as a date.
+
+    One ``ORDER BY ts LIMIT 1`` per instrument, through the (instrument_id, ts) index, rather
+    than a ``min(ts) GROUP BY instrument_id`` over ``price_bars``: on TimescaleDB that grouped
+    every row of every chunk, decompressing the whole hypertable, and its memory grew with the
+    table until the collector's Postgres was OOM-killed 74 times in 2026-10-12..19. Per
+    instrument, the scan stops at its first bar. No constant ``ts`` bound applies (see
+    :mod:`data_lake.ingestion.market.bars`): the earliest bar can be in any chunk.
+
+    Keep it **one statement over** ``instruments``. Planning over the hypertable's ~790 chunks
+    costs ~4 s per statement on the collector, whatever the statement probes, so a loop per
+    instrument or over small batches pays it ~2,000 times (~2 h). Measured there on
+    2026-10-19 with EXPLAIN (ANALYZE, BUFFERS) over 25 instruments: SubPlan → Limit →
+    ordered ChunkAppend, each probe walking ~557 chunks oldest-first at 0.01-0.05 ms each and
+    decompressing only the matching segment. Planning took 4.1 s and execution 0.35 s, and db
+    memory peaked at 188 MiB, during planning. For all 1,970 instruments that extrapolates to
+    ~4 s planning plus ~25-30 s execution at ~190 MiB.
+    """
+    first = (
+        select(PriceBar.ts)
+        .where(PriceBar.instrument_id == Instrument.id)
+        .order_by(PriceBar.ts)
+        .limit(1)
+        .scalar_subquery()
+    )
     return {
-        instrument_id: _day(first)
-        for instrument_id, first in session.execute(
-            select(PriceBar.instrument_id, func.min(PriceBar.ts)).group_by(PriceBar.instrument_id)
-        )
+        instrument_id: _day(ts)
+        for instrument_id, ts in session.execute(select(Instrument.id, first))
+        if ts is not None
     }
 
 
