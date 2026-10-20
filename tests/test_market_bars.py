@@ -8,6 +8,7 @@ from sqlalchemy.pool import StaticPool
 from data_lake.db.models import Base, Instrument, PriceBar
 from data_lake.ingestion.market.bars import (
     LATEST_BAR_LOOKBACKS,
+    bar_is_consistent,
     bar_ts_since,
     latest_bar_ts,
     upsert_daily_bars,
@@ -120,6 +121,69 @@ def test_empty_values_write_nothing():
     engine = _engine()
     with Session(engine) as session:
         assert upsert_daily_bars(session, _instrument(session), iter([]), source="yahoo") == 0
+
+
+#: CPAY 2026-10-08 as a mid-session Yahoo poll stored it: close above high, 3,742 shares.
+_CPAY_PARTIAL = {
+    "ts": daily_ts(date(2026, 10, 8)),
+    "open": 401.97,
+    "high": 402.86,
+    "low": 401.78,
+    "close": 402.955,
+    "volume": 3742.0,
+}
+
+
+def test_skips_a_bar_whose_close_is_outside_its_range(caplog):
+    engine = _engine()
+    with Session(engine) as session:
+        instrument_id = _instrument(session)
+        good = _bar(date(2026, 10, 7), 402.43)
+        written = upsert_daily_bars(session, instrument_id, [good, _CPAY_PARTIAL], source="yahoo")
+        session.commit()
+
+        assert written == 1
+        bars = session.scalars(select(PriceBar)).all()
+        assert [b.ts.date() for b in bars] == [date(2026, 10, 7)]
+    assert "skipped inconsistent yahoo bar" in caplog.text
+    assert "2026-10-08" in caplog.text
+
+
+def test_an_inconsistent_refetch_leaves_the_stored_bar_alone():
+    engine = _engine()
+    with Session(engine) as session:
+        instrument_id = _instrument(session)
+        stored = {**_CPAY_PARTIAL, "high": 403.76, "low": 393.37, "close": 402.08}
+        upsert_daily_bars(session, instrument_id, [stored], source="yahoo")
+        session.commit()
+
+        assert upsert_daily_bars(session, instrument_id, [_CPAY_PARTIAL], source="yahoo") == 0
+        session.commit()
+        bar = session.scalars(select(PriceBar)).one()
+        assert (bar.high, bar.low, bar.close) == (403.76, 393.37, 402.08)
+
+
+def _ohlc(open_: float, high: float, low: float, close: float) -> dict:
+    return {"open": open_, "high": high, "low": low, "close": close}
+
+
+def test_bar_is_consistent_accepts_prices_on_the_range_edges():
+    assert bar_is_consistent(_ohlc(10.0, 12.0, 10.0, 12.0))
+    assert bar_is_consistent(_ohlc(5.0, 5.0, 5.0, 5.0))
+
+
+def test_bar_is_consistent_absorbs_adjustment_rounding_only():
+    assert bar_is_consistent(_ohlc(100.0, 101.0, 99.0, 101.0 * (1 + 1e-12)))
+    # A 10-09 as stored minutes after the close: open 2 cents under the low Yahoo had then.
+    assert not bar_is_consistent(_ohlc(168.57, 172.19, 168.59, 170.54))
+
+
+def test_bar_is_consistent_rejects_each_way_out_of_range():
+    assert not bar_is_consistent(_ohlc(13.0, 12.0, 10.0, 11.0))  # open above high
+    assert not bar_is_consistent(_ohlc(9.0, 12.0, 10.0, 11.0))  # open below low
+    assert not bar_is_consistent(_ohlc(11.0, 12.0, 10.0, 9.0))  # close below low
+    assert not bar_is_consistent(_ohlc(11.0, 10.0, 12.0, 11.0))  # low above high
+    assert not bar_is_consistent(_ohlc(float("nan"), 12.0, 10.0, 11.0))
 
 
 _NOW = datetime(2026, 10, 11, 12, tzinfo=UTC)

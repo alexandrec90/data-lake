@@ -11,8 +11,16 @@ its compressed twin and their indexes, and keeps that catalog cache until it dis
 unbounded ``max(ts)`` grew a backend from 1.4 MB to 63 MB and took 14.8 s; the same lookup bounded
 to the last 35 days took 2 MB and 0.03 s. Four such backends at once got the 768m db container
 OOM-killed six times on 2026-10-10/11.
+
+:func:`upsert_daily_bars` refuses a bar whose open or close lies outside its own low/high (see
+:func:`bar_is_consistent`). Every one of those seen so far was a bar Yahoo had not finished yet:
+fetched mid-session (CPAY 2026-10-08, 3,742 shares against a final 670,000) or minutes after the
+close, before Yahoo settled the day's low. The same days re-fetched later all came back
+consistent. Skipping such a bar leaves a gap for the next poll's re-fetch of its newest day to
+fill, which beats storing a row a consumer's price validation fails on.
 """
 
+import logging
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -22,7 +30,20 @@ from sqlalchemy.orm import Session
 
 from data_lake.db.models import PriceBar
 
-__all__ = ["LATEST_BAR_LOOKBACKS", "bar_ts_since", "latest_bar_ts", "upsert_daily_bars"]
+__all__ = [
+    "LATEST_BAR_LOOKBACKS",
+    "bar_is_consistent",
+    "bar_ts_since",
+    "latest_bar_ts",
+    "upsert_daily_bars",
+]
+
+logger = logging.getLogger(__name__)
+
+#: Float slack for :func:`bar_is_consistent`, relative to the price. ``auto_adjust`` rescales
+#: all four prices by one factor, which costs ~1e-15, so this only absorbs rounding noise. It is
+#: tighter than the 1e-7 a consumer's validation allows, so every bar it admits passes there too.
+CONSISTENCY_TOLERANCE = 1e-9
 
 #: The windows :func:`latest_bar_ts` tries, nearest first, before it scans the whole history.
 #: A series polled on schedule always has a bar in the first; the second catches one paused for
@@ -62,6 +83,16 @@ def _ts_key(ts: datetime) -> datetime:
     return ts.astimezone(UTC).replace(tzinfo=None) if ts.tzinfo else ts
 
 
+def bar_is_consistent(row: dict[str, Any]) -> bool:
+    """Whether ``row``'s open and close both lie within its ``[low, high]`` (and so low <= high).
+
+    A NaN anywhere fails every comparison, so it reads as inconsistent too.
+    """
+    low, high = row["low"], row["high"]
+    slack = CONSISTENCY_TOLERANCE * max(abs(low), abs(high))
+    return all(low - slack <= row[field] <= high + slack for field in ("open", "close"))
+
+
 def upsert_daily_bars(
     session: Session,
     instrument_id: int,
@@ -75,8 +106,26 @@ def upsert_daily_bars(
 
     Returns the number of bars written (inserted or updated). A ``ts`` repeated within
     ``values`` updates the same row rather than violating the unique constraint.
+
+    A bar failing :func:`bar_is_consistent` is logged and skipped, not clipped: a row already
+    stored for its ``ts`` is left as it was, and it does not count as written.
     """
-    rows = list(values)
+    rows = []
+    for row in values:
+        if bar_is_consistent(row):
+            rows.append(row)
+        else:
+            logger.warning(
+                "skipped inconsistent %s bar: instrument %s %s O %s H %s L %s C %s V %s",
+                source,
+                instrument_id,
+                row["ts"].date(),
+                row["open"],
+                row["high"],
+                row["low"],
+                row["close"],
+                row["volume"],
+            )
     if not rows:
         return 0
 
