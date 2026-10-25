@@ -74,6 +74,27 @@ def test_empty_extra_arguments_are_dropped():
     assert script.build_command(changed=False, extra=["", "-k", ""]).count("") == 0
 
 
+def test_help_says_it_takes_test_files(capsys):
+    """devkit ledger b8b42ded: argparse's own usage line omits what reaches pytest
+    unparsed, and a fixer told to pass test files read it as "accepts no test paths"."""
+    script = load_script("run-tests.py")
+    with pytest.raises(SystemExit):
+        script.main(["--help"])
+    assert "[--changed] [test file or pytest argument ...]" in capsys.readouterr().out
+
+
+def test_the_pr_gate_uploads_every_runners_failure_log():
+    """devkit ledger 669db913: the gate ran both runners and uploaded neither log, so the
+    fix pass's evidence ended at "details in logs/test-failures.log" and its fixer re-ran
+    the suite to learn which test had failed."""
+    gate = (REPO_ROOT / ".github" / "workflows" / "pr-gate.yml").read_text(encoding="utf-8")
+    upload = gate[gate.index("actions/upload-artifact") :]
+    assert "if: failure()" in gate[: gate.index("actions/upload-artifact")].rsplit("- name:", 1)[1]
+    for log in ("logs/lint-errors.log", "logs/test-failures.log", "logs/junit-hooks.xml"):
+        assert log in upload
+    assert "--junit-xml=logs/junit-hooks.xml" in gate
+
+
 def test_no_tests_collected_is_not_a_failure():
     """`stop.py` calls this with the changed files under tests/. Editing a conftest or a
     support module collects nothing, and reporting that as a failure blocks the stop with

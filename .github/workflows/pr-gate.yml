@@ -42,11 +42,30 @@ jobs:
           python -m pip install uv
           uv sync --all-extras --all-groups
       - name: Lint and type-check
+        id: lint
         run: uv run python scripts/lint-all.py
       - name: Application suite
+        id: application-suite
+        # After a red lint too, so one gate cycle names both failures.
+        if: success() || steps.lint.outcome == 'failure'
         run: uv run python scripts/run-tests.py
       - name: Harness hook tests
-        run: uv run python -m pytest scripts/hooks/tests/ -q
+        # The JUnit report is their failure log: without it a red vendored suite
+        # uploads nothing the fix pass can read.
+        if: success() || steps.lint.outcome == 'failure' || steps.application-suite.outcome == 'failure'
+        run: uv run python -m pytest scripts/hooks/tests/ -q --junit-xml=logs/junit-hooks.xml
+      - name: Upload failure logs
+        # Each runner prints only "FAILED - details in <its log>", so without this the
+        # fix pass's evidence names no failing test or lint finding.
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: failure-logs
+          path: |
+            logs/lint-errors.log
+            logs/test-failures.log
+            logs/junit-hooks.xml
+          if-no-files-found: ignore
 
   devkit-drift:
     name: Vendored harness drift

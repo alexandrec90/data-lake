@@ -21,6 +21,7 @@ same reason.
 Usage:
     python scripts/run-tests.py             # the whole suite
     python scripts/run-tests.py --changed   # pytest's last-failed subset
+    python scripts/run-tests.py tests/test_a.py tests/test_b.py::test_c   # just these
 """
 
 from __future__ import annotations
@@ -32,6 +33,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ARTIFACT = REPO_ROOT / "logs" / "test-failures.log"
+# Test files reach pytest as unknown arguments, which argparse's own usage line leaves
+# out: a fixer told to pass test files read "[-h] [--changed]" as "accepts no test
+# paths" and ran pytest by hand (devkit ledger b8b42ded).
+USAGE = "%(prog)s [-h] [--changed] [test file or pytest argument ...]"
 
 # Per-failure line cap. Holds a first-party traceback plus the assertion without
 # letting one deep failure crowd out the rest of the run.
@@ -95,7 +100,7 @@ def build_command(changed: bool, extra: list[str]) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, usage=USAGE)
     parser.add_argument("--changed", action="store_true", help="run pytest's last-failed subset")
     args, extra = parser.parse_known_args(argv)
 
