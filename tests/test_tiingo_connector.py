@@ -30,6 +30,8 @@ def _response(status: int, payload=None) -> httpx.Response:
 
 
 def _row(day: str, adj_close: float | None, **extra) -> dict:
+    # The adjusted range brackets the close: upsert_daily_bars skips a bar whose close is outside.
+    anchor = 10.0 if adj_close is None else adj_close
     row = {
         "date": f"{day}T00:00:00.000Z",
         "open": 99.0,
@@ -37,9 +39,9 @@ def _row(day: str, adj_close: float | None, **extra) -> dict:
         "low": 99.0,
         "close": 99.0,
         "volume": 1,
-        "adjOpen": 10.0,
-        "adjHigh": 12.0,
-        "adjLow": 9.0,
+        "adjOpen": anchor - 1,
+        "adjHigh": anchor + 2,
+        "adjLow": anchor - 3,
         "adjClose": adj_close,
         "adjVolume": 500,
         "divCash": 0.0,
@@ -262,8 +264,8 @@ def test_fetch_stores_adjusted_fields_under_the_listing_exchange(monkeypatch, ke
         )
         bars = session.scalars(select(PriceBar).order_by(PriceBar.ts)).all()
         assert [(b.ts.date(), b.open, b.high, b.low, b.close, b.volume) for b in bars] == [
-            (date(2023, 3, 8), 10.0, 12.0, 9.0, 267.83, 500.0),
-            (date(2023, 3, 9), 106.04, 12.0, 9.0, 106.04, None),
+            (date(2023, 3, 8), 267.83 - 1, 267.83 + 2, 267.83 - 3, 267.83, 500.0),
+            (date(2023, 3, 9), 106.04, 106.04 + 2, 106.04 - 3, 106.04, None),
         ]
         assert {(b.source, b.what_to_show, b.bar_size) for b in bars} == {
             ("tiingo", "ADJUSTED_LAST", "1 day")
