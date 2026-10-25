@@ -1,6 +1,7 @@
 from datetime import UTC, date, datetime
 
 import pytest
+from sqlalchemy import event
 
 from _db import make_session_scope
 from data_lake.db.models import Instrument, IpoEvent, PriceBar
@@ -177,6 +178,51 @@ def test_an_ipo_linked_instrument_without_bars_still_gets_its_date(scope):
 
     assert resolve_listing_dates(session_factory=scope) == ListingDatesReport(from_ipo=1)
     assert _listed_on(scope, instrument) == date(2024, 2, 1)
+
+
+def test_first_bars_does_not_aggregate_all_of_price_bars_2026_10_19(scope):
+    """A ``min(ts) GROUP BY instrument_id`` over the whole hypertable decompressed every chunk
+    and got the collector's Postgres OOM-killed 74 times in a week. Each instrument's first bar
+    is looked up through the (instrument_id, ts) index instead, with the same answer: the
+    earliest bar of any source, bar size or what_to_show."""
+    spin = _instrument(scope, "SPIN", date(2015, 3, 2), listed_on=date(2019, 4, 1))
+    bare = _instrument(scope, "BARE", listed_on=date(2019, 4, 1))
+    with scope() as session:
+        session.add(
+            PriceBar(
+                instrument_id=spin,
+                ts=datetime(2014, 6, 2, 14, 30, tzinfo=UTC),
+                bar_size="1 min",
+                source="ibkr",
+                what_to_show="TRADES",
+                open=1,
+                high=1,
+                low=1,
+                close=1,
+                volume=1,
+            )
+        )
+        engine = session.get_bind()
+
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, *args):
+        if "price_bars" in statement:
+            statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        report = resolve_listing_dates(session_factory=scope)
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    assert report == ListingDatesReport(from_first_bar=1)
+    assert _listed_on(scope, spin) == date(2014, 6, 2)
+    assert _listed_on(scope, bare) == date(2019, 4, 1)
+    assert statements
+    for statement in statements:
+        assert "GROUP BY" not in statement.upper()
+        assert "LIMIT" in statement.upper()  # one indexed row per instrument
 
 
 def test_a_second_run_changes_nothing(scope):
