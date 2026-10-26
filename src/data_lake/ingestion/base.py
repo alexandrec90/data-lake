@@ -23,14 +23,22 @@ resolve it through :func:`resolve_session_factory`.
 
 import abc
 import hashlib
+from collections.abc import Iterable, Mapping
 from contextlib import AbstractContextManager
+from typing import Any
 
 from sqlalchemy.orm import Session
 
 from data_lake.runtime import SessionFactory, resolve_session_factory, resolve_settings
 from data_lake.settings import LakeSettings
 
-__all__ = ["Connector", "SessionFactory", "resolve_session_factory", "stable_hash"]
+__all__ = [
+    "Connector",
+    "SessionFactory",
+    "pseudonymize",
+    "resolve_session_factory",
+    "stable_hash",
+]
 
 
 class Connector(abc.ABC):
@@ -73,3 +81,20 @@ class Connector(abc.ABC):
 def stable_hash(value: str) -> str:
     """sha256 hex digest — used for author pseudonymization and URL-based external ids."""
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def pseudonymize(payload: Mapping[str, Any], person_fields: Iterable[str]) -> dict[str, Any]:
+    """A copy of a provider payload that is safe to keep whole in a ``raw`` column.
+
+    Each top-level field in ``person_fields`` is replaced by ``<field>_hash`` (a
+    :func:`stable_hash` digest, or ``None`` when the provider sent nothing), so the stored
+    payload still says *that* two items share an author without saying *who*. Everything
+    else passes through untouched — this is what lets a connector keep the full record for
+    reprocessing instead of guessing up front which fields will matter.
+    """
+    safe = dict(payload)
+    for name in person_fields:
+        if name in safe:
+            value = safe.pop(name)
+            safe[f"{name}_hash"] = stable_hash(str(value)) if value else None
+    return safe

@@ -10,6 +10,7 @@ from sqlalchemy.pool import StaticPool
 
 from _lake_env import SETTINGS
 from data_lake.db.models import Base, NewsArticle
+from data_lake.ingestion.base import stable_hash
 from data_lake.ingestion.news import finnhub_news as fh
 
 
@@ -101,9 +102,26 @@ def test_finnhub_fetch_upserts_articles(monkeypatch):
         assert first.published_at.replace(tzinfo=UTC) == datetime.fromtimestamp(
             1_700_000_000, tz=UTC
         )
-        # raw is trimmed — image URL dropped
-        assert set(first.raw) == {"source", "category", "related"}
-        assert "image" not in first.raw
+        # raw is the whole provider item: a field nobody parses today (image) is still
+        # there for tomorrow's parser, since Finnhub will not serve it again after ~1 year
+        assert first.raw == _item(1, "AAPL beats")
+
+
+def test_finnhub_raw_hashes_a_byline_if_finnhub_ever_sends_one(monkeypatch):
+    """Keeping the item whole must not become a way for a person's name to land."""
+    session_cm = _make_session_scope()
+    item = dict(_item(1, "AAPL beats"), author="Jane Byline")
+
+    monkeypatch.setattr(SETTINGS, "finnhub_key", "test-key")
+    monkeypatch.setattr(fh.httpx, "get", lambda url, params, headers, timeout: FakeResponse([item]))
+
+    fh.FinnhubNewsConnector(session_factory=session_cm).fetch(symbol="AAPL")
+
+    with session_cm() as session:
+        raw = session.scalar(select(NewsArticle)).raw
+        assert "author" not in raw
+        assert raw["author_hash"] == stable_hash("Jane Byline")
+        assert "Jane Byline" not in str(raw)
 
 
 def test_finnhub_fetch_is_idempotent_on_reingest(monkeypatch):

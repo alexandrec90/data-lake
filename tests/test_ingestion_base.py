@@ -1,9 +1,10 @@
-"""stable_hash is the privacy mechanism for social authors (Québec rule: stored hashed only)
-— pin the algorithm so a refactor can't silently switch to something weaker or recoverable."""
+"""stable_hash and pseudonymize are the privacy mechanism for people in scraped content
+(Québec rule: stored hashed only) — pin the algorithm so a refactor can't silently switch to
+something weaker or recoverable, and pin that a payload kept whole never carries a name."""
 
 import hashlib
 
-from data_lake.ingestion.base import stable_hash
+from data_lake.ingestion.base import pseudonymize, stable_hash
 
 
 def test_stable_hash_is_sha256_hex():
@@ -30,3 +31,32 @@ def test_stable_hash_distinguishes_inputs():
 
 def test_stable_hash_handles_unicode():
     assert stable_hash("québec_trader") == hashlib.sha256("québec_trader".encode()).hexdigest()
+
+
+def test_pseudonymize_replaces_a_person_field_with_its_hash():
+    payload = {"author": "Jane Byline", "title": "headline", "source": {"name": "Wire"}}
+
+    safe = pseudonymize(payload, ["author"])
+
+    assert safe == {
+        "author_hash": stable_hash("Jane Byline"),
+        "title": "headline",
+        "source": {"name": "Wire"},
+    }
+    assert "Jane Byline" not in str(safe)
+
+
+def test_pseudonymize_stores_none_for_an_empty_person_field():
+    assert pseudonymize({"author": None}, ["author"]) == {"author_hash": None}
+    assert pseudonymize({"author": ""}, ["author"]) == {"author_hash": None}
+
+
+def test_pseudonymize_ignores_a_person_field_the_provider_did_not_send():
+    # No phantom `author_hash: None`: "absent" and "sent as null" stay distinguishable.
+    assert pseudonymize({"title": "t"}, ["author"]) == {"title": "t"}
+
+
+def test_pseudonymize_never_mutates_the_provider_payload():
+    payload = {"author": "Jane Byline"}
+    pseudonymize(payload, ["author"])
+    assert payload == {"author": "Jane Byline"}
