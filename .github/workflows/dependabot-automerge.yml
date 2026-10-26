@@ -6,10 +6,11 @@ name: Auto-merge
 # click that waits on a human after the gate has already said everything a human
 # would check. Dependabot PRs are labelled automatically by the classify job:
 #   - patch/minor bumps of anything
-#   - major bumps where EVERY updated dependency is a development dependency (dev
-#     tooling can only break CI, and the gate is what just passed)
-# Anything else — a major touching a runtime or transitive dependency, or an update
-# type Dependabot did not classify — is labelled `needs-manual-merge` and left open.
+#   - any update of a development dependency, major or unclassified (dev tooling can
+#     only break CI, and the gate is what just passed; an unclassified dev update held
+#     carameli #393's eleven classified ones for two days)
+# Anything else — a major, or an update Dependabot did not classify, touching a
+# runtime or transitive dependency — is labelled `needs-manual-merge` and left open.
 # Non-Dependabot PRs get the label from whoever decides they are routine: the
 # devkit upgrade PRs `upgrade-project.py` opens carry it from creation, and a human
 # can apply it to any PR instead of babysitting the gate.
@@ -122,10 +123,9 @@ jobs:
           # length guard is what stops an empty payload from merging itself.
           label=$(jq -r '
             if length > 0 and all(.[];
+                .dependencyType == "direct:development" or
                 .updateType == "version-update:semver-patch" or
-                .updateType == "version-update:semver-minor" or
-                (.updateType == "version-update:semver-major" and
-                 .dependencyType == "direct:development"))
+                .updateType == "version-update:semver-minor")
             then "automerge"
             else "needs-manual-merge"
             end' <<<"$UPDATED_DEPS_JSON")
@@ -137,10 +137,15 @@ jobs:
     # whole authorization, and only write access can apply it. A fork PR cannot be
     # labelled by its author, and `gh pr list --head` below matches same-repo
     # branches only, so an unlabelled or external PR falls out before the merge.
+    # A `workflow_dispatch` completion counts: a lock repair pushes with GITHUB_TOKEN,
+    # which raises no usable `pull_request` event, and dispatches the gate on the PR's
+    # branch instead. The script accepts that run only on the PR's own head branch.
+    # A `push` completion is the default branch's own gate: its move is what left every
+    # open PR's mergeability undecided, so the script sweeps them all (`DEFAULT_BRANCH`).
     if: >-
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'pull_request'
+      contains(fromJSON('["pull_request", "workflow_dispatch", "push"]'), github.event.workflow_run.event)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -154,6 +159,7 @@ jobs:
           # head has moved by then, and a mismatch declines.
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         # The runner's own Python and no install step, for the same reason the failure
         # reporter uses it: the script is stdlib-only, and a merge that had to be
         # provisioned first would fail whenever provisioning does.

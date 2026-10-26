@@ -1,12 +1,18 @@
 """Tests for scripts/project_settings.py -- the one file devkit edits and never vendors.
 
-No agent hook is wired anywhere, so the pull's whole job on this file is to take the
-`hooks` block out and leave everything else exactly as the project wrote it.
+No agent hook is wired anywhere, so the pull takes the `hooks` block out, fills in the
+agent-shell environment where a key is missing, and leaves everything else exactly as
+the project wrote it.
 """
 
 import json
+import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
+import pytest
 from conftest import load_module
 
 ps = load_module("scripts/project_settings.py")
@@ -32,6 +38,11 @@ def _hook(command: str, event: str = "PreToolUse") -> dict:
 
 def _settings(root: Path) -> dict:
     return json.loads((root / ps.SETTINGS_FILE).read_text(encoding="utf-8"))
+
+
+def _env(**extra: str) -> dict:
+    """An `env` block already carrying the agent-shell keys, plus `extra`."""
+    return {**ps.AGENT_ENV, **extra}
 
 
 # --- reading a file that may not be there ------------------------------------
@@ -71,7 +82,7 @@ def test_the_pull_unwires_every_agent_hook_and_names_the_events(tmp_path):
     """devkit's own, the guard, and one the project added itself all go: no agent hook
     is wired anywhere, so there is nothing to tell apart."""
     settings = {
-        "env": {"KEEP": "1"},
+        "env": _env(KEEP="1"),
         "hooks": {
             **_hook('python3 "x/scripts/hooks/worktree-guard-launch.py"')["hooks"],
             **_hook("npx markdownlint README.md", event="Stop")["hooks"],
@@ -82,7 +93,7 @@ def test_the_pull_unwires_every_agent_hook_and_names_the_events(tmp_path):
     assert ps.settings_pass(root, RETIRED) == [
         f"(unwired agent hooks) {ps.SETTINGS_FILE}: PreToolUse, Stop"
     ]
-    assert _settings(root) == {"env": {"KEEP": "1"}}
+    assert _settings(root) == {"env": _env(KEEP="1")}
 
 
 def test_the_strip_does_not_mutate_the_callers_tree():
@@ -95,15 +106,15 @@ def test_the_strip_does_not_mutate_the_callers_tree():
 def test_an_empty_or_malformed_hooks_block_is_removed_too(tmp_path):
     """`{"hooks": {}}` is a husk the next reader cannot tell from a hook lost by
     accident, and a non-object one is not a shape anything should keep."""
-    root = _project(tmp_path, '{"hooks": {}, "env": {}}')
+    root = _project(tmp_path, {"hooks": {}, "env": _env()})
     assert ps.settings_pass(root) == [f"(unwired agent hooks) {ps.SETTINGS_FILE}: hooks"]
-    assert _settings(root) == {"env": {}}
+    assert _settings(root) == {"env": _env()}
     assert ps.strip_hooks({"hooks": "nonsense"}) == ({}, [])
 
 
 def test_nothing_to_unwire_leaves_the_file_byte_for_byte(tmp_path):
     """A pull over an already clean project must show no settings diff."""
-    original = '{\n   "env": {"KEEP": "1"}\n}\n'
+    original = '{\n   "env": ' + json.dumps(_env(KEEP="1")) + "\n}\n"
     root = _project(tmp_path, original)
     assert ps.settings_pass(root, RETIRED) == []
     assert (root / ps.SETTINGS_FILE).read_text(encoding="utf-8") == original
@@ -124,6 +135,269 @@ def test_the_previous_sync_devkit_can_still_call_the_pass(tmp_path):
     assert ps.settings_pass(root, RETIRED)
 
 
+# --- the agent-shell environment ----------------------------------------------
+# Claude Code starts its tools under FORCE_COLOR=3, so pytest coloured every line and a
+# rich spinner (pip-audit's) redrew itself into 25 KB of one tool result.
+
+
+def test_the_pull_adds_the_agent_shell_env_and_says_which_keys(tmp_path):
+    root = _project(tmp_path, {"env": {"KEEP": "1"}, "permissions": {"allow": []}})
+    assert ps.settings_pass(root) == [
+        f"(agent shell env) {ps.SETTINGS_FILE}: PYTHON_COLORS, PY_COLORS, TTY_COMPATIBLE, TTY_INTERACTIVE, MSYS2_ARG_CONV_EXCL"
+    ]
+    assert _settings(root) == {"env": _env(KEEP="1"), "permissions": {"allow": []}}
+    assert ps.settings_pass(root) == []
+
+
+def test_a_value_the_project_set_itself_is_kept(tmp_path):
+    root = _project(tmp_path, {"env": {"PY_COLORS": "1"}})
+    assert ps.settings_pass(root) == [
+        f"(agent shell env) {ps.SETTINGS_FILE}: PYTHON_COLORS, TTY_COMPATIBLE, TTY_INTERACTIVE, MSYS2_ARG_CONV_EXCL"
+    ]
+    assert _settings(root)["env"]["PY_COLORS"] == "1"
+
+
+def test_a_settings_file_with_no_env_gets_one_and_a_malformed_env_is_left_alone(tmp_path):
+    root = _project(tmp_path, {})
+    ps.settings_pass(root)
+    assert _settings(root) == {"env": ps.AGENT_ENV}
+    assert ps.with_agent_env({"env": "nonsense"}) == ({"env": "nonsense"}, [])
+    assert ps.with_agent_env(None) == (None, [])
+
+
+def test_unwiring_and_the_env_are_one_write_with_both_notes(tmp_path):
+    root = _project(tmp_path, _hook("python3 cap.py"))
+    assert ps.settings_pass(root) == [
+        f"(unwired agent hooks) {ps.SETTINGS_FILE}: PreToolUse",
+        f"(agent shell env) {ps.SETTINGS_FILE}: PYTHON_COLORS, PY_COLORS, TTY_COMPATIBLE, TTY_INTERACTIVE, MSYS2_ARG_CONV_EXCL",
+    ]
+    assert _settings(root) == {"env": ps.AGENT_ENV}
+
+
+def test_devkit_and_the_template_carry_the_agent_shell_env():
+    """A new project and devkit itself start with it; `--pull` brings everyone else."""
+    repo = Path(__file__).resolve().parents[3]
+    template = repo / "templates/core/dot-claude/settings.json.tmpl"
+    if not template.is_file():
+        return  # a consumer: its settings are its own, and `--pull` fills them in
+    for path in (repo / ".claude/settings.json", template):
+        text = path.read_text(encoding="utf-8")
+        for key, value in ps.AGENT_ENV.items():
+            assert f'"{key}": "{value}"' in text, (path.name, key)
+
+
+# --- the dependency directories a `claude --worktree` tree borrows ---------------
+# Claude Code's git runs with hooks off, so a roguelike session's tree had no
+# `node_modules` until it ran `npm ci` by hand (98fd1f9c).
+
+
+VIRTUAL_PROJECT = "[tool.uv]\npackage = false\n"
+EDITABLE_PROJECT = '[build-system]\nrequires = ["setuptools"]\n'
+
+
+def test_the_pull_links_the_venv_and_each_node_modules_a_manifest_names(tmp_path):
+    root = _project(tmp_path, {"env": _env()})
+    _seed(root, "pyproject.toml", VIRTUAL_PROJECT)
+    for rel in ("package.json", "frontend/package.json"):
+        _seed(root, rel, "{}")
+    linked = ".venv, node_modules, frontend/node_modules"
+    assert ps.settings_pass(root) == [
+        f"(worktree links) {ps.SETTINGS_FILE}: {linked}",
+        f"(worktree links ignored) {ps.GITIGNORE}: {linked}",
+    ]
+    assert _settings(root)["worktree"] == {
+        "symlinkDirectories": [".venv", "node_modules", "frontend/node_modules"]
+    }
+    assert ps.settings_pass(root) == []
+
+
+def test_a_project_that_installs_itself_builds_its_own_venv_but_links_node_modules(tmp_path):
+    """An editable install points the checkout's venv at the checkout's `src/`: borrowed,
+    it would run the checkout's code from inside the tree, so the tests test the wrong
+    branch. `rerun_in_venv` builds such a tree its own `.venv` instead."""
+    root = _project(tmp_path, {"env": _env()})
+    _seed(root, "pyproject.toml", EDITABLE_PROJECT)
+    _seed(root, "package.json", "{}")
+    _seed(root, ps.GITIGNORE, "node_modules\n")
+    assert ps.settings_pass(root) == [f"(worktree links) {ps.SETTINGS_FILE}: node_modules"]
+    assert _settings(root)["worktree"] == {"symlinkDirectories": ["node_modules"]}
+
+
+def test_every_link_the_settings_name_is_ignored_as_a_link_not_a_directory(tmp_path):
+    """carameli #444: Claude Code linked `frontend/node_modules` into the tree, the
+    project ignored `node_modules/` -- directories only, and a link is a file to git --
+    so the fix pass's `git add -A` committed the link, an absolute path into the checkout."""
+    links = [".venv", "frontend/node_modules", "/web/node_modules/"]
+    root = _project(tmp_path, {"env": _env(), "worktree": {"symlinkDirectories": links}})
+    (root / ps.GITIGNORE).write_bytes(b"# Node\r\nnode_modules/\r\n.venv/\r\n/web/node_modules")
+    assert ps.settings_pass(root) == [
+        f"(worktree links ignored) {ps.GITIGNORE}: .venv, frontend/node_modules"
+    ]
+    text = (root / ps.GITIGNORE).read_bytes().decode("utf-8")
+    assert text.startswith("# Node\r\nnode_modules/\r\n.venv/\r\n/web/node_modules\n\n")
+    assert text.endswith("\n/.venv\n/frontend/node_modules\n")
+    assert ps.settings_pass(root) == [], "a second pull has nothing left to add"
+    if shutil.which("git"):
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        (root / "frontend").mkdir()
+        (root / "frontend" / "node_modules").write_text("a link is a file to git")
+        ignored = subprocess.run(
+            ["git", "check-ignore", "-q", "frontend/node_modules"], cwd=root, check=False
+        )
+        assert ignored.returncode == 0
+
+
+@pytest.mark.parametrize(
+    ("lines", "missing"),
+    [
+        ("", ["frontend/node_modules"]),
+        ("node_modules/\nfrontend/node_modules/\n", ["frontend/node_modules"]),
+        ("node_modules\n", []),
+        ("**/node_modules\n", []),
+        ("frontend/node_modules\n", []),
+        ("  /frontend/node_modules  \n", []),
+        ("#frontend/node_modules\n", ["frontend/node_modules"]),
+    ],
+)
+def test_unignored_reads_only_patterns_that_match_a_link(lines, missing):
+    assert ps.unignored(lines, ["frontend/node_modules"]) == missing
+
+
+def test_a_project_with_no_ignore_file_gets_one(tmp_path):
+    assert ps.ignore_links(tmp_path, [".venv"]) == [".venv"]
+    assert (tmp_path / ps.GITIGNORE).read_text(encoding="utf-8") == "\n".join(
+        [*ps.LINKS_COMMENT, "/.venv", ""]
+    )
+    assert ps.ignore_links(tmp_path, []) == []
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        None,
+        {"worktree": "no"},
+        {"worktree": {"symlinkDirectories": "no"}},
+        {"worktree": {"symlinkDirectories": [1, "", "/", "a/"]}},
+    ],
+)
+def test_worktree_links_reads_only_the_shape_claude_code_reads(settings):
+    expected = ["a"] if settings and "a/" in str(settings) else []
+    assert ps.worktree_links(settings) == expected
+
+
+@pytest.mark.parametrize(
+    ("pyproject", "borrows"),
+    [
+        (VIRTUAL_PROJECT, True),
+        (EDITABLE_PROJECT, False),
+        ("[project]\nname = 'x'\n", True),  # no build system: uv installs nothing
+        ("[tool.uv]\npackage = true\n", False),
+        (EDITABLE_PROJECT + "[tool.uv]\npackage = false\n", True),  # the setting wins
+        ("tool = 1\n", True),  # an odd `tool` table is not a package declaration
+        ("{}", False),  # will not parse: nothing can say what it installs
+    ],
+)
+def test_the_venv_is_borrowed_only_where_uv_installs_no_package(tmp_path, pyproject, borrows):
+    _seed(tmp_path, "pyproject.toml", pyproject)
+    assert ps.borrows_venv(tmp_path) is borrows
+
+
+def test_a_project_with_no_pyproject_borrows_no_venv(tmp_path):
+    assert ps.borrows_venv(tmp_path) is False
+
+
+def test_a_project_with_no_manifest_gets_no_links_and_no_write(tmp_path):
+    original = json.dumps({"env": _env()})
+    root = _project(tmp_path, original)
+    assert ps.dependency_dirs(root) == []
+    assert ps.settings_pass(root) == []
+    assert (root / ps.SETTINGS_FILE).read_text(encoding="utf-8") == original
+
+
+def test_a_manifest_inside_a_dependency_or_hidden_dir_is_not_a_project_of_its_own(tmp_path):
+    for rel in ("node_modules/package.json", ".cache/package.json", "a/b/package.json"):
+        _seed(tmp_path, rel, "{}")
+    assert ps.dependency_dirs(tmp_path) == []
+
+
+def test_links_the_project_listed_are_kept_first_and_not_repeated(tmp_path):
+    _seed(tmp_path, "pyproject.toml", "")
+    _seed(tmp_path, "package.json", "{}")
+    tree = {"worktree": {"symlinkDirectories": [".cache", ".venv"], "other": 1}}
+    updated, added = ps.with_worktree_links(tree, tmp_path)
+    assert added == ["node_modules"]
+    assert updated == {
+        "worktree": {"symlinkDirectories": [".cache", ".venv", "node_modules"], "other": 1}
+    }
+    assert tree["worktree"]["symlinkDirectories"] == [".cache", ".venv"]
+
+
+def test_a_worktree_block_of_the_wrong_shape_is_left_alone(tmp_path):
+    _seed(tmp_path, "pyproject.toml", "")
+    for tree in ({"worktree": "no"}, {"worktree": {"symlinkDirectories": "no"}}, None):
+        assert ps.with_worktree_links(tree, tmp_path) == (tree, [])
+
+
+def test_devkit_links_the_venv_and_the_template_does_not():
+    """devkit installs no package, so its trees borrow; a generated project installs itself
+    editable, so its trees build their own `.venv` and its template links nothing."""
+    repo = Path(__file__).resolve().parents[3]
+    template = repo / "templates/core/dot-claude/settings.json.tmpl"
+    if not template.is_file():
+        return  # a consumer: its settings are its own, and `--pull` fills them in
+    assert ps.borrows_venv(repo)
+    assert '"symlinkDirectories": [".venv"]' in (repo / ".claude/settings.json").read_text(
+        encoding="utf-8"
+    )
+    assert "[build-system]" in (repo / "templates/core/pyproject.toml.tmpl").read_text(
+        encoding="utf-8"
+    )
+    assert "symlinkDirectories" not in template.read_text(encoding="utf-8")
+
+
+def _git_bash() -> Path | None:
+    """Git for Windows' own `bash.exe`, never WSL's `System32\\bash.exe`."""
+    git = shutil.which("git")
+    if sys.platform != "win32" or not git:
+        return None
+    for parent in Path(git).resolve().parents:
+        if (candidate := parent / "bin" / "bash.exe").is_file():
+            return candidate
+    return None
+
+
+def _as_native_sees(bash: Path, arg: str, extra_env: dict[str, str]) -> str:
+    env = {
+        k: v for k, v in os.environ.items() if k not in ("MSYS2_ARG_CONV_EXCL", "MSYS_NO_PATHCONV")
+    }
+    python = Path(sys.executable).as_posix()
+    script = f'"{python}" -c "import sys; print(sys.argv[1])" "{arg}"'
+    done = subprocess.run(
+        [str(bash), "-c", script], env={**env, **extra_env}, capture_output=True, text=True
+    )
+    return done.stdout.strip()
+
+
+def test_git_bash_hands_a_remote_rev_path_to_git_unconverted():
+    """The ledger's f5fb6c8d: `git show origin/main:.github/dependabot.yml` from the Bash
+    tool reached git as `origin\\main;.github\\dependabot.yml`. The control run proves the
+    conversion is live here, so the second assertion is the variable's doing."""
+    arg = "origin/main:.github/dependabot.yml"
+    prefixes = ps.AGENT_ENV["MSYS2_ARG_CONV_EXCL"].split(";")
+    assert any(arg.startswith(prefix) for prefix in prefixes)
+    assert not any(prefix.startswith("/") or prefix == "*" for prefix in prefixes)
+    bash = _git_bash()
+    if bash is None:
+        return  # no MSYS runtime converts anything here; the prefix checks above still ran
+    assert _as_native_sees(bash, arg, {}) != arg
+    env = {"MSYS2_ARG_CONV_EXCL": ps.AGENT_ENV["MSYS2_ARG_CONV_EXCL"]}
+    assert _as_native_sees(bash, arg, env) == arg
+    upstream = "refs/remotes/upstream/main:.x"
+    assert _as_native_sees(bash, upstream, env) == upstream
+    # An absolute path still converts: the exclusion is by prefix, not wholesale.
+    assert _as_native_sees(bash, "/c/Windows", env) != "/c/Windows"
+
+
 # --- what `--check` says -------------------------------------------------------
 
 
@@ -141,3 +415,9 @@ def test_a_stale_codex_mirror_is_still_a_check_fault(tmp_path):
     ((label, message),) = notes
     assert "STALE" in message
     assert ps.check_summary(notes) == label
+
+
+def test_only_a_retired_python_script_can_be_a_retired_hook_command():
+    retired = ("scripts/hooks/old.py", "README.md", ".claude/skills/x/SKILL.md", "scripts/x.sh")
+    assert ps.retired_hook_paths(retired) == ("scripts/hooks/old.py",)
+    assert ps.retired_hook_paths(()) == ()

@@ -114,6 +114,93 @@ def test_failed_verification_keeps_raw(seeded, tmp_path, monkeypatch):
     assert scored.raw == {"category": "company", "id": 1}
 
 
+def _posts_across_two_months(session: Session) -> list[str]:
+    """Five scored, aged posts over two event months, inserted out of event order."""
+    later = OLD + timedelta(days=40)
+    session.add_all(
+        [
+            _post("b1", 0.1, later, raw={"n": 1}),
+            _post("a1", 0.1, OLD, raw={"n": 2}),
+            _post("b2", 0.1, later, raw={"n": 3}),
+            _post("a2", 0.1, OLD, raw={"n": 4}),
+            _post("a3", 0.1, OLD, raw={"n": 5}),
+        ]
+    )
+    session.commit()
+    return [f"raw/social_posts/{OLD:%Y-%m}.parquet", f"raw/social_posts/{later:%Y-%m}.parquet"]
+
+
+def test_a_backlog_is_archived_in_bounded_batches_each_committed(tmp_path, monkeypatch):
+    """ibkr_trader's scheduler read 8.1M social posts into memory in one SELECT and was
+    OOM-killed within seconds, on every restart, so nothing was ever archived. A batch is
+    at most `batch_rows` rows, read as columns, and committed before the next is read."""
+    session = _session()
+    month_keys = _posts_across_two_months(session)
+    store = LocalDirStore(tmp_path)
+    commits: list[int] = []
+    real_commit = session.commit
+    monkeypatch.setattr(
+        session,
+        "commit",
+        lambda: (commits.append(len(session.identity_map)), real_commit())[1],
+    )
+
+    result = archive_raw_payloads(session, store, now=NOW, batch_rows=2)
+
+    assert result.rows_archived == result.rows_removed == 5
+    assert len(commits) == 3, "five rows in batches of two"
+    assert commits == [0, 0, 0], "no ORM row is held while a batch is written"
+    assert set(result.objects) == set(month_keys)
+    archived = parquet_bytes_to_frame(store.get_bytes(month_keys[0]))
+    assert sorted(archived["external_id"]) == ["a1", "a2", "a3"], "batches merge into the month"
+    assert all(post.raw is None for post in session.execute(select(SocialPost)).scalars())
+
+
+def test_a_run_that_fails_partway_keeps_the_batches_it_finished(tmp_path, monkeypatch):
+    """Committed per batch: a backlog of millions is many runs' worth if a run dies, and
+    each run resumes where the last stopped instead of starting over."""
+    session = _session()
+    _posts_across_two_months(session)
+    store = LocalDirStore(tmp_path)
+    import data_lake.archive.raw as raw_module
+
+    real_verify = raw_module.verify_partition
+    calls: list[str] = []
+
+    def verify_twice(*args, **kwargs):
+        calls.append(args[1])
+        if len(calls) > 1:
+            raise RuntimeError("archive verification failed: injected")
+        return real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(raw_module, "verify_partition", verify_twice)
+    with pytest.raises(RuntimeError, match="injected"):
+        archive_raw_payloads(session, store, now=NOW, batch_rows=2)
+    session.rollback()
+    nulled = {p.external_id for p in session.execute(select(SocialPost)).scalars() if p.raw is None}
+    assert nulled == {"a1", "a2"}, "the first batch stays archived; the failed one is untouched"
+
+    monkeypatch.setattr(raw_module, "verify_partition", real_verify)
+    again = archive_raw_payloads(session, store, now=NOW, batch_rows=2)
+    assert again.rows_archived == 3
+
+
+def test_a_json_null_payload_never_stalls_the_batches(tmp_path):
+    """A JSON 'null' payload passes `raw IS NOT NULL` and is never NULLed, so a batch of
+    nothing but those must still move the read past them."""
+    session = _session()
+    session.add_all([_post(f"j{i}", 0.1, OLD, raw=None) for i in range(3)])
+    session.add(_post("z", 0.1, OLD + timedelta(days=1), raw={"n": 1}))
+    session.commit()
+    result = archive_raw_payloads(session, LocalDirStore(tmp_path), now=NOW, batch_rows=2)
+    assert result.rows_archived == 1
+
+
+def test_batch_rows_must_be_positive():
+    with pytest.raises(ValueError, match="batch_rows"):
+        archive_raw_payloads(_session(), LocalDirStore("unused"), batch_rows=0)
+
+
 def test_restore_refills_only_null_raw(seeded, tmp_path):
     store = LocalDirStore(tmp_path)
     archive_raw_payloads(seeded, store, now=NOW)

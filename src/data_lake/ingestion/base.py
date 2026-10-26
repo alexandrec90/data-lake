@@ -23,9 +23,10 @@ resolve it through :func:`resolve_session_factory`.
 
 import abc
 import hashlib
-from collections.abc import Iterable, Mapping
+import logging
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
-from typing import Any
+from typing import Any, TypeVar
 
 from sqlalchemy.orm import Session
 
@@ -33,12 +34,18 @@ from data_lake.runtime import SessionFactory, resolve_session_factory, resolve_s
 from data_lake.settings import LakeSettings
 
 __all__ = [
+    "AllItemsFailedError",
     "Connector",
     "SessionFactory",
     "pseudonymize",
     "resolve_session_factory",
+    "run_each",
     "stable_hash",
 ]
+
+logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 class Connector(abc.ABC):
@@ -76,6 +83,39 @@ class Connector(abc.ABC):
     @abc.abstractmethod
     def fetch(self, **kwargs) -> int:
         """Pull new data and persist it. Returns number of rows upserted."""
+
+
+class AllItemsFailedError(RuntimeError):
+    """Every item of a multi-item fetch failed; the first failure is chained as the cause."""
+
+
+def run_each(items: Sequence[T], work: Callable[[T], int], *, what: str) -> int:
+    """Sum ``work(item)`` over ``items``, tolerating some failures but not all of them.
+
+    One bad series or symbol must not cost the rest of a batch, but a run where *nothing*
+    worked is an outage (a revoked key, a provider down) and must reach the caller as one.
+    So each failure is logged by item and collected; if every item failed, this raises
+    :class:`AllItemsFailedError` naming them all. Errors are logged by ``str(exc)`` only, so
+    callers must keep credentials out of their exception messages.
+
+    Only *item* failures are tolerated: a provider refusing or failing (every connector's
+    provider error is a ``RuntimeError``) and a payload that does not parse (``ValueError``).
+    Anything else — a bug, a database error — aborts the batch at once.
+    """
+    total = 0
+    failures: list[tuple[T, Exception]] = []
+    for item in items:
+        try:
+            total += work(item)
+        except (RuntimeError, ValueError) as exc:
+            logger.warning("%s %s failed: %s", what, item, exc)
+            failures.append((item, exc))
+    if items and len(failures) == len(items):
+        names = ", ".join(str(item) for item, _ in failures)
+        raise AllItemsFailedError(
+            f"every {what} failed ({names}); first error: {failures[0][1]}"
+        ) from failures[0][1]
+    return total
 
 
 def stable_hash(value: str) -> str:

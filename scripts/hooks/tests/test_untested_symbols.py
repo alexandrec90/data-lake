@@ -17,11 +17,18 @@ purpose.** This file is part of the corpus the scanner reads, so a fixture quoti
 real symbol would have the gate certify coverage it invented; that is not hypothetical,
 it is the defect the devkit-only ancestor of this gate shipped with and had to fix.
 `test_the_gate_certifies_only_what_it_actually_tests` holds the line.
+
+**Fixture module names are invented too, and start with `acme`.** The symbol is only half
+of a vouch: a file name this file reaches puts it in that module's corpus in every
+consumer that has one, where any name called here -- `us.main(` -- reads as coverage.
+That check can only fail in the consumer, so `test_every_module_a_fixture_reaches_is_invented`
+holds the module half here, where devkit's own gate can see it.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import json
 import re
 from pathlib import Path
 
@@ -94,6 +101,7 @@ def test_public_symbols_ignores_module_level_assignments():
         "alpha(1)",  # bare call, after a from-import
         "from acme import alpha",
         "from acme import beta, alpha",
+        "from acme import (\n    beta,\n    alpha,\n)",
     ],
 )
 def test_a_reference_is_a_call_an_attribute_or_an_import(text):
@@ -107,6 +115,9 @@ def test_a_reference_is_a_call_an_attribute_or_an_import(text):
         "acme.alphabet()",  # substring after a dot
         '"alpha"',  # a bare mention in prose or a string
         "# alpha is untested",
+        "from acme import (\n    beta,\n)\nalpha = 1",  # after the list closes
+        "from acme.alpha import beta",  # a module path, not a symbol
+        "    import acme.alpha",
     ],
 )
 def test_a_bare_substring_is_not_a_reference(text):
@@ -126,12 +137,16 @@ def test_a_bare_substring_is_not_a_reference(text):
         ("alpha(1)", {"alpha"}),
         ("from acme import alpha", {"alpha"}),
         ("from acme import beta, alpha", {"beta", "alpha"}),
-        # The name is on the next line, so neither reading sees it; `import (` is a
-        # call-shaped `import` to both, which is harmless because nothing defines one.
-        ("from acme import (\n    alpha,\n)", {"import"}),
+        # A parenthesised list is read to its `)`, across lines. `import (` is also a
+        # call-shaped `import` to both readings, harmless because nothing defines one.
+        ("from acme import (\n    alpha,\n    beta,\n)\ngamma = 1", {"import", "alpha", "beta"}),
         ("alphabet = 1", set()),
         ('"alpha"', set()),
         ("# alpha is untested", set()),
+        # A dotted path in an import statement names modules, not symbols (27c631a4).
+        ("from acme.alpha import beta", {"beta"}),
+        ("import acme.alpha", set()),
+        ("import acme.alpha as beta", set()),
     ],
 )
 def test_referenced_names_reads_the_three_shapes_a_reference_takes(text, expected):
@@ -183,7 +198,7 @@ def test_the_corpus_is_only_the_tests_that_name_the_module():
     everywhere: many modules define those names, so a hit says nothing about which."""
     texts = {
         Path("tests/test_acme.py"): "acme.alpha()",
-        Path("tests/test_other.py"): "other.beta()",
+        Path("tests/test_other.py"): "acme_other.beta()",
     }
     corpus = us.corpus_for(Path("scripts/acme.py"), texts)
     assert "alpha" in corpus
@@ -203,6 +218,8 @@ def test_the_corpus_is_only_the_tests_that_name_the_module():
         "assert out == 'ran scripts/acme-tool.py'",  # a log line quoting it
         "ARTIFACTS = {'scripts/acme-tool.py': 'logs/acme.log'}",  # a mapping key
         "assert 'scripts/acme-tool.py' in manifest",  # a membership check
+        # An import by name reaches only the module it names, not a longer one.
+        "pytest.importorskip('pkg.acme_tool_helpers')",
     ],
 )
 def test_a_module_named_only_in_passing_does_not_join_its_corpus(text):
@@ -235,7 +252,7 @@ def test_corpus_files_names_the_files_the_corpus_is_made_of():
     concatenation `corpus_for` returns have to be built from the same selection."""
     texts = {
         Path("tests/test_acme.py"): "acme.alpha()",
-        Path("tests/test_other.py"): "other.beta()",
+        Path("tests/test_other.py"): "acme_other.beta()",
         Path("tests/test_caller.py"): "import acme\n",
     }
     files = us.corpus_files(Path("scripts/acme.py"), texts)
@@ -252,6 +269,10 @@ def test_corpus_files_names_the_files_the_corpus_is_made_of():
         "import acme_tool",  # an import
         "acme_tool.alpha()",  # an attribute off it
         "acme_tool = load_module('x')",  # a binding
+        # 1effb775: an import by name, bound to anything. Every public symbol of a
+        # module reached this way read as untested while the test called each one.
+        "rpt = pytest.importorskip('pkg.sub.acme_tool')",
+        'm = importlib.import_module("acme_tool")',
     ],
 )
 def test_the_prefilter_cannot_skip_a_real_mention(text):
@@ -285,9 +306,9 @@ def test_source_dirs_honours_an_explicit_list():
 
 
 def test_source_files_finds_modules_at_any_depth(tmp_path):
-    write(tmp_path, "src/acme/deep/thing.py")
+    write(tmp_path, "src/acme/deep/acme_leaf.py")
     assert us.source_files(tmp_path, config(sources=["src"])) == [
-        Path("src/acme/deep/thing.py"),
+        Path("src/acme/deep/acme_leaf.py"),
     ]
 
 
@@ -296,9 +317,9 @@ def test_source_files_finds_modules_at_any_depth(tmp_path):
     [
         "src/test_acme.py",  # a test, not a source
         "src/conftest.py",  # fixtures
-        "src/_private.py",  # not the API
+        "src/_acme.py",  # not the API
         "src/__init__.py",  # re-exports
-        "src/tests/helper.py",  # inside a tests tree
+        "src/tests/acme_helper.py",  # inside a tests tree
         "src/__pycache__/acme.py",  # tooling
         "src/.venv/lib/acme.py",  # tooling
     ],
@@ -309,7 +330,7 @@ def test_source_files_skips_what_is_not_this_project_s_api(tmp_path, rel):
 
 
 def test_source_files_honours_the_configured_exclusions(tmp_path):
-    write(tmp_path, "src/generated/client.py")
+    write(tmp_path, "src/generated/acme_client.py")
     write(tmp_path, "src/acme.py")
     cfg = config(sources=["src"], exclude=["generated"])
     assert us.source_files(tmp_path, cfg) == [Path("src/acme.py")]
@@ -365,7 +386,7 @@ def test_gaps_counts_a_module_no_test_mentions_at_all(tmp_path):
 def test_gaps_skips_a_file_that_does_not_parse(tmp_path):
     """The interpreter and the linter both say so louder, and skipping keeps one broken
     file from masking the other two hundred modules."""
-    write(tmp_path, "src/broken.py", "def alpha(:\n")
+    write(tmp_path, "src/acme_broken.py", "def alpha(:\n")
     write(tmp_path, "src/acme.py", "def beta():\n    pass\n")
     assert us.gaps(tmp_path, config(sources=["src"])) == ["src/acme.py::beta"]
 
@@ -378,6 +399,291 @@ def test_gaps_accepts_a_substituted_corpus(tmp_path):
     assert us.gaps(tmp_path, cfg, texts={}) == ["src/acme.py::alpha"]
 
 
+OVERLAY_TEST = (
+    "from shop.overlay import (\n    Offer,\n    evaluate,\n)\n\n\n"
+    "def test_it():\n    evaluate([Offer()])\n"
+)
+
+
+@pytest.mark.parametrize(
+    "init",
+    [
+        "from shop.overlay.acme_evaluate import evaluate\n"
+        "from shop.overlay.acme_offers import Offer\n",
+        "from .acme_evaluate import evaluate\nfrom .acme_offers import Offer\n",
+    ],
+)
+def test_a_test_reaching_a_module_through_its_package_reexport_covers_it(tmp_path, init):
+    """sports_betting #50: `from sports_betting.overlay import (... evaluate, ...)` named
+    neither `overlay/evaluate.py` nor `overlay/offers.py`, so every function the test
+    called read as untested, and the PR went red on a gap that was not there."""
+    write(tmp_path, "shop/__init__.py")
+    write(tmp_path, "shop/overlay/__init__.py", init)
+    write(
+        tmp_path,
+        "shop/overlay/acme_evaluate.py",
+        "def evaluate():\n    pass\n\n\nclass Verdict:\n    pass\n",
+    )
+    write(tmp_path, "shop/overlay/acme_offers.py", "class Offer:\n    pass\n")
+    write(tmp_path, "tests/test_overlay.py", OVERLAY_TEST)
+    found = us.gaps(tmp_path, config(sources=["shop"]))
+    assert found == ["shop/overlay/acme_evaluate.py::Verdict"]
+
+
+def test_a_name_imported_in_a_parenthesised_list_is_referenced(tmp_path):
+    """sports_betting #50: `OverlayHandler`, imported on the fourth line of a wrapped
+    `from ... import (` and only compared by `is`, read as untested."""
+    write(tmp_path, "src/acme_server.py", "class Handler:\n    pass\n\n\nclass Server:\n    pass\n")
+    test = (
+        "from acme_server import (\n    Handler,\n    Server,\n)\n\n\n"
+        "def test_it():\n    assert Server().handler is Handler\n"
+    )
+    write(tmp_path, "tests/test_acme_server.py", test)
+    assert us.gaps(tmp_path, config(sources=["src"])) == []
+
+
+def test_a_package_that_does_not_reexport_a_module_vouches_for_nothing_in_it(tmp_path):
+    write(tmp_path, "shop/__init__.py")
+    write(tmp_path, "shop/overlay/__init__.py", "from shop.overlay.acme_offers import Offer\n")
+    write(tmp_path, "shop/overlay/acme_evaluate.py", "def evaluate():\n    pass\n")
+    write(tmp_path, "shop/overlay/acme_offers.py", "class Offer:\n    pass\n")
+    write(tmp_path, "tests/test_overlay.py", OVERLAY_TEST)
+    found = us.gaps(tmp_path, config(sources=["shop"]))
+    assert found == ["shop/overlay/acme_evaluate.py::evaluate"]
+
+
+def test_reexporting_package_names_the_package_whose_init_imports_the_module(tmp_path):
+    write(tmp_path, "src/shop/__init__.py")
+    write(tmp_path, "src/shop/acme_core.py")
+    write(tmp_path, "src/shop/acme_other.py")
+    write(tmp_path, "src/shop/overlay/__init__.py", "from .acme_offers import Offer\n")
+    write(tmp_path, "src/shop/overlay/acme_offers.py")
+    write(tmp_path, "src/loose/acme_mod.py")
+    write(tmp_path, "src/broken/__init__.py", "from .acme_mod import (\n")
+    write(tmp_path, "src/broken/acme_mod.py")
+    offers = Path("src/shop/overlay/acme_offers.py")
+    assert us.reexporting_package(tmp_path, offers) == "shop.overlay"
+    assert us.reexporting_package(tmp_path, Path("src/shop/acme_core.py")) == ""
+    assert us.reexporting_package(tmp_path, Path("src/loose/acme_mod.py")) == ""
+    assert us.reexporting_package(tmp_path, Path("src/broken/acme_mod.py")) == ""
+
+
+def test_dotted_name_starts_at_the_outermost_package(tmp_path):
+    write(tmp_path, "src/shop/__init__.py")
+    write(tmp_path, "src/shop/overlay/__init__.py")
+    assert us.dotted_name(tmp_path, Path("src/shop/overlay")) == "shop.overlay"
+    assert us.dotted_name(tmp_path, Path("src")) == ""
+
+
+@pytest.mark.parametrize(
+    ("text", "joins"),
+    [
+        ("from shop.overlay import evaluate", True),
+        ("import shop.overlay", True),
+        ("import shop.overlay as ov", True),
+        ("from shop.overlay.server import X", False),
+        ("import shop.overlay.server", False),
+        ("from shop.overlays import X", False),
+        ("x = 'from shop.overlay import y'", False),
+    ],
+)
+def test_package_pattern_matches_an_import_of_the_package_itself(text, joins):
+    assert bool(us.package_pattern("shop.overlay").search(text)) is joins
+
+
+def test_a_fixture_named_after_the_function_it_replaces_is_not_its_test(tmp_path):
+    """devkit #394: `def gh_for(_project_dir):`, a stand-in handed to `monkeypatch` in a
+    file that also names `sweep`, read as a call of `sweep.gh_for`, and the stale half
+    of the ratchet demanded its baseline line be deleted with nothing testing it. A bare
+    call of the stand-in is a call of the stand-in too."""
+    write(tmp_path, "src/acme.py", "def alpha():\n    pass\n\n\ndef beta():\n    pass\n")
+    stand_in = (
+        "import acme\n\n\n"
+        "def alpha(_path):\n    return 1\n\n\n"
+        "def test_it(monkeypatch):\n"
+        "    monkeypatch.setattr(acme, 'alpha', alpha)\n"
+        "    assert alpha(None) == 1\n    acme.beta()\n"
+    )
+    write(tmp_path, "tests/test_acme.py", stand_in)
+    assert us.gaps(tmp_path, config(sources=["src"])) == ["src/acme.py::alpha"]
+
+
+def test_a_stand_in_does_not_hide_a_real_reference_in_the_same_file(tmp_path):
+    write(tmp_path, "src/acme.py", "def alpha():\n    pass\n")
+    for reaching in ("import acme\nacme.alpha()\n", "from acme import alpha\n"):
+        write(tmp_path, "tests/test_acme.py", reaching + "\n\ndef alpha():\n    pass\n")
+        assert us.gaps(tmp_path, config(sources=["src"])) == [], reaching
+
+
+def test_a_call_on_a_module_loaded_by_path_vouches_only_for_that_module(tmp_path):
+    """1a0918d0: `installer.runner_script()`, with `installer` loaded from
+    install-collectors.py, sat in a file whose other test loads install-global-tools.py
+    into the same local name, and read as coverage of install-global-tools.py's
+    `runner_script`. The ratchet demanded that baseline line be deleted as "now covered",
+    and the reporter renamed a new function to get past it."""
+    write(tmp_path, "src/acme-tool.py", "def alpha():\n    pass\n")
+    write(tmp_path, "src/acme-other.py", "def alpha():\n    pass\n\n\ndef beta():\n    pass\n")
+    tests = (
+        "def test_acme():\n    tool = load('src/acme-tool.py')\n    tool.alpha()\n\n\n"
+        "def test_other():\n    tool = load('src/acme-other.py')\n    tool.beta()\n"
+    )
+    write(tmp_path, "tests/test_tools.py", tests)
+    assert us.gaps(tmp_path, config(sources=["src"])) == ["src/acme-other.py::alpha"]
+
+
+def test_a_module_level_load_binds_its_name_in_every_test_that_does_not_rebind_it(tmp_path):
+    write(tmp_path, "src/acme-tool.py", "def alpha():\n    pass\n")
+    write(tmp_path, "src/acme-other.py", "def alpha():\n    pass\n")
+    tests = (
+        "acme = load('src/acme-tool.py')\nacme_other = load('src/acme-other.py')\n\n\n"
+        "def test_it():\n    acme.alpha()\n"
+    )
+    write(tmp_path, "tests/test_tools.py", tests)
+    assert us.gaps(tmp_path, config(sources=["src"])) == ["src/acme-other.py::alpha"]
+
+
+def test_a_module_level_load_after_a_helper_vouches_only_for_its_own_module(tmp_path):
+    """7e14d6d3: `up = load_script("db-upgrade.py")` written below `def load_script`
+    joined that function's scope, `up` was never bound, and `up.write_artifact` vouched
+    for db-revision.py's same-named helper, which the file also loads."""
+    write(tmp_path, "src/acme-upgrade.py", "def write_artifact():\n    pass\n")
+    write(tmp_path, "src/acme-revision.py", "def write_artifact():\n    pass\n")
+    tests = (
+        "def load_script(name):\n    return load('src/' + name)\n\n\n"
+        "up = load_script('acme-upgrade.py')\n\n\n"
+        "def test_it():\n    up.write_artifact()\n\n\n"
+        "def test_revision():\n    load_script('acme-revision.py')\n"
+    )
+    write(tmp_path, "tests/test_db.py", tests)
+    found = us.gaps(tmp_path, config(sources=["src"]))
+    assert found == ["src/acme-revision.py::write_artifact"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "def test_it(tool):\n    tool.alpha()\n",  # a fixture: which module is not written here
+        "def test_it():\n    tool = load('src/acme-tool.py')\n    tool = wrap(tool)\n"
+        "    tool.alpha()\n",  # also bound some other way
+        "def test_it():\n    tool = load('src/acme-tool.py')\n    x.tool.alpha()\n",  # not the name
+        "def test_it():\n    tool = load('src/acme-tool.py')\n    alpha()\n",  # a bare call
+    ],
+)
+def test_a_receiver_the_file_does_not_bind_by_path_vouches_as_before(tmp_path, body):
+    """Narrowed only where the file itself says which module a name is. Anything else
+    keeps vouching for every module the file names -- the gate's no-false-negative
+    claim is about gaps, and a false gap fails new, tested code."""
+    write(tmp_path, "src/acme-tool.py", "def beta():\n    pass\n")
+    write(tmp_path, "src/acme-other.py", "def alpha():\n    pass\n")
+    loads = "def test_load():\n    load('src/acme-tool.py').beta()\n    load('src/acme-other.py')\n"
+    write(tmp_path, "tests/test_tools.py", loads + "\n\n" + body)
+    assert us.gaps(tmp_path, config(sources=["src"])) == [], body
+
+
+@pytest.mark.parametrize(
+    "reach",
+    [
+        "from vendor.alpha import run\n\n\ndef test_it():\n    run()\n",
+        "import vendor.alpha\n",
+        "import vendor\n\n\ndef test_it():\n    vendor.alpha.run()\n",
+        "import vendor as v\n\n\ndef test_it():\n    v.alpha.run()\n",
+        "def test_it():\n    import vendor.sub as v\n    v.alpha()\n",
+    ],
+)
+def test_a_name_off_a_module_the_project_does_not_define_vouches_for_nothing(tmp_path, reach):
+    """27c631a4: `typer.main.get_command`, and even `from typer.main import get_command`,
+    in a test file that loads four scripts by path read as coverage of each script's
+    `main`, and the ratchet demanded their baseline lines be dropped as "now covered".
+    A dotted path in an import statement names modules, never a symbol; and a name
+    reached off a module the file imports belongs to that module."""
+    write(tmp_path, "src/acme-tool.py", "def alpha():\n    pass\n\n\ndef beta():\n    pass\n")
+    loads = "def test_load():\n    load('src/acme-tool.py').beta()\n"
+    write(tmp_path, "tests/test_tools.py", reach + "\n\n" + loads)
+    assert us.gaps(tmp_path, config(sources=["src"])) == ["src/acme-tool.py::alpha"], reach
+
+
+@pytest.mark.parametrize(
+    "reach, uncovered",
+    [
+        ("import acme_tool\n\n\ndef test_it():\n    acme_tool.alpha()\n", "pkg/acme_core.py"),
+        (
+            "import src.acme_tool as tool\n\n\ndef test_it():\n    tool.alpha()\n",
+            "pkg/acme_core.py",
+        ),
+        ("import src\n\n\ndef test_it():\n    src.acme_tool.alpha()\n", "pkg/acme_core.py"),
+        # reached through another module that imports it
+        (
+            "import acme_other\n\n\ndef test_it():\n    acme_other.acme_tool.alpha()\n",
+            "pkg/acme_core.py",
+        ),
+        # reached through the package that re-exports it
+        ("import pkg as p\n\n\ndef test_it():\n    p.alpha()\n", "src/acme_tool.py"),
+    ],
+)
+def test_a_name_off_an_imported_project_module_still_vouches_for_it(tmp_path, reach, uncovered):
+    """The other side of 27c631a4: a module the file imports under its own name, a
+    dotted path or an alias still covers what is reached off it."""
+    write(tmp_path, "src/__init__.py")
+    write(tmp_path, "src/acme_tool.py", "def alpha():\n    pass\n")
+    write(tmp_path, "pkg/__init__.py", "from .acme_core import alpha\n")
+    write(tmp_path, "pkg/acme_core.py", "def alpha():\n    pass\n")
+    write(tmp_path, "tests/test_tools.py", reach)
+    found = us.gaps(tmp_path, config(sources=["src", "pkg"]))
+    assert found == [f"{uncovered}::alpha"], reach
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("t = load('s/a-b.py')\nt.alpha()\n", {"alpha": {"a-b.py"}}),
+        ("import acme\nacme.alpha()\n", {"alpha": {"acme.py"}}),
+        ("import x.acme as t, y\nt.alpha()\n", {"alpha": {"x.py", "acme.py"}}),
+        ("import x\nx.acme.alpha()\n", {"acme": {"x.py"}, "alpha": {"x.py", "acme.py"}}),
+        ("import x\nx = 1\nx.alpha()\n", {}),  # also bound some other way
+        ("import x.alpha\nfrom y.beta import z\n", {}),  # an import path is no attribute
+        ('t = load(r"s\\\\a.py")\nt.alpha()\nt.alpha\n', {"alpha": {"a.py"}}),
+        (
+            "def f():\n    t = load('a.py')\n    t.x()\n\ndef g():\n    t = load('b.py')\n    t.x()\n",
+            {"x": {"a.py", "b.py"}},
+        ),
+        ("def f():\n    t = load('a.py')\n    t.x()\n\ndef g(t):\n    t.x()\n", {}),
+        ("t = load('a.py')\nt.x()\nu.x()\n", {}),
+        ("t = load('a.py')\nt.x()\nfrom m import x\n", {}),
+        ("t: object = load('a.py')\nt.x()\n", {"x": {"a.py"}}),
+        ("t = load('a.py')\nt == 1\nt.x()\n", {"x": {"a.py"}}),
+        # 7e14d6d3: a module-level load written after a function is still module-level
+        (
+            "def load(p):\n    pass\n\n\nt = load('a.py')\n\n\ndef f():\n    t.x()\n",
+            {"x": {"a.py"}},
+        ),
+        (
+            "@fixture\ndef load(p):\n    pass\nt = load('a.py')\ndef f():\n    t.x()\n",
+            {"x": {"a.py"}},
+        ),
+        ("def g(\n    p,\n):\n    pass\nt = load('a.py')\nt.x()\n", {"x": {"a.py"}}),
+    ],
+)
+def test_attributes_by_module_reads_only_receivers_a_loader_bound(text, expected):
+    found = us.attributes_by_module(text)
+    assert found == {name: frozenset(files) for name, files in expected.items()}
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("def alpha():\n    alpha()\n", {"alpha"}),
+        ("async def alpha():\n    pass\n", {"alpha"}),
+        ("class Alpha:\n    pass\n", {"Alpha"}),
+        ("def test_it():\n    def  alpha(_p):\n        pass\n", {"test_it", "alpha"}),
+        ("import acme\ndef alpha():\n    acme.alpha()\n", set()),  # reached as an attribute
+        ("from acme import alpha\ndef alpha():\n    pass\n", set()),  # reached by an import
+        ("alpha()\n", set()),  # a call is not a definition
+    ],
+)
+def test_shadowed_names_are_the_file_s_own_definitions_it_never_reaches_elsewhere(text, expected):
+    assert us.shadowed_names(text) == frozenset(expected)
+
+
 def test_read_tests_returns_the_text_of_every_corpus_file(tmp_path):
     write(tmp_path, "tests/test_acme.py", "acme.alpha()")
     assert us.read_tests(tmp_path, config(sources=["src"])) == {
@@ -386,40 +692,6 @@ def test_read_tests_returns_the_text_of_every_corpus_file(tmp_path):
 
 
 # --- code_only: prose cannot put a file in a corpus ---------------------------
-
-
-def test_code_only_blanks_docstrings_and_comments_and_keeps_layout():
-    """Blanked to spaces, not cut: every remaining token keeps its line and column, and
-    the string a loader is *called with* -- an argument, not a docstring -- survives."""
-    text = (
-        '"""Module prose naming src/acme-tool.py."""\n'
-        "\n"
-        "def test_it():\n"
-        '    """Function prose: acme_tool."""  # trailing acme_tool\n'
-        "    acme = load('src/acme-tool.py')\n"
-        "    acme.alpha()\n"
-    )
-    code = us.code_only(text)
-    assert len(code) == len(text)
-    assert code.splitlines() == [
-        " " * len('"""Module prose naming src/acme-tool.py."""'),
-        "",
-        "def test_it():",
-        "    "
-        + " " * len('"""Function prose: acme_tool."""')
-        + "  "
-        + " " * len("# trailing acme_tool"),
-        "    acme = load('src/acme-tool.py')",
-        "    acme.alpha()",
-    ]
-
-
-def test_code_only_returns_text_that_is_not_python_unchanged():
-    """A broken test file is the linter's and the interpreter's to report; this gate
-    scanning it as written is the same answer it gave before `code_only` existed."""
-    broken = "def test_(:\n    acme.alpha("
-    assert us.code_only(broken) == broken
-    assert us.code_only("") == ""
 
 
 def test_read_tests_returns_the_code_of_every_corpus_file(tmp_path):
@@ -442,9 +714,9 @@ def test_a_module_named_only_in_a_docstring_does_not_join_its_corpus(tmp_path):
     write(
         tmp_path,
         "tests/test_other.py",
-        '"""Tests for other.py -- not src/acme-tool.py, which is the trap this avoids."""\n'
+        '"""Tests for acme_other.py -- not src/acme-tool.py, the trap this avoids."""\n'
         "# acme_tool is measured elsewhere\n"
-        "other.alpha()\n",
+        "acme_other.alpha()\n",
     )
     assert us.gaps(tmp_path, config(sources=["src"])) == ["src/acme-tool.py::alpha"]
 
@@ -529,6 +801,51 @@ def test_a_seeded_project_starts_clean(tmp_path):
     assert us.verdict(tmp_path, cfg) == ([], [])
 
 
+# --- reconcile ----------------------------------------------------------------
+
+
+def test_reconcile_drops_what_a_pull_covered_and_records_what_it_revealed(tmp_path):
+    """#464's upgrade: a vendored test covered a baselined `main`, and the narrowed
+    scanner stopped reading `ship.changed_paths()` as coverage of a sibling's
+    `changed_paths`. The project had touched neither, and both reddened its gate."""
+    write(tmp_path, "src/acme.py", "def alpha():\n    pass\n\n\ndef beta():\n    pass\n")
+    write(tmp_path, "tests/test_acme.py", "acme.alpha()")
+    write(tmp_path, us.BASELINE_NAME, "src/acme.py::alpha\n")
+    cfg = config(sources=["src"])
+    assert us.reconcile(tmp_path, cfg, before=set()) == (1, 1)
+    assert us.read_baseline(us.baseline_path(tmp_path)) == ["src/acme.py::beta"]
+    assert us.verdict(tmp_path, cfg) == ([], [])
+    assert b"\r\n" not in us.baseline_path(tmp_path).read_bytes()
+
+
+def test_reconcile_never_records_debt_the_project_made(tmp_path):
+    """`seed`'s refusal, kept: a gap the pre-pull scanner already reported is the
+    project's own, as is any in a file it has uncommitted edits to, and an unknown
+    `before` vouches for nothing. The gate still names all three."""
+    write(tmp_path, "src/acme.py", "def alpha():\n    pass\n")
+    write(tmp_path, "src/acme_wip.py", "def beta():\n    pass\n")
+    write(tmp_path, us.BASELINE_NAME, "")
+    cfg = config(sources=["src"])
+    held = frozenset({"src/acme_wip.py"})
+    assert us.reconcile(tmp_path, cfg, before={"src/acme.py::alpha"}, held=held) == (0, 0)
+    assert us.reconcile(tmp_path, cfg, before=None) == (0, 0)
+    assert us.read_baseline(us.baseline_path(tmp_path)) == []
+    assert us.verdict(tmp_path, cfg)[0] == ["src/acme.py::alpha", "src/acme_wip.py::beta"]
+
+
+def test_reconcile_leaves_an_unadopted_project_alone(tmp_path):
+    write(tmp_path, "src/acme.py", "def alpha():\n    pass\n")
+    assert us.reconcile(tmp_path, config(sources=["src"]), before=set()) is None
+    assert not us.baseline_path(tmp_path).exists(), "adoption is `seed`'s, not this"
+
+
+def test_read_reconcile_input_keeps_an_unknown_before_unknown(tmp_path):
+    spec = write(tmp_path, "r.json", json.dumps({"before": None, "held": ["a.py"]}))
+    assert us.read_reconcile_input(spec) == (None, frozenset({"a.py"}))
+    write(tmp_path, "r.json", json.dumps({"before": ["a.py::x"]}))
+    assert us.read_reconcile_input(spec) == ({"a.py::x"}, frozenset())
+
+
 # --- verdict ------------------------------------------------------------------
 
 
@@ -601,6 +918,17 @@ def test_main_seed_refuses_rather_than_overwriting(project, capsys):
     write(root, us.BASELINE_NAME, "# empty\n")
     assert us.main(["--seed"]) == 1
     assert "refusing to overwrite" in capsys.readouterr().out
+
+
+def test_main_reconcile_reads_its_input_and_reports_both_counts(project, capsys):
+    root = project(sources=["src"])
+    write(root, "src/acme.py", "def alpha():\n    pass\n")
+    spec = write(root, "r.json", json.dumps({"before": [], "held": []}))
+    assert us.main(["--reconcile", str(spec)]) == 1, "no baseline is nothing to reconcile"
+    assert "no .devkit-untested.txt" in capsys.readouterr().out
+    write(root, us.BASELINE_NAME, "")
+    assert us.main(["--reconcile", str(spec)]) == 0
+    assert "dropped 0 covered line(s), recorded 1 gap(s)" in capsys.readouterr().out
 
 
 def test_main_list_prints_every_gap_regardless_of_the_baseline(project, capsys):
@@ -715,3 +1043,27 @@ def test_the_gate_certifies_only_what_it_actually_tests():
         "fixtures here vouch for modules this file does not test: use invented symbol "
         f"names — {sorted(vouched)}"
     )
+
+
+# An `acme` stem, optionally private, or a one-letter placeholder (`a.py`, `a-b.py`).
+INVENTED_MODULE = re.compile(r"_?acme[\w-]*|[a-z](-[a-z])?")
+
+
+def test_every_module_a_fixture_reaches_is_invented():
+    """The module half of the test above, which only a consumer can fail: carameli #447
+    went red because `load_script('db-revision.py')`, a fixture here, put this file in
+    carameli's real `scripts/db-revision.py` corpus, where `us.main(` vouched for its
+    `main`. devkit has no such script, so its own run of that test stayed green. Every file
+    name this file reaches -- by the gate's own `module_pattern` -- is therefore invented,
+    which no consumer's tree can collide with."""
+    text = us.code_only(Path(__file__).read_text(encoding="utf-8"))
+    own = {GATE.name, CONFIG_MODULE.name, "conftest.py", "__init__.py"}
+    reached = {
+        name
+        for name in re.findall(r"[\w-]+\.py\b", text)
+        if name not in own
+        and not name.startswith("test_")
+        and us.module_pattern(Path(name)).search(text)
+    }
+    real = sorted(name for name in reached if not INVENTED_MODULE.fullmatch(Path(name).stem))
+    assert not real, f"fixtures here reach modules a consumer may have: rename to acme_* — {real}"

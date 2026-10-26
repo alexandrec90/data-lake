@@ -100,6 +100,10 @@ def tracked_yahoo_symbols(session: Session) -> list[str]:
     This is the "refresh what we track" universe for the scheduled price poll: it never
     guesses ticker formats or reads universe files — an instrument enters it via a first
     manual/batch Yahoo ingest and stays current from then on.
+
+    A full scan of the yahoo bars, left so on purpose: measured on the collector 2026-10-19,
+    it streams into a small hash in 2.3 s with negligible memory, which beats per-instrument
+    probes (~24 s, see ``listing_dates._first_bars``).
     """
     instruments = session.scalars(
         select(Instrument)

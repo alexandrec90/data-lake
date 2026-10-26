@@ -52,6 +52,11 @@ class TestFieldLimits:
     def test_a_spawn_failures_detail_keeps_gits_reason(self):
         assert events.limit_for("detail") > events.VALUE_LIMIT
 
+    def test_evidence_keeps_every_absolute_path(self):
+        """An agent-report's evidence is absolute paths joined by `; `, and two of
+        them under a worktree run past the flat cap."""
+        assert events.limit_for("evidence") > events.VALUE_LIMIT
+
     def test_every_other_field_takes_the_flat_cap(self):
         assert events.limit_for("command") == events.VALUE_LIMIT
         assert events.limit_for("project") == events.VALUE_LIMIT
@@ -73,6 +78,39 @@ class TestFieldLimits:
         line = events.event_line("s", "agent-report", (("message", report),))
         assert "\n" not in line
         assert line.count("\t") == 2
+
+
+class TestCommandKeepsBothEnds:
+    """A command's head is an interpreter and absolute paths, its tail the arguments
+    that say which invocation it was. Cut from the end, a deep worktree path pushed
+    `--branch --slug lint-autofix --yes` off the row entirely (10b3cce0)."""
+
+    def _deep(self):
+        root = "C:/Users/x/vs-code/devkit/.claude/worktrees/bridge-cse_" + "q" * 200
+        return f"python {root}/scripts/sweep.py --only alpha --branch --slug lint-autofix --yes"
+
+    def test_a_long_commands_arguments_survive_into_the_line(self):
+        line = events.event_line("s", "scheduled-job-failed", (("command", self._deep()),))
+        assert line.endswith("--branch --slug lint-autofix --yes")
+
+    def test_and_so_does_its_interpreter(self):
+        kept = events.clean(self._deep(), events.limit_for("command"), keep_tail=True)
+        assert kept.startswith("python C:/Users/x/vs-code/devkit/")
+        assert events.ELISION in kept
+
+    def test_it_is_still_bounded(self):
+        kept = events.clean(self._deep(), events.limit_for("command"), keep_tail=True)
+        assert len(kept) == events.limit_for("command")
+
+    def test_a_short_command_is_untouched(self):
+        assert events.clean("python x.py --yes", 300, keep_tail=True) == "python x.py --yes"
+
+    def test_a_limit_too_small_for_the_marker_cuts_the_head(self):
+        assert events.clean("x" * 50, limit=3, keep_tail=True) == "xxx"
+
+    def test_other_fields_still_cut_from_the_end(self):
+        line = events.event_line("s", "e", (("project", "p" * 400 + "END"),))
+        assert line == "s\tevent=e\tproject=" + "p" * events.VALUE_LIMIT
 
 
 class TestEventLine:
@@ -332,6 +370,82 @@ class TestLedgerPaths:
         monkeypatch.delenv("DEVKIT_DIR", raising=False)
         monkeypatch.setattr(events, "REPO_ROOT", _repo(tmp_path, "someproject"))
         assert events.ledger_paths() == []
+
+
+class TestPool:
+    """The pointer that moves this machine's shard into a folder another machine shares.
+
+    Without it the shards could only live in the checkout's whole `logs/`, which no two
+    machines can share -- so a second machine's defects sat where no fix pass read them.
+    """
+
+    def _point(self, root, target):
+        (root / "logs").mkdir(parents=True, exist_ok=True)
+        (root / "logs" / "ledger-pool").write_text(f"{target}\n", encoding="utf-8")
+
+    def test_no_pointer_is_no_pool(self, tmp_path):
+        assert events.pool_named(tmp_path) is None
+        assert events.pool_dir(tmp_path) is None
+
+    def test_the_shard_is_written_into_the_pool(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DEVKIT_HOST", "desktop")
+        pool = tmp_path / "shared"
+        pool.mkdir()
+        self._point(tmp_path / "devkit", pool)
+        assert events.ledger_path(tmp_path / "devkit") == pool / "harness-events-desktop.log"
+
+    def test_another_machines_shard_in_the_pool_is_read(self, tmp_path, monkeypatch):
+        """The defect this exists for: a row the laptop filed is on the desktop's backlog."""
+        monkeypatch.setenv("DEVKIT_HOST", "desktop")
+        pool = tmp_path / "shared"
+        pool.mkdir()
+        (pool / "harness-events-laptop.log").write_text("x\n", encoding="utf-8")
+        root = tmp_path / "devkit"
+        self._point(root, pool)
+        assert pool / "harness-events-laptop.log" in events.ledger_paths(root)
+
+    def test_local_history_is_still_read_once_pooled(self, tmp_path, monkeypatch):
+        """The legacy file stays behind on every machine, and rows written while the pool
+        was offline stay local until the next `--set`: neither may drop off the backlog."""
+        monkeypatch.setenv("DEVKIT_HOST", "desktop")
+        pool = tmp_path / "shared"
+        pool.mkdir()
+        root = tmp_path / "devkit"
+        self._point(root, pool)
+        (root / "logs" / "harness-events.log").write_text("x\n", encoding="utf-8")
+        (root / "logs" / "harness-events-desktop.log").write_text("x\n", encoding="utf-8")
+        found = events.ledger_paths(root)
+        assert root / "logs" / "harness-events.log" in found
+        assert root / "logs" / "harness-events-desktop.log" in found
+        assert pool / "harness-events-desktop.log" in found
+
+    def test_an_unreachable_pool_writes_locally(self, tmp_path, monkeypatch):
+        """A synced folder not mounted yet must not lose the row `record` was asked for."""
+        monkeypatch.setenv("DEVKIT_HOST", "desktop")
+        root = tmp_path / "devkit"
+        self._point(root, tmp_path / "offline")
+        assert events.pool_named(root) == tmp_path / "offline"
+        assert events.pool_dir(root) is None
+        assert events.ledger_path(root) == root / "logs" / "harness-events-desktop.log"
+
+    def test_a_relative_or_blank_address_is_no_address(self, tmp_path):
+        self._point(tmp_path, "shared")
+        assert events.pool_named(tmp_path) is None
+        self._point(tmp_path, "   ")
+        assert events.pool_named(tmp_path) is None
+
+    def test_record_lands_in_the_pool(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DEVKIT_HOST", "desktop")
+        pool = tmp_path / "shared"
+        pool.mkdir()
+        root = tmp_path / "devkit"
+        self._point(root, pool)
+        assert events.record("agent-report", (("project", "devkit"),), root=root) == (
+            pool / "harness-events-desktop.log"
+        )
+        assert "event=agent-report" in (pool / "harness-events-desktop.log").read_text(
+            encoding="utf-8"
+        )
 
 
 class TestRecord:

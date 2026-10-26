@@ -18,6 +18,8 @@ import json
 import re
 from types import SimpleNamespace
 
+import pytest
+
 from conftest import REPO_ROOT, load_module
 
 merger = load_module("scripts/merge-dependabot-prs.py")
@@ -159,20 +161,42 @@ def test_a_pr_whose_gate_never_passed_is_not_merged():
     assert not run.merges()
 
 
-def test_a_gate_run_that_was_dispatched_by_hand_is_not_evidence():
-    """Someone re-running the gate is not the gate passing on a Dependabot event, and the
-    event-driven job has never accepted it either."""
-    run = FakeRun(
-        world(
-            **{
-                "actions/runs": {
-                    "workflow_runs": [
-                        {"name": "PR Gate", "event": "workflow_dispatch", "conclusion": "success"}
-                    ]
+BRANCH = "dependabot/pip/minor-and-patch-7def012b62"
+
+
+def dispatched(head_branch: str) -> dict:
+    return {
+        "actions/runs": {
+            "workflow_runs": [
+                {
+                    "name": "PR Gate",
+                    "event": "workflow_dispatch",
+                    "conclusion": "success",
+                    "head_branch": head_branch,
                 }
-            }
-        )
-    )
+            ]
+        }
+    }
+
+
+def test_a_gate_dispatched_on_the_prs_own_branch_at_its_head_is_evidence():
+    """carameli #393: a lock repair pushed with `GITHUB_TOKEN`, which raises no usable
+    `pull_request` event, so it dispatched the gate itself. Every check at the head was
+    green, and the PR sat open because only a `pull_request` run counted."""
+    run = FakeRun(world(prs=[pr(head={"sha": SHA, "ref": BRANCH})], **dispatched(BRANCH)))
+    assert merger.main(env(), run) == 0
+    assert len(run.merges()) == 1, run.calls
+
+
+@pytest.mark.parametrize(
+    ("head", "ran_on"),
+    [({"sha": SHA, "ref": BRANCH}, "main"), ({"sha": SHA}, BRANCH)],
+    ids=["gated-on-another-branch", "pr-ref-unknown"],
+)
+def test_a_dispatched_gate_that_is_not_on_the_prs_branch_is_not_evidence(head, ran_on):
+    """The same commit gated on another ref is a different question, and a PR whose
+    head ref cannot be read has nothing to match the run against."""
+    run = FakeRun(world(prs=[pr(head=head)], **dispatched(ran_on)))
     assert merger.main(env(), run) == 0
     assert not run.merges()
 
@@ -215,11 +239,57 @@ def test_a_conflicted_pr_is_left_alone():
 
 
 def test_an_undecided_mergeable_is_deferred_not_refused():
-    """GitHub returns null while it computes the merge commit. That is "ask again", and
-    the next hourly pass is exactly that -- but it must not merge on it now."""
+    """GitHub returns null while it computes the merge commit. That is "ask again" -- but
+    never a merge on it now. Still null after the re-reads, the hourly pass owns it."""
     run = FakeRun(world(prs=[pr(mergeable=None)]))
-    assert merger.main(env(), run) == 0
+    naps: list[float] = []
+    assert merger.main(env(), run, sleep=naps.append) == 0
     assert not run.merges()
+    assert len(naps) == merger.MERGEABLE_READS - 1
+
+
+class Computing(FakeRun):
+    """GitHub computing mergeability: null for the first reads of the PR, then decided."""
+
+    def __init__(self, routes, undecided_reads: int):
+        super().__init__(routes)
+        self.left = undecided_reads
+
+    def __call__(self, argv, capture_output=False, text=False, check=False):
+        if any(a.endswith("pulls/15") for a in argv) and self.left > 0:
+            self.left -= 1
+            self.calls.append(list(argv))
+            return SimpleNamespace(stdout=json.dumps(pr(mergeable=None)), stderr="", returncode=0)
+        return super().__call__(argv, capture_output, text, check)
+
+
+def test_mergeability_still_being_computed_is_asked_again_before_giving_up():
+    """devkit #405 was stranded twice: its gate finished while `main` had just moved, so
+    GitHub had not decided `mergeable` yet, and the one read said null -- at the gate's
+    completion and again at the hourly retry, since fixer PRs kept moving `main`. GitHub
+    computes it on request, so a few reads seconds apart get the answer."""
+    run = Computing(world(), undecided_reads=2)
+    naps: list[float] = []
+    assert merger.main(env(HEAD_BRANCH="agent/x", RUN_HEAD_SHA=SHA), run, sleep=naps.append) == 0
+    assert len(run.merges()) == 1
+    assert naps == [merger.MERGEABLE_WAIT] * 2
+
+
+def test_settled_reads_only_while_undecided():
+    """A decided answer -- mergeable or conflicted -- is never re-read or slept on."""
+    naps: list[float] = []
+    for decided in (True, False):
+        run = FakeRun(world())
+        assert (
+            merger.settled(REPO, 15, run, naps.append, pr(mergeable=decided))["mergeable"]
+            is decided
+        )
+        assert run.calls == [] and naps == []
+    never = Computing(world(), undecided_reads=merger.MERGEABLE_READS)
+    assert merger.settled(REPO, 15, never, naps.append, pr(mergeable=None))["mergeable"] is None
+    assert len(naps) == merger.MERGEABLE_READS - 1, "bounded: the hourly pass owns the rest"
+    soon = Computing(world(), undecided_reads=1)
+    assert merger.settled(REPO, 15, soon, naps.append, pr(mergeable=None))["mergeable"] is True
 
 
 def test_a_draft_is_never_merged():
@@ -254,6 +324,27 @@ def test_branch_mode_asks_the_api_for_that_branch_rather_than_scanning():
     merger.main(env(HEAD_BRANCH="dependabot/uv/x", RUN_HEAD_SHA=SHA), run)
     listings = [c for c in run.calls if any("head=owner:dependabot/uv/x" in a for a in c)]
     assert listings, run.calls
+
+
+def test_a_gate_completed_on_the_default_branch_sweeps_every_open_pr():
+    """devkit #629, 2026-10-12: its gate went green 40 seconds after #635 moved `main`,
+    `mergeable` was still undecided after every re-read, and it sat for the hourly pass.
+    What strands a PR is the base moving, and the base's own gate completing is the next
+    moment the answer is decided -- so that completion sweeps, rather than looking for
+    PRs whose head is `main`. The gated commit is `main`'s, never any PR's head."""
+    run = FakeRun(world(prs=[pr(head={"sha": SHA, "ref": "agent/x"})]))
+    main_tip = "0" * 40
+    code = merger.main(env(HEAD_BRANCH="main", RUN_HEAD_SHA=main_tip, DEFAULT_BRANCH="main"), run)
+    assert code == 0
+    assert len(run.merges()) == 1, run.calls
+    assert not [c for c in run.calls if any("head=owner:main" in a for a in c)]
+
+
+def test_without_a_default_branch_a_main_completion_stays_branch_mode():
+    """An older workflow copy passes no `DEFAULT_BRANCH`: the run keeps its old meaning."""
+    run = FakeRun(world())
+    merger.main(env(HEAD_BRANCH="main", RUN_HEAD_SHA=SHA), run)
+    assert [c for c in run.calls if any("head=owner:main" in a for a in c)]
 
 
 # --- failure handling -------------------------------------------------------------

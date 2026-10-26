@@ -78,6 +78,29 @@ billed input tokens, ~2.5% of all spend, at an average context of 117k tokens pe
 Polls land at the *end* of a session, where context is largest, so they are the most
 expensive place a call can go — one late poll cost more than five whole sessions did.
 
+### Reading "no checks reported": ask `mergeStateStatus` once
+
+`gh pr view <N> --json mergeStateStatus,statusCheckRollup`, once, after a push:
+
+| What you see | What it is | What to do |
+| --- | --- | --- |
+| `CONFLICTING` | no merge ref to build against, so the gate never will run | merge `origin/<default>` and push |
+| `BLOCKED`/`CLEAN` | the run exists | `--watch` is right |
+| `UNKNOWN` | the ordinary answer in the seconds after a push | says nothing either way; ask again |
+| `UNSTABLE` **with an empty rollup** | a run exists that the PR cannot show you | `gh run list --branch <head> --event workflow_dispatch` |
+
+That last row is the one that reads as the first and is its opposite. **A push made with
+`GITHUB_TOKEN` raises no `pull_request` event**, so a workflow that commits to a PR branch
+— a lock repair, a generated-file sync — leaves the only gate evidence on a run it
+dispatched itself, and a `workflow_dispatch` run is not in the PR's check rollup. The PR
+reads exactly like one whose gate has not started. carameli #347 sat four days that way
+while its dispatched gate had *failed*, on a real test, with the fix a one-line command.
+`UNSTABLE` is the tell: a gate that has not started yet cannot make a PR unstable.
+
+Moved here from `engineering.md` on 2026-09-26: the always-loaded tier had 12 tokens of
+headroom, and this table is read only by a session waiting on a gate, which
+`session-scope.md` keeps project sessions from doing at all.
+
 ### devkit#180: "no checks reported" was a gate that would never start
 
 GitHub builds a `pull_request` run against the *merge* ref, and a PR that has gone
@@ -118,6 +141,16 @@ git -C "$HOME/…/eager-kindling-russell" rev-parse → C:/Users/…/eager-kindl
 The tilde is never expanded before the check — the path predicate rejects any string
 containing `~` outright, alongside `/proc/self`, `/dev/fd` and a leading `/../`.
 
+`$HOME` resolves as an *argument*, not as the program. For an interpreter the script is
+the program, so the same variable is refused one operand earlier (10-08, a supervisor
+session):
+
+```
+python scripts/harness_triage.py --agent "$HOME/x"           → runs
+python "$HOME/…/devkit/scripts/harness_triage.py" --agent claude → refused: "a computed
+    argument goes after the script or --"
+```
+
 The substring match is the expensive one. A statement the parser cannot reduce to a
 simple list is tested against `/git/i` over the entire line, unanchored:
 
@@ -133,6 +166,22 @@ has a branch for exactly that shape. The two wrong ones pointed the wrong way: a
 reading them avoids `$HOME` for the tilde, which is the one spelling that is actually
 refused. Nothing gates a sentence like that, which is why it survived until a session
 ran the commands instead of believing it.
+
+## Git Bash rewrites a `rev:path` whose path starts with a dot
+
+Not the guard: the MSYS layer under Git Bash converting what it takes for a POSIX path
+list before `git.exe` sees it. Reproduced in one worktree, 2026-09-26:
+
+```
+git rev-parse origin/main:.devkit.toml    → ambiguous argument 'origin\main;.devkit.toml'
+git rev-parse origin/main:README.md       → the blob
+git rev-parse origin/main:./.devkit.toml  → the blob
+```
+
+Spell the path `./.name`, or issue it through the PowerShell tool, which has no such
+layer. `MSYS_NO_PATHCONV=1` in the agent env was proposed and is not the fix: it also
+stops `$HOME` becoming `C:/Users/…` for a native program, and `$HOME` is the spelling the
+isolation guard above requires.
 
 ## Why capped Bash is a blocklist, not a proof obligation
 
@@ -224,3 +273,15 @@ The vendored suite clears the variable in an autouse fixture, on the same reason
 the ledger fixture beside it: the switch lives in the environment of every agent session
 on a machine where it is set, so a suite that inherits it is one whose end-to-end hook
 tests pass by agreeing that nothing happened.
+
+## The Bash tool collapses a doubled backslash: why file writes go through Write or Edit
+
+Not the guard, and not devkit: Claude Code's Bash tool delivers a doubled backslash as a
+single one, inside `<<'EOF'` as well as in a single-quoted argument, so a Python patch
+script written that way arrives with its escapes changed. The one spelling it leaves
+alone is a run of backslashes ending at a `"` (`"\\"` arrives intact, `'\\'` does not),
+which is why the same write is damaged in one file and not the next. Its `assert old in text` fails,
+or worse, the replacement writes a different regex than the one reviewed. On 2026-09-26
+alone five sessions filed it (ledger `f5f07c62`, `c979d748`, `f0997a7c`, `b957e0cf`, and
+the session that retired those), each after the rule already said "use Write or Edit"
+without saying why. What devkit owns is putting the reason where the instruction is read.

@@ -103,33 +103,65 @@ Two practical consequences worth knowing before you add one:
 - Personal data in a shared table is still personal data. Hash it before it lands (see
   Privacy, below); the bucket and every consumer's database inherit whatever you store.
 
-## The archive's storage tier is local disk, by decision
+## The archive's storage tier is a SeaweedFS pool across the desktops
 
 `store_from_settings` treats `local` and `s3` as equals, so which one is in use is not
-derivable from this package — it is a per-consumer setting, and today **every consumer is
-`local` and no bucket is configured anywhere.** The reason is cost: the workstation has
-~830 GB free, the archive holds nothing yet, and R2 would buy durability the projects do
-not need before there is data to lose.
+derivable from this package — it is a per-consumer setting, read off that consumer's
+settings, never assumed from here. The intended one is `s3` pointed at **a SeaweedFS
+pool on the user's own PCs**, reached over Tailscale, rather than a cloud bucket: one
+PC's 1 TB drive was not going to hold the historical backfills, and pooling the desktops
+costs nothing. `scripts/storage-node.py` provisions a node — its docstring is the
+layout — and `credentials` on the primary prints the `.env` lines. The local tree,
+`data-lake/data/archive` (gitignored here; `sports_betting` has always defaulted to it),
+is still a valid backend.
 
-The pooled tree is `data-lake/data/archive` (gitignored here; `sports_betting` has always
-defaulted to it, `ibkr_trader` now points `ARCHIVE_LOCAL_DIR` there too). Datasets are
-namespaced by the `DatasetSpec.prefix` values in `archive/catalog.py`, so two consumers
-writing one tree share a `_catalog/` without colliding — that sharing is the point.
+| Node | Tailscale IP | Runs |
+| --- | --- | --- |
+| DESKTOP-B9FC8VP | 100.76.121.58 | primary: master, filer, S3 gateway (`:8333`), volume |
+| DESKTOP-ML5F3PJ | 100.100.229.119 | volume |
 
-Two things this costs, both worth re-reading before assuming the archive is a backup:
+Consumers read the archive over S3 — `ibkr_trader`'s scheduler container reads
+social-scraper's export from the bucket — so a broken download is a real failure mode:
+`S3ObjectStore.get_bytes` re-fetches an object whose body dies mid-read.
 
-- **A local archive bounds Postgres, not the disk.** `archive_price_bars` moves bytes from
-  the database to a directory on the same drive. The hot/cold window is still worth
-  keeping — it is what stops the *database* growing without limit — but "archived" here
-  means "out of Postgres", not "off this machine".
+Two buckets with different placements: `data-lake` (the archive) keeps **two copies on
+different PCs** (`001`); `raw-dumps` (downloaded source dumps, re-fetchable) keeps one,
+pinned to ML5F3PJ (`configure-buckets --pin`, saved in `pins.json`) so the dumps fill the
+larger drive. A pin only takes effect once the bucket has no writable volume on any other
+node: the master hands out an existing volume before it grows one on the pinned node, so
+pinning a bucket that already has volumes elsewhere fails writes as `no writable volumes`
+until the empty ones are deleted.
+
+What that costs, worth re-reading before assuming the pool is a backup:
+
+- **With two storage PCs, an archive write needs both up.** `001` cannot be placed with
+  one node away, so writes to `data-lake` fail — loudly, as an S3 `InternalError` —
+  while either desktop is off. Reads keep working. A third storage PC removes this.
+- **The filer index lives on the primary only.** The volumes hold the bytes on both PCs,
+  but the key → chunk mapping is the primary's. Every node's supervisor saves a copy daily
+  to its own `%LOCALAPPDATA%/seaweedfs/meta` (a volume node pulls it over the tailnet), so
+  losing the primary's drive costs at most a day of keys: a new primary restores the
+  newest copy with `fs.meta.load`.
+- **No PC is the pool for good.** `storage-node.py promote` on the volume node makes it the
+  primary over the volumes and index copy it holds, and `point-consumers` repoints each
+  sibling checkout's `.env` — consumers name the endpoint by IP, and a MagicDNS name
+  belongs to one machine, so there is no alias to move instead. A one-node pool keeps one
+  copy (`000`) until a second PC joins. The runbook, planned retirement and sudden loss,
+  is in the script's docstring.
 - **Verify-then-delete deletes for real.** `archive/bars.py` drops the rows once it has
-  read the object back, so the archive tree is the only copy of everything past the
-  window. Whatever backs up the workstation has to cover it, or the first drive failure
-  takes the database and its archive together.
+  read the object back, so the archive is the only copy of everything past the window.
 
-Flipping to a bucket is a settings change plus a file copy — same `ObjectStore` protocol,
-same keys, same self-describing `_catalog/`. Every archive entry point takes the store as
-an argument, so a consumer can also split datasets across both backends in one process.
+Datasets are namespaced by the `DatasetSpec.prefix` values in `archive/catalog.py`, so
+consumers writing one bucket share a `_catalog/` without colliding — that sharing is the
+point. The archive is read as well as written:
+`src/data_lake/ingestion/social/social_scraper.py` is how `social_posts` gets filled at
+all, from a dataset whose layout social-scraper owns (its README, "Data contract"), so a
+consumer whose archive settings miss that bucket gets no social data. social-scraper
+itself always writes `data-lake/data/archive` locally and mirrors to the bucket.
+
+Moving between backends is a settings change plus a file copy — same `ObjectStore`
+protocol, same keys, same self-describing `_catalog/`. Every archive entry point takes the
+store as an argument, so a consumer can also split datasets across backends in one process.
 
 ### Provider payloads are kept whole — do not trim them to save space
 

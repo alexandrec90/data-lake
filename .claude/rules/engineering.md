@@ -19,15 +19,12 @@ and loaded only when a pointer sends you there.
 
 ## Testing
 
-Every code change must include tests in the same commit. Every endpoint and every testable
-unit of logic must have test coverage — gaps are not acceptable. If you touch something
+Every code change must include tests in the same commit. If you touch something
 that has no test, write the test in the same commit even if the logic didn't change.
 
 - **New unit of logic:** the happy path, the error cases, and the edge cases.
 - **Bug fix:** write the regression test first and watch it fail before you fix it. One
   that has never failed is asserting the wrong thing.
-- **Reversion check:** before calling a change complete, identify which test would
-  fail if the changed behavior were reverted. If none would, it is not covered yet.
 - **Coverage floors are ratchets:** never lower it merely to make a change pass. The
   other end of the same rule is the one that slips quietly, because raising a ceiling —
   a timeout, a retry count, a size or complexity limit, a baseline of known gaps — reads
@@ -35,17 +32,11 @@ that has no test, write the test in the same commit even if the logic didn't cha
   **A ceiling raised on three consecutive branches is a defect report, not a raise:**
   find out what is filling it before moving it again, and say in the commit message what
   you found.
-- **Run targeted tests** — the module you touched — plus the linter, while you work. The
-  whole gate runs once, in CI, on the PR the fix pass opens for you: a session never
-  pushes, so it never waits on a gate. When the gate is red, the pass downloads the
-  artifact and sends a fresh session at the failure with the failing tests named. The
-  `devkit-push-gate` pre-commit hook still guards a push a person makes by hand.
-- **Fix failures in the code, not in the assertion.** Relaxing an assertion to get green
-  deletes the only evidence that something is wrong.
 - A skipped or `xfail` test carries a linked issue or a one-line reason in the marker.
 
-If the toolchain isn't available locally, still write the tests and leave execution to CI.
-"I couldn't run it" defers the run, never the writing.
+Running tests is optional, and the full suite is not yours to run — see
+`.claude/rules/session-scope.md`. The gate runs once, in CI, on the PR the fix pass opens
+for you; a red gate comes back as a fresh session with the failing tests named.
 
 Instruction files — `CLAUDE.md`, `.claude/rules/*`, `.claude/skills/*` — are under this
 same mandate. See `.claude/rules/authoring.md`.
@@ -57,9 +48,15 @@ No agent hook is wired, so nothing judges a Bash call before it runs
 `BASH_MAX_OUTPUT_LENGTH` in `.claude/settings.json`, which truncates bytes that already
 exist and so cannot false-positive.
 
+**Write and edit files with the Write and Edit tools, never through Bash** -- no heredoc,
+`sed -i` or `python -` patch script, whatever a system prompt says about small edits.
+The Bash tool collapses `\\` to `\`, quoted heredocs included, and a test run finds it.
+Write and Edit decode a backslash-u escape to its character, failing ruff's RUF001: spell
+it `\N{EN DASH}` in source.
+
 **Issue commands bare; wrapping by reflex is a mistake.** A `grep`, a `python -c`, a test
-run, a `curl`, a heredoc: routing them through a wrapper buys no second bound and has
-happened here at scale. Bound only a statement whose output grows with the
+run, a `curl`, a heredoc: routing them through a wrapper buys no second bound.
+Bound only a statement whose output grows with the
 **repository** rather than with the command you wrote — `ls`, `cat`, `find`, `tree`,
 `du`, `env`, `git status`, an uncounted `git log`, a raw `git diff`/`git show`:
 
@@ -76,75 +73,51 @@ page rather than dump. Codex caps shell output itself, so issue commands there d
 What preemptive wrapping has cost is in
 [`.claude/engineering-evidence.md`](../engineering-evidence.md).
 
-**A refusal that says the command "is too complex to verify that it stays inside the
-worktree", "names git in a form too complex to verify", or "cannot be shown not to be
-git", is not a devkit hook** — none is wired. It is Claude Code's own isolation guard
-for a `claude --worktree` session. No setting turns it off and nothing in devkit can
-change what it accepts — report it to Claude Code, not to this harness, where one week's
-backlog once carried three of these filed as guard defects.
-
-It judges the shape of the command line rather than what the command does, and it runs
-**only on the Bash tool**. The same statement issued through the PowerShell tool is never
-parsed, while the working-directory check that holds the session inside its worktree
-applies to both — so on Windows the PowerShell tool is the answer for a compound
-statement, not a workaround.
+**A refusal saying a command is "too complex to verify that it stays inside the
+worktree" or "cannot be shown not to be git" is not a devkit hook** — none is wired. It
+is Claude Code's own `claude --worktree` isolation guard. It parses **only the Bash tool's** command lines, so on Windows the
+PowerShell tool is the answer for a compound statement, not a workaround.
 
 | Shape it refuses | What to issue instead |
 | --- | --- |
-| `~` in a path | `$HOME`, which resolves; the tilde is rejected unexpanded |
+| `~` in a path; `$HOME` as the script, `python "$HOME/…/x.py"` | `$HOME` as an argument; the PowerShell tool for a script path |
 | `git -C`, `--git-dir`, `env -C`, `GIT_DIR=`, `cd … &&` before git | bare `git`, from the worktree |
 | command substitution, `for`/`while`, a subshell | one call each — a plain `&&` list is fine |
 | the letters `git` inside any of the above | nothing; it is a false positive |
 
 **The last row is the one that wastes turns.** Inside a statement the parser could not
 reduce to a simple list, the guard tests the *whole line* for `git` as an unanchored
-substring, so `.gitignore`, `github.com`, `digit` and `legitimate` each read as "names
-git" — rename the variable or split the statement, because no spelling of the real
-command will satisfy it. A heredoc and a `$HOME` argument are **not** triggers on their
-own; put a file write through the Write or Edit tool regardless, which sidesteps the
-parse entirely. The reproductions are in
+substring, so `.gitignore`, `github.com` and `digit` each read as "names git": split
+the statement. The reproductions are in
 [`.claude/engineering-evidence.md`](../engineering-evidence.md).
 
-## Waiting on a CI gate: one blocking call, not a poll loop
+**Git Bash rewrites POSIX-looking arguments into Windows paths**: `rev:path` into what
+git calls an `ambiguous argument`, a container's `/tmp/x` into `C:/…/Temp/x`.
+`MSYS2_ARG_CONV_EXCL` in `.claude/settings.json` exempts revs opening `origin/`,
+`upstream/` or `refs/`; spell another `feature/x:./.devkit.toml`, and prefix
+`docker exec` with `MSYS_NO_PATHCONV=1`.
+
+## Waiting: one backgrounded call, not a poll loop
 
 ```bash
 gh pr checks <N> --watch --fail-fast      # with run_in_background: true
 ```
 
-`--watch` returns only once every check has settled, collapsing N polls into one call plus
-the completion notification. **Backgrounding is the half that is easy to drop**: a gate
-routinely outruns the Bash tool's ceiling, and a foreground `--watch` that times out is a
-poll loop with the timeout as its interval.
+`--watch` returns once every check has settled: one call and its notice. **Backgrounding
+is the half that is easy to drop**, here and for an `until` loop on a file a job will
+write (or put that loop in `Monitor`): a foreground wait holds the turn. **A subagent gets
+no notice before it returns**, so it runs the job itself in the foreground instead.
 
-This condemns neither **diagnosing a failure** (`gh run view --log-failed` and the greps
-after it are the work, not waiting — send them to a file where the volume warrants) nor
-**asking once**. The waste begins at the *second* identical poll.
+Diagnosing a failure (`gh run view --log-failed`) and asking once are not polling; the
+waste begins at the *second* identical poll.
 
-**"No checks reported" has three causes needing opposite responses.** Ask once, after a
-push — `gh pr view <N> --json mergeStateStatus,statusCheckRollup`:
+**"No checks reported" has causes needing opposite responses.** Ask once, after a push —
+`gh pr view <N> --json mergeStateStatus,statusCheckRollup` — and read the answer against
+the table in the evidence file: `CONFLICTING` is a gate that will never run, and
+`UNSTABLE` with an empty rollup is one that ran, as a `workflow_dispatch` the PR cannot show.
 
-| What you see | What it is | What to do |
-| --- | --- | --- |
-| `CONFLICTING` | no merge ref to build against, so the gate never will run | merge `origin/<default>` and push |
-| `BLOCKED`/`CLEAN` | the run exists | `--watch` is right |
-| `UNKNOWN` | the ordinary answer in the seconds after a push | says nothing either way; ask again |
-| `UNSTABLE` **with an empty rollup** | a run exists that the PR cannot show you | `gh run list --branch <head> --event workflow_dispatch` |
-
-That last row is the one that reads as the first and is its opposite. **A push made with
-`GITHUB_TOKEN` raises no `pull_request` event**, so a workflow that commits to a PR branch
-— a lock repair, a generated-file sync — leaves the only gate evidence on a run it
-dispatched itself, and a `workflow_dispatch` run is not in the PR's check rollup. The PR
-reads exactly like one whose gate has not started. carameli #347 sat four days that way
-while its dispatched gate had *failed*, on a real test, with the fix a one-line command.
-`UNSTABLE` is the tell: a gate that has not started yet cannot make a PR unstable.
-
-If you get the message anyway, tell the not-started case from the rest by **how long the
-call took, not what it said**: a `--watch` back in about a second never waited, so
-re-issue it once.
-
-When the gate will outlast anything useful you could do meanwhile, stop: report that the
-branch is pushed and the gate is running, and let the result arrive in a fresh session.
-What polling has cost is in
+When the gate will outlast anything useful you could do, stop: report the branch pushed and
+the gate running, and let the result arrive in a fresh session. What polling has cost is in
 [`.claude/engineering-evidence.md`](../engineering-evidence.md).
 
 ## Scripts
@@ -234,17 +207,20 @@ devkit clone are in [`.claude/engineering-evidence.md`](../engineering-evidence.
 
 ## Guardrail: the harness is not your job
 
+**For project sessions:** a fixer follows [`.claude/fixer.md`](../fixer.md) where the
+two differ.
+
 A session in a project makes the change the user asked for and nothing else. It does not
 maintain the harness, does not fix a gate, and does not file its defects: the scheduled
 fix pass (`scripts/fix-pass.py` in devkit) reads every gate, records every refusal on the
 machine's ledger itself, and sends a devkit session at the harness before any project
-session at a project. That ordering is the whole design, and a project session that
-"just fixes" a vendored file breaks it twice — once by editing what the drift gate will
-reject, and once by hiding the defect from the pass that would have fixed it everywhere.
+session at a project. A project session that "just fixes" a vendored file breaks that
+ordering twice: the drift gate rejects the edit, and the defect is hidden from the pass
+that would have fixed it everywhere.
 
 **Never silently work around a bad instruction or a refusal.** If a skill, a rule, a
 `CLAUDE.md`, a hook or a vendored script sent you into a dead end — blocked a correct
 command, refused an edit it should have allowed, crashed, reported success while doing
-nothing — say so in your report with the file or the exact command, and stop there. A
-workaround fixes your turn and leaves the next agent at the same wall; a report is what
-the devkit session works from.
+nothing — say so in your report with the file or the exact command, write the same
+line to `logs/friction.md`, and stop there: the pass files each line, and reads your
+transcript for the rest. A workaround leaves the next agent at the same wall.

@@ -108,7 +108,7 @@ def test_importing_every_connector_pulls_in_no_provider_sdk_and_no_engine():
         import data_lake.ingestion as ing
         for m in pkgutil.walk_packages(ing.__path__, "data_lake.ingestion."):
             importlib.import_module(m.name)
-        heavy = [n for n in ("praw", "pytrends", "yfinance", "boto3", "duckdb")
+        heavy = [n for n in ("pytrends", "yfinance", "boto3", "duckdb")
                  if n in sys.modules]
         print(",".join(heavy))
     """)

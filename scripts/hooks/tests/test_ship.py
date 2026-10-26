@@ -1,8 +1,25 @@
 """Unit tests for the deterministic mechanics behind /ship."""
 
+import sys
+import types
+
+import pytest
+
 from conftest import load_module
 
 ship = load_module("scripts/ship.py")
+# Before the autouse stubs below replace them in every test.
+real_reconcile_baseline = ship.reconcile_baseline
+real_mirror_codex_skills = ship.mirror_codex_skills
+
+
+@pytest.fixture(autouse=True)
+def _no_baseline_scan(monkeypatch):
+    """`_fix` reconciles the real baseline, which scans and may REWRITE this checkout's
+    `.devkit-untested.txt`; every test here gets a reconcile that found nothing. It also
+    re-mirrors this checkout's `.agents/skills/`, so every test gets a current mirror."""
+    monkeypatch.setattr(ship, "reconcile_baseline", lambda: ((0, 0), ".devkit-untested.txt"))
+    monkeypatch.setattr(ship, "mirror_codex_skills", lambda: "")
 
 
 class _Result:
@@ -65,6 +82,37 @@ def test_push_does_not_retry_rejection(monkeypatch):
     )
     assert not ship._push("claude/x", sleep=lambda _: None)
     assert len(calls) == 1
+
+
+def test_a_failed_pre_push_gate_is_not_reported_as_a_network_failure(monkeypatch, capsys):
+    """The ledger report: a test the pre-push gate failed read as "push failed after
+    retries", and the session went to diagnose the network. Nothing was retried."""
+    gate = "FAILED tests/test_x.py::test_y\nerror: failed to push some refs to 'origin'\n"
+    monkeypatch.setattr(ship, "_git", lambda *args: _Result(1, stderr=gate))
+    assert not ship._push("claude/x", sleep=lambda _: None)
+    err = capsys.readouterr().err
+    assert "FAILED tests/test_x.py::test_y" in err
+    assert "pre-push gate failed" in err
+    assert "retries" not in err and "network error)" in err
+
+
+def test_push_failure_names_each_cause():
+    assert "network error after 4 retries" in ship.push_failure("fatal: connection timed out")
+    assert "rejected by the remote" in ship.push_failure(" ! [rejected] x -> x (fetch first)")
+    assert "pre-push gate" in ship.push_failure("error: failed to push some refs to 'o'")
+    assert "not a network error" in ship.push_failure("fatal: something else")
+
+
+def test_the_hook_output_on_stdout_is_printed_too(monkeypatch, capsys):
+    monkeypatch.setattr(
+        ship,
+        "_git",
+        lambda *args: _Result(
+            1, stdout="push-gate: tests failed", stderr="failed to push some refs"
+        ),
+    )
+    ship._push("claude/x", sleep=lambda _: None)
+    assert "push-gate: tests failed" in capsys.readouterr().err
 
 
 def _wire_main(monkeypatch, *, branch="claude/x", clean=True, lint=True, push=True):
@@ -225,6 +273,39 @@ def test_the_runner_is_asked_for_paths_only_when_it_understands_them():
     assert legacy[-1] == "--changed"
 
 
+def test_the_lint_runner_is_run_under_the_interpreter_it_is_handed():
+    argv = ship._lint_argv(["a.py"], "--paths FILE", "/tree/.venv/bin/python")
+    assert argv[0] == "/tree/.venv/bin/python"
+    assert ship._lint_argv([], "", "/tree/.venv/bin/python")[0] == "/tree/.venv/bin/python"
+
+
+def test_the_lint_gate_uses_the_tree_venv_when_this_interpreter_has_no_ruff(tmp_path, monkeypatch):
+    """db3e57f7: roguelike's own lint-all.py, run without ruff, skipped it and said clean."""
+    venv = ship.toolchain.venv_python(tmp_path)
+    venv.parent.mkdir(parents=True)
+    venv.write_text("", encoding="utf-8")
+    monkeypatch.setattr(ship.toolchain, "has_module", lambda module: False)
+    assert ship.lint_python(tmp_path, env={}) == str(venv)
+
+
+def test_the_lint_gate_keeps_an_interpreter_that_has_ruff(tmp_path, monkeypatch):
+    monkeypatch.setattr(ship.toolchain, "has_module", lambda module: True)
+    assert ship.lint_python(tmp_path, env={"CI": "1"}) == sys.executable
+
+
+def test_the_lint_gate_inside_a_rerun_stays_where_it_is(tmp_path, monkeypatch):
+    """A re-run's own gate must not hop again, or a venv without ruff would loop."""
+    monkeypatch.setattr(ship.toolchain, "has_module", lambda module: False)
+    rerun = {ship.toolchain.RERUN_ENV: "1"}
+    assert ship.lint_python(tmp_path, env=rerun) == sys.executable
+
+
+def test_the_lint_gate_without_a_venv_on_ci_stays_where_it_is(tmp_path, monkeypatch):
+    """CI never provisions, so with no `.venv` the gate runs as it always did."""
+    monkeypatch.setattr(ship.toolchain, "has_module", lambda module: False)
+    assert ship.lint_python(tmp_path, env={"CI": "1"}) == sys.executable
+
+
 def test_an_empty_branch_diff_keeps_the_old_behaviour():
     assert (
         ship._lint_argv([], "usage: lint-all.py [--changed] [--paths FILE ...]")[-1] == "--changed"
@@ -278,6 +359,34 @@ def test_pre_commit_is_looked_for_where_the_dispatcher_looks(tmp_path):
     assert ship.pre_commit_command(tree, checkout, **nothing) == [
         str(tree / ".venv" / "Scripts" / "pre-commit.exe")
     ]
+
+
+def test_a_venv_with_its_interpreter_runs_pre_commit_as_a_module(tmp_path):
+    """uv writes the interpreter's absolute path into each console script, so a launcher
+    written from a tree since deleted dies with `uv trampoline failed to canonicalize
+    script path` -- the fix pass's ship step was refused on exactly that in devkit, whose
+    `claude --worktree` trees share the checkout's `.venv`. The venv's own interpreter
+    reads `pyvenv.cfg` and survives it, and it is still the dispatcher's choice."""
+    nothing = {"which": lambda name: None, "find_spec": lambda name: None}
+    for launcher, python in (
+        ("Scripts/pre-commit.exe", "Scripts/python.exe"),
+        ("bin/pre-commit", "bin/python"),
+    ):
+        tree = tmp_path / python.replace("/", "-")
+        for name in (launcher, python):
+            (tree / ".venv" / name).parent.mkdir(parents=True, exist_ok=True)
+            (tree / ".venv" / name).write_text("", encoding="utf-8")
+        assert ship.pre_commit_command(tree, None, **nothing) == [
+            str(tree / ".venv" / python),
+            "-m",
+            "pre_commit",
+        ]
+
+
+def test_a_launcher_with_no_interpreter_beside_it_is_run_as_it_is(tmp_path):
+    """No module form to fall back to: a launcher alone is what the venv offers."""
+    launcher = tmp_path / "Scripts" / "pre-commit.exe"
+    assert ship.venv_module_command(launcher) == [str(launcher)]
 
 
 def _fixers(*codes: int):
@@ -344,9 +453,174 @@ def test_fix_is_a_mode_of_main_taking_optional_paths(monkeypatch):
     assert seen == [[], ["a.py", "b.py"]]
 
 
+@pytest.mark.parametrize("branch", ["flag-wired-agent-hooks", "main"])
+def test_fix_runs_on_any_branch_because_it_opens_no_pr(monkeypatch, branch):
+    """The branch rule is about where a new PR opens, and `--fix` opens nothing. devkit
+    #390's head is `flag-wired-agent-hooks`: the pass accepts it because the PR is
+    already open, then its resolver's merge was refused at `--fix` on the name alone."""
+    _wire_main(monkeypatch, branch=branch)
+    seen: list[list[str]] = []
+    monkeypatch.setattr(ship, "_fix", lambda paths: seen.append(paths) or ship.EXIT_OK)
+    assert ship.main(["--fix"]) == ship.EXIT_OK
+    assert seen == [[]]
+    assert ship.main([]) == ship.EXIT_NOT_SHIPPABLE
+
+
 def test_fix_refuses_with_a_remedy_when_no_pre_commit_exists(monkeypatch, capsys):
     monkeypatch.setattr(ship, "_porcelain", lambda: " M x.py\n")
     monkeypatch.setattr(ship, "_git", lambda *args: _Result(0, stdout=""))
     monkeypatch.setattr(ship, "pre_commit_command", lambda root, checkout: None)
     assert ship._fix([]) == ship.EXIT_FIXERS_FAILED
     assert "provision first" in capsys.readouterr().err
+
+
+def test_a_failed_fix_names_the_command_it_ran(monkeypatch, capsys):
+    """4099febd: a launcher dying on uv's one-line `failed to canonicalize script path`
+    left the pass's pre-commit.log naming neither the launcher nor its venv."""
+    launcher = ["C:/checkout/.venv/Scripts/python.exe", "-m", "pre_commit"]
+    monkeypatch.setattr(ship, "_porcelain", lambda: " M x.py\n")
+    monkeypatch.setattr(ship, "_git", lambda *args: _Result(0, stdout=""))
+    monkeypatch.setattr(ship, "pre_commit_command", lambda root, checkout: launcher)
+    monkeypatch.setattr(ship, "run_fixers", lambda paths, command: (7, "still fails"))
+    assert ship._fix([]) == 7
+    err = capsys.readouterr().err.splitlines()
+    assert err[-2] == f"ship: ran {' '.join(launcher)} run --files (1 path(s))"
+    # The verdict stays last: `ship_intent.refusal_line` falls back to the last line.
+    assert err[-1] == "ship: still fails"
+
+
+def test_a_quiet_fix_does_not_name_the_command(monkeypatch, capsys):
+    monkeypatch.setattr(ship, "_porcelain", lambda: " M x.py\n")
+    monkeypatch.setattr(ship, "_git", lambda *args: _Result(0, stdout=""))
+    monkeypatch.setattr(ship, "pre_commit_command", lambda root, checkout: ["pre-commit"])
+    monkeypatch.setattr(ship, "run_fixers", lambda paths, command: (0, "quiet"))
+    assert ship._fix([]) == ship.EXIT_OK
+    assert "ship: ran" not in capsys.readouterr().out
+
+
+def test_fix_drops_the_baseline_lines_the_change_covered(monkeypatch, capsys):
+    """ibkr_trader #74: a test that covered `make_connector` left its baseline line in,
+    and the vendored gate went red on a PR whose session had claimed a green suite.
+    The commit stage drops it like a formatter rewrite, and runs the fixers over it."""
+    monkeypatch.setattr(ship, "reconcile_baseline", lambda: ((1, 0), ".devkit-untested.txt"))
+    monkeypatch.setattr(ship, "_porcelain", lambda: " M tests/test_x.py\n")
+    monkeypatch.setattr(ship, "_git", lambda *args: _Result(0, stdout=""))
+    monkeypatch.setattr(ship, "pre_commit_command", lambda root, checkout: ["pre-commit"])
+    seen: list[list[str]] = []
+    monkeypatch.setattr(
+        ship, "run_fixers", lambda paths, command: seen.append(paths) or (0, "quiet")
+    )
+    assert ship._fix([]) == ship.EXIT_OK
+    assert seen == [["tests/test_x.py", ".devkit-untested.txt"]]
+    assert "dropped 1 line(s) this change covered" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("result", [None, (0, 0)])
+def test_nothing_to_drop_leaves_the_paths_alone(result):
+    """No baseline (`None`, an unadopted project) and a clean one are both no-ops."""
+    paths, line = ship.drop_covered_baseline(["a.py"], lambda: (result, ".devkit-untested.txt"))
+    assert (paths, line) == (["a.py"], "")
+
+
+def test_a_baseline_already_among_the_paths_is_not_listed_twice():
+    paths, _line = ship.drop_covered_baseline(
+        [".devkit-untested.txt"], lambda: ((2, 0), ".devkit-untested.txt")
+    )
+    assert paths == [".devkit-untested.txt"]
+
+
+def test_a_scan_that_cannot_read_the_tree_does_not_stop_the_fixers():
+    """The fixers are the commit stage's job; the ratchet is a courtesy on top of it."""
+
+    def broken():
+        raise SyntaxError("bad.py")
+
+    paths, line = ship.drop_covered_baseline(["a.py"], broken)
+    assert paths == ["a.py"] and "could not reconcile" in line
+
+
+def test_reconcile_baseline_records_nothing_new(monkeypatch):
+    """`before=None` is `reconcile`'s drop-only mode: a gap this change made is the
+    gate's to report, never the commit stage's to launder into the debt list."""
+    calls = []
+    fake = types.SimpleNamespace(
+        REPO_ROOT="root",
+        CFG="cfg",
+        BASELINE_NAME=".devkit-untested.txt",
+        reconcile=lambda root, cfg, before: calls.append((root, cfg, before)) or (3, 0),
+    )
+    monkeypatch.setitem(sys.modules, "untested_symbols", fake)
+    assert real_reconcile_baseline() == ((3, 0), ".devkit-untested.txt")
+    assert calls == [("root", "cfg", None)]
+
+
+def _codex_tree(tmp_path, mirrored: str | None):
+    """A tree with this checkout's `sync-codex-context.py`, one skill, and its mirror
+    holding `mirrored` (no mirror at all when None)."""
+    script = tmp_path / ship.CODEX_CONTEXT_SCRIPT
+    script.parent.mkdir(parents=True)
+    script.write_bytes((ship.REPO_ROOT / ship.CODEX_CONTEXT_SCRIPT).read_bytes())
+    skill = tmp_path / ".claude" / "skills" / "art-check"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("new", encoding="utf-8")
+    if mirrored is not None:
+        copy = tmp_path / ".agents" / "skills" / "art-check"
+        copy.mkdir(parents=True)
+        (copy / "SKILL.md").write_text(mirrored, encoding="utf-8")
+        (copy / "retired.md").write_text("x", encoding="utf-8")
+    return tmp_path
+
+
+def test_fix_re_mirrors_a_skill_the_change_edited(tmp_path):
+    """roguelike #81 edited `.claude/skills/art-check/SKILL.md`, and the vendored
+    `test_sync_codex_context.py` went red on the stale `.agents/skills/` copy: only
+    devkit's own pre-commit config re-mirrors, and a consumer's generated one does not."""
+    root = _codex_tree(tmp_path, mirrored="old")
+    line = real_mirror_codex_skills(root)
+    mirror = root / ".agents" / "skills" / "art-check"
+    assert (mirror / "SKILL.md").read_text(encoding="utf-8") == "new"
+    assert not (mirror / "retired.md").exists()
+    assert line == "re-mirrored 2 file(s) into .agents/skills/ for Codex"
+    assert real_mirror_codex_skills(root) == ""
+
+
+def test_a_project_without_the_mirror_is_not_given_one(tmp_path):
+    """No `.agents/skills/` is a project that has not opted into Codex."""
+    root = _codex_tree(tmp_path, mirrored=None)
+    assert real_mirror_codex_skills(root) == ""
+    assert not (root / ".agents").exists()
+
+
+def test_a_missing_or_broken_sync_script_leaves_the_mirror_to_the_gate(tmp_path):
+    root = _codex_tree(tmp_path, mirrored="old")
+    (root / ship.CODEX_CONTEXT_SCRIPT).write_text("raise ImportError('x')\n", encoding="utf-8")
+    assert "could not load" in real_mirror_codex_skills(root)
+    (root / ship.CODEX_CONTEXT_SCRIPT).unlink()
+    assert real_mirror_codex_skills(root) == ""
+    assert (root / ".agents" / "skills" / "art-check" / "SKILL.md").read_text() == "old"
+
+
+def test_fix_re_mirrors_after_the_fixers_and_says_so(monkeypatch, capsys):
+    """After, so a fixer that rewrote a skill's source is what the mirror copies."""
+    order: list[str] = []
+    monkeypatch.setattr(ship, "_porcelain", lambda: " M .claude/skills/s/SKILL.md\n")
+    monkeypatch.setattr(ship, "_git", lambda *args: _Result(0, stdout=""))
+    monkeypatch.setattr(ship, "pre_commit_command", lambda root, checkout: ["pre-commit"])
+    monkeypatch.setattr(
+        ship, "run_fixers", lambda paths, command: order.append("fixers") or (0, "quiet")
+    )
+    monkeypatch.setattr(ship, "mirror_codex_skills", lambda: order.append("mirror") or "did")
+    assert ship._fix([]) == ship.EXIT_OK
+    assert order == ["fixers", "mirror"]
+    assert "ship: did" in capsys.readouterr().out
+
+
+def test_a_failed_fix_does_not_re_mirror(monkeypatch):
+    called: list[str] = []
+    monkeypatch.setattr(ship, "_porcelain", lambda: " M x.py\n")
+    monkeypatch.setattr(ship, "_git", lambda *args: _Result(0, stdout=""))
+    monkeypatch.setattr(ship, "pre_commit_command", lambda root, checkout: ["pre-commit"])
+    monkeypatch.setattr(ship, "run_fixers", lambda paths, command: (7, "still fails"))
+    monkeypatch.setattr(ship, "mirror_codex_skills", lambda: called.append("m") or "")
+    assert ship._fix([]) == 7
+    assert called == []

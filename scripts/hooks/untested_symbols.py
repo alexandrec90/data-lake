@@ -24,7 +24,13 @@ every test in the repo and not only the identically-named one.
   by the endpoint test that exercises it.
 
 A *reference* is a call, an attribute access, or an import. Never a bare substring,
-which `cap` satisfies inside `capsys`.
+which `cap` satisfies inside `capsys`. And never a bare call of a name the test file
+defines itself (`shadowed_names`): a fixture named after the function it stands in for
+is that fixture, not the function, unless the file also reaches the real one through
+its module or an import. And an attribute off a name the file loaded one module into, by
+path (`tool = load("scripts/a.py")`, then `tool.x()`) or by `import` (`typer.main`),
+vouches for that module only (`attributes_by_module`), not for every other module the
+same file names. The dotted path of an import statement is no attribute at all.
 
 ## The baseline is debt, not configuration
 
@@ -41,21 +47,29 @@ rather than a config file, and `tests/test_untested_symbols.py` enforces both:
 adoption and recording the existing debt are one act. Seeding an *existing* file is
 refused -- that would launder new untested code into the debt list, which is the one
 way this check can be defeated without anyone deciding to defeat it.
+
+Every later pull *reconciles* it instead (`reconcile`), because a release moves the gaps
+under a project that did nothing: a vendored test covers a baselined symbol, or this
+scanner stops counting a reference that never exercised the symbol it named. Both
+reddened the adoption of #464's scanner. Reconciling drops the lines now covered, and
+records only the gaps the pull itself revealed -- present now, absent from what the
+project's own pre-pull scanner reported, and not in a file the project has uncommitted
+edits to -- so debt the project wrote is still its gate's to report.
 """
 
 from __future__ import annotations
 
 import argparse
 import ast
-import io
+import json
 import re
 import sys
-import tokenize
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import harness_config
+from code_text import code_only, top_level_scopes
 
 REPO_ROOT = (Path(__file__).parent / "../..").resolve()
 CFG = harness_config.load(REPO_ROOT)
@@ -180,23 +194,39 @@ def reference_pattern(symbol: str) -> re.Pattern[str]:
     The definition of a reference. `referenced_names` is the same three shapes read the
     other way round -- every name a text references, in one pass -- and the scan uses
     that; `test_referenced_names_agrees_with_reference_pattern` holds the two together.
+
+    The attribute shape is never read on an import statement's line: the dotted path
+    there names modules, never a symbol, and 27c631a4's `from typer.main import
+    get_command` read as coverage of `main` in every script its file loaded.
     """
     name = re.escape(symbol)
     return re.compile(
-        rf"\.{name}\b"  # module.symbol
+        rf"^(?![ \t]*(?:import|from)\b)[^\n]*?\.{name}\b"  # module.symbol
         rf"|(?<![\w.]){name}\s*\("  # symbol(...) after a from-import
-        rf"|^\s*from\s+.*\bimport\b.*\b{name}\b",  # from mod import symbol
+        # from mod import symbol, and from mod import (\n    symbol,\n) across lines
+        rf"|^\s*from\s+.*\bimport\b[ \t]*(?:\([^)]*?\b{name}\b|[^\n(]*?\b{name}\b)",
         re.MULTILINE,
     )
 
 
 # The three shapes of `reference_pattern`, each capturing the name it would have been
 # asked about. `\w+` is greedy, so the captured word is the maximal identifier -- which
-# is exactly what the `\b` on the symbol side of `reference_pattern` demands.
+# is exactly what the `\b` on the symbol side of `reference_pattern` demands. The import
+# reads a parenthesised list to its `)`, across lines: sports_betting #50's
+# `from sports_betting.overlay.server import (\n    ...,\n    OverlayHandler,\n)` read as no
+# reference to anything it listed, so a class the test only compared by `is` was a gap.
 _ATTRIBUTE_RE = re.compile(r"\.(\w+)")
 _CALL_RE = re.compile(r"(?<![\w.])(\w+)\s*\(")
-_FROM_IMPORT_RE = re.compile(r"^\s*from\s+.*?\bimport\b(.*)", re.MULTILINE)
+_FROM_IMPORT_RE = re.compile(r"^\s*from\s+.*?\bimport\b[ \t]*(\([^)]*|[^\n(]*)", re.MULTILINE)
 _WORD_RE = re.compile(r"\w+")
+# An import statement's line, which the attribute shape never reads (`reference_pattern`).
+_IMPORT_LINE_RE = re.compile(r"^[ \t]*(?:import|from)\b[^\n]*", re.MULTILINE)
+
+
+def _without_import_lines(text: str) -> str:
+    """`text` with every import statement's line blanked, offsets kept, for the
+    attribute shape to read."""
+    return _IMPORT_LINE_RE.sub(lambda found: " " * len(found[0]), text)
 
 
 def referenced_names(text: str) -> frozenset[str]:
@@ -210,11 +240,135 @@ def referenced_names(text: str) -> frozenset[str]:
     names it references and taking a set union per module answers the same question
     in well under a second.
     """
-    names: set[str] = set(_ATTRIBUTE_RE.findall(text))
+    names: set[str] = set(_ATTRIBUTE_RE.findall(_without_import_lines(text)))
     names.update(_CALL_RE.findall(text))
     for rest_of_line in _FROM_IMPORT_RE.findall(text):
         names.update(_WORD_RE.findall(rest_of_line))
     return frozenset(names)
+
+
+_DEFINITION_RE = re.compile(r"^[ \t]*(?:async[ \t]+)?(?:def|class)[ \t]+(\w+)", re.MULTILINE)
+
+
+def shadowed_names(text: str) -> frozenset[str]:
+    """Names `text` defines itself and never reaches through an attribute or an import.
+
+    The call shape cannot tell `gh_for(` from `def gh_for(`, and should not have to: a
+    name a test file binds with its own `def` or `class` is that file's, so every bare
+    call of it in that file is a call of the local one. A fixture named after the
+    function it stands in for -- `def gh_for(_project_dir):` handed to `monkeypatch`
+    -- read as coverage of `sweep.gh_for` and made the gate demand its baseline line be
+    deleted as "now covered", when nothing had tested it. `gaps` subtracts these names
+    from the file's references. A `module.name` attribute or a `from module import
+    name` is still a reference to the real one, so a name reached that way is not
+    shadowed even where the file also defines one.
+
+    A file-level fact rather than a shape, which is why it is kept out of
+    `reference_pattern` and `referenced_names`: those read one reference at a time, and
+    this is the whole file's answer to whether a bare call can mean the module's symbol.
+    """
+    defined = set(_DEFINITION_RE.findall(text))
+    reached = set(_ATTRIBUTE_RE.findall(_without_import_lines(text)))
+    for rest_of_line in _FROM_IMPORT_RE.findall(text):
+        reached.update(_WORD_RE.findall(rest_of_line))
+    return frozenset(defined - reached)
+
+
+# `name = loader("dir/file.py", ...)`: a name bound to one module by its path.
+_LOADED_RE = re.compile(
+    r"""^[ \t]*(\w+)[ \t]*(?::[^=\n]*)?=[ \t]*[\w.]+\(\s*[rRuU]?["'][^"'\n]*?([^"'/\\\n]+\.py)["']""",
+    re.MULTILINE,
+)
+_ASSIGNED_RE = re.compile(r"^[ \t]*(\w+)[ \t]*(?::[^=\n]*)?=(?!=)", re.MULTILINE)
+# `import a.b as c, d`: the clauses, split on `,` by `_imported`.
+_IMPORT_RE = re.compile(r"^[ \t]*import[ \t]+([\w. \t,]+)", re.MULTILINE)
+_IMPORT_CLAUSE_RE = re.compile(r"\s*([\w.]+)(?:\s+as\s+(\w+))?\s*")
+# `receiver.a.b`: a name and the dotted chain off it.
+_CHAIN_RE = re.compile(r"(?<![\w.])(\w+)((?:\.\w+)+)")
+
+
+def _imported(scope: str) -> dict[str, set[str]]:
+    """Each name an `import` statement in `scope` binds, with the file names of the
+    modules on its dotted path: `import a.b as c` binds `c` to `a.py` and `b.py`, and
+    `import a.b` binds `a` to `a.py`, the chain off it reaching the rest."""
+    bound: dict[str, set[str]] = {}
+    for statement in _IMPORT_RE.findall(scope):
+        for clause in statement.split(","):
+            found = _IMPORT_CLAUSE_RE.fullmatch(clause)
+            if not found:
+                continue
+            parts = found[1].split(".")
+            name, modules = (found[2], parts) if found[2] else (parts[0], parts[:1])
+            bound.setdefault(name, set()).update(f"{part}.py" for part in modules)
+    return bound
+
+
+def _loaded(scope: str) -> dict[str, frozenset[str]]:
+    """Each name `scope` loads a module into, by path or by `import`, with the file names
+    of those modules -- empty for a name also assigned any other way, which says nothing
+    about its module."""
+    files: dict[str, set[str]] = {}
+    loads: dict[str, int] = {}
+    for found in _LOADED_RE.finditer(scope):
+        files.setdefault(found[1], set()).add(found[2])
+        loads[found[1]] = loads.get(found[1], 0) + 1
+    for name in _ASSIGNED_RE.findall(scope):
+        loads[name] = loads.get(name, 0) - 1
+    for name, modules in _imported(scope).items():
+        files.setdefault(name, set()).update(modules)
+        loads.setdefault(name, 0)
+    return {
+        name: frozenset(files.get(name, ())) if count == 0 else frozenset()
+        for name, count in loads.items()
+    }
+
+
+def attributes_by_module(text: str) -> dict[str, frozenset[str]]:
+    """Names `text` reaches only off a receiver bound to a module, each mapped to the file
+    names of the modules that reach it.
+
+    1a0918d0: `installer.runner_script()`, with `installer` loaded from
+    install-collectors.py, read as coverage of install-global-tools.py's `runner_script`
+    because another test in the file loaded that one into the same local name. A name in
+    this map vouches only for the modules it maps to; every other reference -- a bare call,
+    a from-import, an attribute off a fixture or off anything the file does not bind to a
+    module -- is left out and vouches for the whole corpus as before, so this can only
+    move a symbol out of coverage where the file itself says which module it reached.
+
+    27c631a4: `typer.main.get_command` read as coverage of `main` in every script the file
+    loaded by path. A receiver bound by `import` names its modules too, and each link of a
+    chain belongs to the receiver's modules and the links before it -- `typer.py` for
+    `main`, which no project module is, while `pkg.mod.alpha` still reaches `mod.py`.
+
+    7e14d6d3: the module's scope is every top-level statement that is not a definition,
+    wherever it sits (`top_level_scopes`), so a load written below a helper still binds.
+    """
+    module, functions = top_level_scopes(text)
+    scopes = [module, *functions]
+    module_level = _loaded(module)
+    owned: dict[str, set[str]] = {}
+    free = set(_CALL_RE.findall(text))
+    for rest_of_line in _FROM_IMPORT_RE.findall(text):
+        free.update(_WORD_RE.findall(rest_of_line))
+    for index, scope in enumerate(scopes):
+        bound = {**module_level, **_loaded(scope)} if index else module_level
+        code = _without_import_lines(scope)
+        dots: dict[int, frozenset[str]] = {}
+        for found in _CHAIN_RE.finditer(code):
+            owners = bound.get(found[1])
+            if not owners:
+                continue
+            dot = found.start(2)
+            for link in found[2].split(".")[1:]:
+                dots[dot] = owners
+                owners = owners | {f"{link}.py"}
+                dot += len(link) + 1
+        for found in _ATTRIBUTE_RE.finditer(code):
+            if found.start() in dots:
+                owned.setdefault(found[1], set()).update(dots[found.start()])
+            else:
+                free.add(found[1])
+    return {name: frozenset(files) for name, files in owned.items() if name not in free}
 
 
 def module_pattern(module: Path) -> re.Pattern[str]:
@@ -266,6 +420,13 @@ def module_pattern(module: Path) -> re.Pattern[str]:
     vendors, where `load_script` may not exist. One assertion form left admitting is a
     far smaller surface than every mention in the file, and narrowing it further wants
     the call's *callee*, which means parsing rather than matching.
+
+    **An import by name** -- `pytest.importorskip("pkg.sub.mod")`,
+    `importlib.import_module(...)`, `__import__(...)` -- is the fifth way, and the one a
+    test of a module behind an optional dependency is written in. Missing it, every
+    public symbol of such a module read as untested while its test called each one
+    (1effb775). Here the callee *is* named, because these are the import machinery's own
+    spellings rather than one repo's test idiom; the dotted name must end on the stem.
     """
     filename = re.escape(module.name)
     snake = re.escape(module.stem.replace("-", "_"))
@@ -273,6 +434,8 @@ def module_pattern(module: Path) -> re.Pattern[str]:
         # path spelling, in the position that reaches a module rather than names one:
         # load_module('scripts/sync-devkit.py'), REPO_ROOT / 'scripts/sync-devkit.py'
         rf"""[(/]\s*["'][^"']*{filename}["']"""
+        # an import by name: pytest.importorskip('pkg.sync_devkit'), import_module(...)
+        rf"""|\b(?:importorskip|import_module|__import__)\(\s*["'](?:[\w.]+\.)?{snake}["']"""
         rf"|^\s*(?:import|from)\s+.*\b{snake}\b"  # import sync_devkit / from x import ...
         rf"|\b{snake}\s*\."  # sync_devkit.main
         rf"|\b{snake}\b\s*=",  # sync_devkit = load(...)
@@ -280,8 +443,58 @@ def module_pattern(module: Path) -> re.Pattern[str]:
     )
 
 
-def corpus_files(module: Path, texts: dict[Path, str]) -> list[Path]:
-    """The test files that mention `module`, in the order `texts` lists them.
+def dotted_name(root: Path, directory: Path) -> str:
+    """`directory`'s import name: its path from the outermost enclosing package, dotted.
+
+    `directory` is relative to `root`. Empty where it is not a package. Walked up rather
+    than taken from the path, so a `src/` layout names `pkg.sub`, not `src.pkg.sub`.
+    """
+    parts: list[str] = []
+    current = directory
+    while current.name and (root / current / "__init__.py").is_file():
+        parts.insert(0, current.name)
+        current = current.parent
+    return ".".join(parts)
+
+
+def reexporting_package(root: Path, module: Path) -> str:
+    """The dotted name of `module`'s package where its `__init__.py` imports from it.
+
+    sports_betting #50: `from sports_betting.overlay import evaluate, parse_offers` is how
+    a test reaches a package's API, and it names neither `overlay/evaluate.py` nor
+    `overlay/offers.py`, so both read as untested while the test called every function.
+    `__init__.py` is skipped as a source because it is re-exports; this is the other half,
+    a test that reaches a module through them. One level: a package re-exported again by
+    its own parent is not followed. Empty where nothing re-exports `module`.
+    """
+    package = dotted_name(root, module.parent)
+    init = root / module.parent / "__init__.py"
+    if not package or not init.is_file():
+        return ""
+    try:
+        tree = ast.parse(init.read_text(encoding="utf-8"))
+    except SyntaxError:
+        return ""
+    absolute = f"{package}.{module.stem}"
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        relative = node.level == 1 and node.module == module.stem
+        if relative or (node.level == 0 and node.module == absolute):
+            return package
+    return ""
+
+
+def package_pattern(package: str) -> re.Pattern[str]:
+    """Matches a test file's import of `package` itself -- not of a module inside it,
+    which `module_pattern` answers for that module."""
+    name = re.escape(package)
+    return re.compile(rf"^\s*(?:from\s+{name}\s+import\b|import\s+{name}\b(?!\.))", re.MULTILINE)
+
+
+def corpus_files(module: Path, texts: dict[Path, str], package: str = "") -> list[Path]:
+    """The test files that mention `module`, or import the `package` that re-exports it,
+    in the order `texts` lists them.
 
     The substring test in front of the regex is a **necessary condition of every
     alternative** {@link module_pattern} accepts -- each one contains either the file
@@ -296,15 +509,18 @@ def corpus_files(module: Path, texts: dict[Path, str]) -> list[Path]:
     60s timeout on `test_every_public_symbol_is_named_by_a_test`; a `in` check that
     settles the same question for most pairs brings it to about 4s. A timing-out gate
     is not a slow gate, it is a red one, and the failure names a regex rather than the
-    coverage it was asked about.
+    coverage it was asked about. The package's import spells `package` literally, so the
+    same prefilter holds for it.
     """
     mentions = module_pattern(module)
     name = module.name
     snake = module.stem.replace("-", "_")
+    via = package_pattern(package) if package else None
     return [
         rel
         for rel, text in texts.items()
-        if (name in text or snake in text) and mentions.search(text)
+        if ((name in text or snake in text) and mentions.search(text))
+        or (via is not None and package in text and via.search(text))
     ]
 
 
@@ -316,56 +532,6 @@ def corpus_for(module: Path, texts: dict[Path, str]) -> str:
 def entry(module: Path, symbol: str) -> str:
     """The baseline key for one symbol. Posix, so the file is identical on any OS."""
     return f"{module.as_posix()}::{symbol}"
-
-
-# A string token is a docstring -- or a bare string statement, which is prose too -- when
-# it opens a statement and nothing follows it on that statement.
-_STATEMENT_START = frozenset({tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT})
-_STATEMENT_END = frozenset({tokenize.NEWLINE, tokenize.ENDMARKER})
-_NOT_CODE = frozenset({tokenize.COMMENT, tokenize.NL})
-
-
-def code_only(text: str) -> str:
-    """`text` with every docstring and comment blanked, so only code can name a module.
-
-    Blanked rather than removed -- each is replaced by spaces of the same width, with
-    its newlines kept -- so nothing else in the file moves. String literals that are
-    not docstrings survive: the path a test passes to a loader is an argument, and it
-    is exactly the spelling the corpus is scoped by. Read with the tokenizer rather than
-    `ast`, because a docstring is a token-level fact (a string that opens a statement
-    and ends it) and the tokenizer is what `structure_scan` already trusts for
-    comments. Text it cannot finish is returned unchanged: a gate that raises on a
-    broken test file reports the wrong thing, and the linter reports the right one.
-    """
-    try:
-        tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
-    except (tokenize.TokenError, SyntaxError):
-        return text
-    lines = io.StringIO(text).readlines()  # split exactly as the tokenizer read it
-
-    def blank(token: tokenize.TokenInfo) -> None:
-        (start_line, start_col), (end_line, end_col) = token.start, token.end
-        for number in range(start_line, end_line + 1):
-            line = lines[number - 1]
-            lo = start_col if number == start_line else 0
-            hi = end_col if number == end_line else len(line.rstrip("\r\n"))
-            lines[number - 1] = line[:lo] + " " * (hi - lo) + line[hi:]
-
-    for token in tokens:
-        if token.type == tokenize.COMMENT:
-            blank(token)
-    code = [token for token in tokens if token.type not in _NOT_CODE]
-    previous = tokenize.NEWLINE
-    for index, token in enumerate(code):
-        following = code[index + 1].type if index + 1 < len(code) else tokenize.ENDMARKER
-        if (
-            token.type == tokenize.STRING
-            and previous in _STATEMENT_START
-            and following in _STATEMENT_END
-        ):
-            blank(token)
-        previous = token.type
-    return "".join(lines)
 
 
 def read_tests(root: Path, cfg: harness_config.Config) -> dict[Path, str]:
@@ -389,7 +555,14 @@ def gaps(root: Path, cfg: harness_config.Config, texts: dict[Path, str] | None =
     """
     if texts is None:
         texts = read_tests(root, cfg)
-    referenced = {rel: referenced_names(text) for rel, text in texts.items()}
+    # Split once per file: what vouches for every module the file names, and the names that
+    # vouch only for the modules `attributes_by_module` maps them to.
+    referenced: dict[Path, frozenset[str]] = {}
+    owned: dict[Path, dict[str, frozenset[str]]] = {}
+    for rel, text in texts.items():
+        reached = referenced_names(text) - shadowed_names(text)
+        owned[rel] = {n: files for n, files in attributes_by_module(text).items() if n in reached}
+        referenced[rel] = reached - owned[rel].keys()
     found: list[str] = []
     for module in source_files(root, cfg):
         try:
@@ -398,9 +571,15 @@ def gaps(root: Path, cfg: harness_config.Config, texts: dict[Path, str] | None =
             # Not this gate's job to report: the linter and the interpreter both say so
             # louder. Skipping keeps a broken file from masking every other module.
             continue
+        package = reexporting_package(root, module)
+        # The spellings an owner may give `module`: its file name, its import name, and the
+        # packages it is reached through when one re-exports it.
+        spellings = {module.name, module.name.replace("-", "_")}
+        spellings.update(f"{part}.py" for part in package.split(".") if part)
         names: set[str] = set()
-        for rel in corpus_files(module, texts):
+        for rel in corpus_files(module, texts, package):
             names |= referenced[rel]
+            names.update(name for name, files in owned[rel].items() if spellings & files)
         found.extend(entry(module, symbol) for symbol in symbols if symbol not in names)
     return sorted(found)
 
@@ -449,6 +628,44 @@ def verdict(root: Path, cfg: harness_config.Config) -> tuple[list[str], list[str
     return sorted(current - recorded), sorted(recorded - current)
 
 
+def reconcile(
+    root: Path,
+    cfg: harness_config.Config,
+    before: set[str] | None,
+    held: frozenset[str] = frozenset(),
+) -> tuple[int, int] | None:
+    """Carry an adopted baseline across a pull: `(dropped, recorded)`, `None` if unadopted.
+
+    Drops every line no longer a gap, which only shrinks the debt. Records a gap only if
+    `before` -- the gaps the pre-pull tree's own scanner reported -- lacks it and its file
+    is not in `held`, the project-owned files with uncommitted edits: such a gap was
+    made by the pull, not by the project. `before=None`, when nothing says what the tree
+    looked like, records nothing, so the one thing this can never do is `seed`'s refusal
+    in reverse -- launder a symbol someone just failed to test.
+    """
+    path = baseline_path(root)
+    if not path.exists():
+        return None
+    current = set(gaps(root, cfg))
+    recorded = set(read_baseline(path))
+    stale = recorded - current
+    revealed: set[str] = set()
+    if before is not None:
+        revealed = {k for k in current - recorded - before if k.partition("::")[0] not in held}
+    if stale or revealed:
+        path.write_text(
+            render_baseline(sorted((recorded - stale) | revealed)), encoding="utf-8", newline="\n"
+        )
+    return len(stale), len(revealed)
+
+
+def read_reconcile_input(path: Path) -> tuple[set[str] | None, frozenset[str]]:
+    """`(before, held)` from the JSON `sync-devkit.py` writes; `before` null is unknown."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    before = data.get("before")
+    return (None if before is None else set(before)), frozenset(data.get("held", ()))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -457,7 +674,24 @@ def main(argv: list[str] | None = None) -> int:
         help=f"write {BASELINE_NAME} when adopting the gate; refuses to overwrite",
     )
     parser.add_argument("--list", action="store_true", help="print every gap, covered or not")
+    parser.add_argument(
+        "--reconcile",
+        metavar="JSON",
+        type=Path,
+        help="after a pull: drop covered lines, record gaps absent from the JSON's `before`",
+    )
     args = parser.parse_args(argv)
+
+    if args.reconcile:
+        result = reconcile(REPO_ROOT, CFG, *read_reconcile_input(args.reconcile))
+        if result is None:
+            print(f"untested-symbols: no {BASELINE_NAME} to reconcile.")
+            return 1
+        print(
+            f"untested-symbols: dropped {result[0]} covered line(s), "
+            f"recorded {result[1]} gap(s) the pull revealed."
+        )
+        return 0
 
     if args.seed:
         count = seed(REPO_ROOT, CFG)

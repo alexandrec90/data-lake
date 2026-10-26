@@ -1,6 +1,8 @@
 """Object-store backends: LocalDirStore round-trips, S3ObjectStore against a fake client
 (never a real bucket), and backend dispatch from the settings object."""
 
+import time
+
 import pytest
 
 from data_lake.archive.store import (
@@ -134,6 +136,91 @@ def test_s3_store_does_not_hide_non_missing_client_errors():
         store.get_bytes("private.parquet")
     with pytest.raises(_S3ClientError, match="AccessDenied"):
         store.exists("private.parquet")
+
+
+class _BrokenBody:
+    """A body whose stream dies mid-read, as an R2 download did in ibkr_trader's social poll."""
+
+    def __init__(self, error: Exception):
+        self._error = error
+
+    def read(self) -> bytes:
+        raise self._error
+
+
+class FlakyBodyClient(FakeS3Client):
+    """``get_object`` answers, but the first ``broken`` bodies break while being read."""
+
+    def __init__(self, error: Exception, broken: int):
+        super().__init__()
+        self.error = error
+        self.broken = broken
+        self.gets = 0
+
+    def get_object(self, Bucket, Key):
+        response = super().get_object(Bucket, Key)
+        self.gets += 1
+        if self.gets <= self.broken:
+            return {"Body": _BrokenBody(self.error)}
+        return response
+
+
+def _streaming_errors() -> list[Exception]:
+    """The three errors botocore's ``StreamingBody.read`` raises for a broken download."""
+    exceptions = pytest.importorskip("botocore.exceptions")
+    return [
+        exceptions.ResponseStreamingError(error="Connection broken: IncompleteRead(1589248 bytes)"),
+        exceptions.IncompleteReadError(actual_bytes=1589248, expected_bytes=5034367),
+        exceptions.ReadTimeoutError(endpoint_url="https://example.r2.cloudflarestorage.com"),
+    ]
+
+
+@pytest.fixture
+def sleeps(monkeypatch) -> list[float]:
+    """The back-off delays the store asked for, without waiting them out."""
+    recorded: list[float] = []
+    monkeypatch.setattr(time, "sleep", recorded.append)
+    return recorded
+
+
+@pytest.mark.parametrize("index", range(3), ids=["streaming", "incomplete", "read-timeout"])
+def test_s3_store_retries_a_body_that_breaks_mid_read(index, sleeps):
+    error = _streaming_errors()[index]
+    client = FlakyBodyClient(error, broken=2)
+    client.blobs[("bucket", "social/part.parquet")] = b"whole object"
+    store = S3ObjectStore(client, "bucket")
+
+    assert store.get_bytes("social/part.parquet") == b"whole object"
+    assert client.gets == 3  # the object is fetched again, not the broken stream resumed
+    assert len(sleeps) == 2
+
+
+def test_s3_store_gives_up_after_the_last_read_attempt(sleeps):
+    error = _streaming_errors()[0]
+    client = FlakyBodyClient(error, broken=99)
+    client.blobs[("bucket", "social/part.parquet")] = b"whole object"
+    store = S3ObjectStore(client, "bucket", read_attempts=2)
+
+    with pytest.raises(type(error)):
+        store.get_bytes("social/part.parquet")
+    assert client.gets == 2
+    assert len(sleeps) == 1  # no pause after the last attempt
+
+
+def test_s3_store_does_not_retry_a_body_error_that_is_not_transient(sleeps):
+    client = FlakyBodyClient(ValueError("not a stream failure"), broken=1)
+    client.blobs[("bucket", "x.parquet")] = b"x"
+    store = S3ObjectStore(client, "bucket")
+
+    with pytest.raises(ValueError, match="not a stream failure"):
+        store.get_bytes("x.parquet")
+    assert client.gets == 1
+    assert sleeps == []
+
+
+def test_s3_store_rejects_fewer_than_one_read_attempt():
+    with pytest.raises(ValueError, match="read_attempts"):
+        S3ObjectStore(FakeS3Client(), "bucket", read_attempts=0)
 
 
 def test_s3_store_listing_paginates_and_strips_prefix():

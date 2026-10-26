@@ -1,7 +1,11 @@
 """Unit tests for scripts/sync-devkit.py (harness vendoring + drift check)."""
 
+import ast
+import importlib.util
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -338,6 +342,25 @@ def test_an_untagged_pull_leaves_the_pin_alone(tmp_path, monkeypatch):
     assert sh.read_pin((repo / sh.PRECOMMIT_FILE).read_text()) == "v0.5.2"
 
 
+def test_devkit_itself_has_nothing_to_compare_and_nothing_to_pull(tmp_path, capsys, monkeypatch):
+    """A devkit worktree checked against the static checkout reported its own newer files
+    as DRIFT and advised `--pull`, which would have reverted them: in devkit the vendored
+    files are the source, and every other devkit checkout is only an older copy of it."""
+    src = tmp_path / "static"
+    (src / "scripts").mkdir(parents=True)
+    repo = tmp_path / "tree"
+    (repo / "scripts").mkdir(parents=True)
+    (repo / "scripts" / "new-project.py").write_text("")
+    (repo / "templates" / "core").mkdir(parents=True)
+    monkeypatch.setenv(sh.SRC_ENV, str(src))
+    monkeypatch.setattr(sh, "REPO_ROOT", repo)
+    assert sh.main(["--check"]) == 0
+    assert "devkit itself" in capsys.readouterr().out
+    assert sh.main(["--pull"]) == 1
+    assert sh.main(["--push"]) == 1
+    assert not sh.devkit_itself(src), "a consumer ships neither the generator nor templates/"
+
+
 def test_check_noop_when_src_unset_and_project_never_pulled(tmp_path, capsys, monkeypatch):
     """Pre-adoption: nothing is vendored, so there is nothing a skip could hide.
 
@@ -403,6 +426,28 @@ def test_pull_copies_shared_into_project(tmp_path, monkeypatch):
     # is under test here is the copy/retire/receipt behaviour, not the guards.
     assert sh.main(["--pull", "--src", str(src), "--allow-untagged"]) == 0
     assert (repo / "scripts/x.py").read_text() == "upstream"
+
+
+def test_pull_gives_a_python_dependabot_entry_the_floor_keeping_strategy(
+    tmp_path, monkeypatch, capsys
+):
+    """A project rendered before the template carried the strategy adopts the contract
+    test that requires it on this pull, so this pull is what supplies it -- or the upgrade
+    rehearsal from the previous release goes red on `test_ci_workflow_contract.py`."""
+    src = tmp_path / "shared"
+    repo = tmp_path / "proj"
+    _seed(src, "scripts/x.py", "upstream")
+    _seed(repo, ".github/dependabot.yml", "updates:\n  - package-ecosystem: uv\n    directory: /\n")
+    monkeypatch.setattr(sh, "REPO_ROOT", repo)
+    monkeypatch.setattr(sh, "MANIFEST", ("scripts/x.py",))
+
+    assert sh.main(["--pull", "--src", str(src), "--allow-untagged"]) == 0
+    text = (repo / ".github/dependabot.yml").read_text(encoding="utf-8")
+    assert "    versioning-strategy: lockfile-only\n" in text
+    assert (
+        "(floor-keeping versioning-strategy) .github/dependabot.yml: uv" in capsys.readouterr().out
+    )
+    assert sh.dependabot_pass(repo) == [], "a second pull has nothing to add"
 
 
 def test_pull_removes_only_reviewed_retired_files(tmp_path, monkeypatch):
@@ -905,7 +950,7 @@ def test_prune_settings_rewrites_the_file(tmp_path):
         json.dumps(_settings('python3 "x/scripts/hooks/branch-per-task.py"')), encoding="utf-8"
     )
     notes = sh.settings_pass(tmp_path, ("scripts/hooks/branch-per-task.py",))
-    assert notes == [f"(unwired agent hooks) {sh.SETTINGS_FILE}: PreToolUse, UserPromptSubmit"]
+    assert notes[0] == f"(unwired agent hooks) {sh.SETTINGS_FILE}: PreToolUse, UserPromptSubmit"
     assert "hooks" not in json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -1254,6 +1299,63 @@ def test_check_passes_once_the_codex_artifact_is_regenerated(tmp_path, monkeypat
     assert sh.main(["--check", "--src", str(src)]) == 0
 
 
+def _mirrored_project(root: Path) -> Path:
+    """A project holding the vendored mirror script and an `.agents/skills/` mirror that
+    matched its `.claude/skills/` before the pull."""
+    _seed(
+        root,
+        sh.CODEX_CONTEXT_SCRIPT,
+        (sh.REPO_ROOT / sh.CODEX_CONTEXT_SCRIPT).read_text(encoding="utf-8"),
+    )
+    for tier in (".claude/skills", sh.CODEX_SKILLS_DIR):
+        _seed(root, f"{tier}/ship/SKILL.md", "old ship")
+        _seed(root, f"{tier}/local/SKILL.md", "the project's own")
+    return root
+
+
+def test_pull_re_mirrors_the_skills_it_changed(tmp_path, monkeypatch, capsys):
+    """social-scraper #26: v0.11.38 changed `ship` and added `go-nuts`, the pull copied
+    both into `.claude/skills/`, and the vendored mirror test failed the adoption PR on
+    the `.agents/skills/` copy nothing rewrote."""
+    skills = {".claude/skills/ship/SKILL.md": "new ship", ".claude/skills/go-nuts/SKILL.md": "go"}
+    src = _repo(tmp_path / "src", tag="v0.5.3", files=skills)
+    repo = _mirrored_project(tmp_path / "proj")
+    _seed(repo, sh.PRECOMMIT_FILE, CONFIG)
+    monkeypatch.setattr(sh, "REPO_ROOT", repo)
+    monkeypatch.setattr(sh, "MANIFEST", tuple(skills))
+
+    assert sh.main(["--pull", "--src", str(src)]) == 0
+    mirror = repo / sh.CODEX_SKILLS_DIR
+    assert (mirror / "ship/SKILL.md").read_text() == "new ship"
+    assert (mirror / "go-nuts/SKILL.md").read_text() == "go"
+    assert (mirror / "local/SKILL.md").read_text() == "the project's own"
+    out = capsys.readouterr().out
+    assert f"{sh.CODEX_SKILLS_DIR}/go-nuts/SKILL.md" in out
+    assert f"{sh.CODEX_SKILLS_DIR}/local/SKILL.md" not in out
+
+
+def test_re_mirroring_a_current_mirror_changes_nothing(tmp_path):
+    assert sh.remirror_codex_skills(_mirrored_project(tmp_path)) == []
+
+
+def test_a_project_with_no_mirror_gets_none(tmp_path):
+    """No `.agents/skills/` is a project that never opted into Codex."""
+    root = _mirrored_project(tmp_path)
+    shutil.rmtree(root / sh.CODEX_SKILLS_DIR)
+    _seed(root, ".claude/skills/ship/SKILL.md", "new ship")
+    assert sh.remirror_codex_skills(root) == []
+    assert not (root / sh.CODEX_SKILLS_DIR).exists()
+
+
+def test_a_mirror_without_its_script_is_left_alone(tmp_path):
+    """A consumer several releases behind: its gate names the drift, not a crash here."""
+    root = _mirrored_project(tmp_path)
+    (root / sh.CODEX_CONTEXT_SCRIPT).unlink()
+    _seed(root, ".claude/skills/ship/SKILL.md", "new ship")
+    assert sh.remirror_codex_skills(root) == []
+    assert (root / sh.CODEX_SKILLS_DIR / "ship/SKILL.md").read_text() == "old ship"
+
+
 # --- the interpreter the generator is spawned with --------------------------
 # `NO_WINDOW` above is necessary and not sufficient, and the gap is invisible until a
 # scheduled job hits it: Windows **ignores** `CREATE_NO_WINDOW` for a GUI-subsystem
@@ -1299,6 +1401,7 @@ def test_a_missing_console_twin_falls_back_rather_than_raising(tmp_path, monkeyp
 
 SCANNER = "scripts/hooks/untested_symbols.py"
 CONFIG_MODULE = "scripts/hooks/harness_config.py"
+CODE_TEXT = "scripts/hooks/code_text.py"  # the scanner imports it
 
 
 def _ratchet_project(root: Path, source: str = "def alpha():\n    pass\n") -> Path:
@@ -1308,7 +1411,7 @@ def _ratchet_project(root: Path, source: str = "def alpha():\n    pass\n") -> Pa
     a Windows console is not UTF-8, so `_seed` would hand the subprocess a file its own
     interpreter cannot parse — a failure that reads as the seeder being broken.
     """
-    for rel in (SCANNER, CONFIG_MODULE):
+    for rel in (SCANNER, CONFIG_MODULE, CODE_TEXT):
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text((sh.REPO_ROOT / rel).read_text(encoding="utf-8"), encoding="utf-8")
@@ -1351,6 +1454,85 @@ def test_a_scanner_that_fails_leaves_no_half_written_baseline(tmp_path):
 def test_the_baseline_reader_drops_comments_and_blank_lines(tmp_path):
     _seed(tmp_path, sh.UNTESTED_BASELINE_FILE, "# header\n\nsrc/acme.py::alpha\n")
     assert sh.read_untested_baseline(tmp_path) == ["src/acme.py::alpha"]
+
+
+# #464 reddened the upgrade rehearsal twice over on files the project never touched: a
+# new vendored test covered a baselined symbol, and the narrowed scanner stopped
+# counting a sibling's same-named method as coverage. The pull reconciles instead.
+
+VENDORED_TEST = "tests/test_acme.py"
+
+
+def _adopted_ratchet_project(tmp_path: Path) -> Path:
+    """Committed with `beta` covered by a vendored test and `alpha` baselined."""
+    root = _ratchet_project(tmp_path, "def alpha():\n    pass\n\n\ndef beta():\n    pass\n")
+    _seed(root, VENDORED_TEST, "acme.beta()\n")
+    _seed(root, sh.UNTESTED_BASELINE_FILE, "src/acme.py::alpha\n")
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "t@example.com")
+    _git(root, "config", "user.name", "t")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "adopted")
+    return root
+
+
+def test_reconciling_records_only_what_the_pull_changed(tmp_path):
+    root = _adopted_ratchet_project(tmp_path)
+    # The pull: the vendored test now reaches `alpha` and no longer `beta`.
+    _seed(root, VENDORED_TEST, "acme.alpha()\n")
+    # The project's own uncommitted work, which the pull did not make.
+    _seed(root, "src/wip.py", "def gamma():\n    pass\n")
+    assert sh.reconcile_untested_baseline(root, (VENDORED_TEST,)) == (1, 1)
+    assert sh.read_untested_baseline(root) == ["src/acme.py::beta"]
+
+
+def test_reconciling_only_drops_when_head_cannot_say_what_the_tree_was(tmp_path, monkeypatch):
+    """No git here, so every gap might be the project's own: record none of them."""
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    root = _ratchet_project(tmp_path, "def alpha():\n    pass\n\n\ndef beta():\n    pass\n")
+    _seed(root, VENDORED_TEST, "acme.alpha()\n")
+    _seed(root, sh.UNTESTED_BASELINE_FILE, "src/acme.py::alpha\n")
+    assert sh.pre_pull_gaps(root) is None
+    assert sh.reconcile_untested_baseline(root, (VENDORED_TEST,)) == (1, 0)
+    assert sh.read_untested_baseline(root) == []
+
+
+def test_reconciling_is_skipped_before_adoption_and_without_a_scanner(tmp_path):
+    root = _ratchet_project(tmp_path / "unadopted")
+    assert sh.reconcile_untested_baseline(root, ()) is None
+    assert not (root / sh.UNTESTED_BASELINE_FILE).exists(), "adoption is the seed's"
+    _seed(tmp_path / "bare", sh.UNTESTED_BASELINE_FILE, "src/acme.py::alpha\n")
+    assert sh.reconcile_untested_baseline(tmp_path / "bare", ()) is None
+
+
+def test_a_scanner_that_fails_reconciles_nothing(tmp_path):
+    root = _adopted_ratchet_project(tmp_path)
+    _seed(root, SCANNER, "raise SystemExit(3)\n")
+    assert sh.reconcile_untested_baseline(root, ()) is None
+    assert sh.read_untested_baseline(root) == ["src/acme.py::alpha"]
+
+
+def test_pre_pull_gaps_are_what_heads_own_scanner_listed(tmp_path):
+    root = _adopted_ratchet_project(tmp_path)
+    _seed(root, VENDORED_TEST, "acme.alpha()\n")  # the working tree is not HEAD
+    assert sh.pre_pull_gaps(root) == {"src/acme.py::alpha"}
+
+
+def test_pre_pull_gaps_are_unknown_for_a_project_nested_in_another_repo(tmp_path):
+    """HEAD's tree would be the outer repo's, keyed by paths no entry here uses."""
+    outer = _adopted_ratchet_project(tmp_path)
+    inner = _ratchet_project(outer / "vendor" / "proj")
+    _git(outer, "add", "-A")
+    _git(outer, "commit", "-qm", "nest")
+    assert sh.pre_pull_gaps(inner) is None
+
+
+def test_uncommitted_paths_name_edits_and_untracked_files(tmp_path):
+    root = _adopted_ratchet_project(tmp_path)
+    assert sh.uncommitted_paths(root) == set()
+    _seed(root, VENDORED_TEST, "acme.alpha()\n")
+    _seed(root, "src/new dir/wip.py", "")
+    assert sh.uncommitted_paths(root) == {VENDORED_TEST, "src/new dir/wip.py"}
 
 
 def test_the_baseline_of_a_project_that_never_adopted_reads_empty(tmp_path):
@@ -2200,6 +2382,7 @@ def test_report_sync_names_every_file_a_reader_could_act_on(capsys):
         seeded_structure=4,
         tightened=(2, 1),
         pull=True,
+        reconciled=(5, 6),
     )
     sh.report_sync(outcome)
     out = capsys.readouterr().out
@@ -2212,6 +2395,7 @@ def test_report_sync_names_every_file_a_reader_could_act_on(capsys):
     assert "3 symbol(s)" in out
     assert "4 finding(s) grandfathered" in out
     assert "dropped 2 line(s)" in out
+    assert "dropped 5 line(s) now covered, recorded 6 gap(s) this pull revealed" in out
 
 
 def test_report_failed_blocks_is_silent_and_green_when_every_block_landed(capsys):
@@ -2335,3 +2519,139 @@ def test_run_check_and_run_sync_are_what_main_dispatches_to(tmp_path, monkeypatc
     assert sh.run_check(src, ("scripts/hooks/x.py",)) == 0
     assert sh.main(["--check", "--src", str(src)]) == 0
     assert sh.run_sync(src, ("scripts/hooks/x.py",), pull=False) == 0
+
+
+# --- the path lists live in `devkit_manifest.py` ------------------------------
+# Cut out of the tool because every vendored file was a raise of its `file_lines`
+# baseline. The tool re-exports the names, and exactly one pull per consumer can see
+# the tool without the list: the one whose OLD tool copied the new tool in and did not
+# know the list existed. That pull must take the list from its source or not run --
+# an empty list reads every receipt entry as retired and deletes it.
+
+dm = load_module("scripts/devkit_manifest.py")
+
+
+def test_the_path_lists_are_devkit_manifests_own():
+    """Re-exported rather than copied, so there is one list; and bound in this module's
+    globals, so every `monkeypatch.setattr(sh, "MANIFEST", ...)` above still drives it."""
+    assert sh.MANIFEST is dm.MANIFEST
+    assert sh.RETIRED_PATHS is dm.RETIRED_PATHS
+    assert sh.GATED_MANIFEST is dm.GATED_MANIFEST
+    assert (sh.FRONTEND_GATE, sh.DEFAULT_FRONTEND_SRC) == (
+        dm.FRONTEND_GATE,
+        dm.DEFAULT_FRONTEND_SRC,
+    )
+
+
+def test_the_list_is_vendored_beside_the_tool_that_reads_it():
+    assert {"scripts/sync-devkit.py", "scripts/devkit_manifest.py"} <= set(sh.MANIFEST)
+
+
+def test_the_lists_structure_check_reads_stay_literals():
+    """`structure_check.vendored_paths` reads these off the SOURCE with
+    `ast.literal_eval` in every consumer; an expression here is an empty exemption."""
+    tree = ast.parse((REPO_ROOT / "scripts" / "devkit_manifest.py").read_text(encoding="utf-8"))
+    found = {}
+    for node in tree.body:
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value:
+            if node.target.id in ("MANIFEST", "GATED_MANIFEST"):
+                found[node.target.id] = ast.literal_eval(node.value)
+    assert tuple(found["MANIFEST"]) == sh.MANIFEST
+    assert found["GATED_MANIFEST"] == sh.GATED_MANIFEST
+
+
+BOOTSTRAP_LISTS = """\
+MANIFEST = ("scripts/hooks/x.py", "scripts/sync-devkit.py", "scripts/devkit_manifest.py")
+RETIRED_PATHS = ()
+FRONTEND_GATE = "frontend"
+DEFAULT_FRONTEND_SRC = "frontend/src/"
+GATED_MANIFEST = {"frontend": ()}
+"""
+
+
+def _bootstrap(tmp_path: Path) -> tuple[Path, Path]:
+    """`(src, proj)`: a consumer holding the new tool and not its list, and the source.
+
+    A short list in the source, so a run that read it is told apart from one that read
+    the real MANIFEST; a plain directory, hence `--allow-untagged` on every pull.
+    """
+    tool = (REPO_ROOT / "scripts" / "sync-devkit.py").read_bytes()
+    src, proj = tmp_path / "src", tmp_path / "proj"
+    for root in (src, proj):
+        _seed(root, "scripts/hooks/x.py", "vendored\n")
+        (root / "scripts" / "sync-devkit.py").write_bytes(tool)
+    _seed(src, "scripts/devkit_manifest.py", BOOTSTRAP_LISTS)
+    return src, proj
+
+
+def _run_copy(proj: Path, *args: str, env: dict[str, str] | None = None):
+    """The consumer's own copy, as a process: only a fresh interpreter has no list."""
+    clean = {k: v for k, v in os.environ.items() if k != sh.SRC_ENV}
+    return subprocess.run(
+        [sys.executable, str(proj / "scripts" / "sync-devkit.py"), *args],
+        capture_output=True,
+        text=True,
+        env={**clean, **(env or {})},
+        check=False,
+    )
+
+
+def test_a_bootstrap_run_reads_the_list_from_src(tmp_path):
+    src, proj = _bootstrap(tmp_path)
+    result = _run_copy(proj, "--list", "--src", str(src))
+    assert result.returncode == 0, result.stderr
+    assert "scripts/hooks/x.py" in result.stdout
+    assert "scripts/hooks/harness_config.py" not in result.stdout, "not the source's list"
+
+
+def test_a_bootstrap_run_reads_the_list_from_devkit_dir(tmp_path):
+    src, proj = _bootstrap(tmp_path)
+    result = _run_copy(proj, "--list", env={sh.SRC_ENV: str(src)})
+    assert result.returncode == 0, result.stderr
+    assert "scripts/hooks/x.py" in result.stdout
+
+
+def test_a_bootstrap_run_with_no_source_refuses_rather_than_running_on_nothing(tmp_path):
+    _, proj = _bootstrap(tmp_path)
+    sh.write_receipt(proj, ("scripts/hooks/x.py",))
+    for args in (("--pull", "--allow-untagged"), ("--list", "--src", str(tmp_path / "none"))):
+        result = _run_copy(proj, *args)
+        assert result.returncode != 0, args
+        assert "devkit_manifest.py" in result.stderr
+        assert "--src" in result.stderr and sh.SRC_ENV in result.stderr
+        assert "Traceback" not in result.stderr
+    assert (proj / "scripts/hooks/x.py").is_file()
+
+
+def test_the_bootstrap_pull_keeps_every_vendored_file_and_delivers_the_list(tmp_path):
+    """The regression the refusal exists for: the receipt names files the list must
+    still name, or `remove_receipt_retired` deletes them as retired."""
+    src, proj = _bootstrap(tmp_path)
+    sh.write_receipt(proj, ("scripts/hooks/x.py", "scripts/sync-devkit.py"))
+
+    result = _run_copy(proj, "--pull", "--src", str(src), "--allow-untagged")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (proj / "scripts/hooks/x.py").read_text() == "vendored\n"
+    assert (proj / "scripts/devkit_manifest.py").read_bytes() == (
+        src / "scripts/devkit_manifest.py"
+    ).read_bytes()
+    assert "scripts/devkit_manifest.py" in sh.read_receipt(proj)
+    # The run after it imports the list it now holds, with no source at all.
+    assert _run_copy(proj, "--list").returncode == 0
+
+
+def test_a_by_path_load_without_the_list_raises_import_error(tmp_path, monkeypatch):
+    """Not a `SystemExit`: `new-project.py` and `workspace-status.py` load this script
+    in-process and handle `ImportError`, and an exit would take them down with it."""
+    _, proj = _bootstrap(tmp_path)
+    scripts = (REPO_ROOT / "scripts").resolve()
+    monkeypatch.delitem(sys.modules, "devkit_manifest")
+    monkeypatch.setattr(sys, "path", [p for p in sys.path if p and Path(p).resolve() != scripts])
+    monkeypatch.setattr(sys, "argv", ["tool"])
+    monkeypatch.delenv(sh.SRC_ENV, raising=False)
+    spec = importlib.util.spec_from_file_location(
+        "_bootstrap_copy", proj / "scripts/sync-devkit.py"
+    )
+    assert spec is not None and spec.loader is not None
+    with pytest.raises(ImportError, match=r"devkit_manifest\.py"):
+        spec.loader.exec_module(importlib.util.module_from_spec(spec))

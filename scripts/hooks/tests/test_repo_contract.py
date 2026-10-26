@@ -35,8 +35,10 @@ import dataclasses
 import inspect
 import json
 from collections.abc import Mapping
+from itertools import pairwise
 import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 from conftest import REPO_ROOT, load_module
@@ -158,6 +160,108 @@ def test_manifest_has_no_unknown_keys():
         assert not extra, f"unknown key(s) in [{table}]: {extra} (legal: {sorted(allowed)})"
 
 
+# --- every pytest run gets a temp root of its own -----------------------------
+
+TEMPROOT_PLUGIN = "devkit_temproot"
+TEMPROOT_DIR = "scripts/pytest-plugins"
+
+
+def temproot_gaps(pytest_options: Mapping[str, Any]) -> list[str]:
+    """What a `[tool.pytest.ini_options]` table lacks to load the vendored temp-root
+    plugin; empty when it loads it.
+
+    Without it a bare `python -m pytest` shares `%TEMP%/pytest-of-<user>` with every other
+    run on the machine, and exits 1 after a green suite whenever one of them holds the
+    `pytest-current` link there (237ed2b1).
+    """
+    addopts = pytest_options.get("addopts", "")
+    words = addopts.split() if isinstance(addopts, str) else [str(w) for w in addopts]
+    loaded = any(
+        (word == "-p" and after == TEMPROOT_PLUGIN) or word == f"-p{TEMPROOT_PLUGIN}"
+        for word, after in pairwise([*words, ""])
+    )
+    paths = pytest_options.get("pythonpath", [])
+    paths = [paths] if isinstance(paths, str) else list(paths)
+    gaps = [] if loaded else [f'addopts: add "-p {TEMPROOT_PLUGIN}"']
+    if TEMPROOT_DIR not in [str(p).rstrip("/") for p in paths]:
+        gaps.append(f'pythonpath: add "{TEMPROOT_DIR}"')
+    return gaps
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        ({"addopts": "-q -p devkit_temproot", "pythonpath": ["scripts/pytest-plugins"]}, []),
+        ({"addopts": ["-pdevkit_temproot"], "pythonpath": "scripts/pytest-plugins/"}, []),
+        ({"addopts": "-q"}, 2),
+        ({"addopts": "-p no:devkit_temproot", "pythonpath": ["scripts/pytest-plugins"]}, 1),
+        ({"pythonpath": ["tests"], "addopts": "-p devkit_temproot"}, 1),
+        # The table every project rendered before the plugin existed: no `addopts`.
+        ({"testpaths": ["tests"]}, 2),
+        ({"addopts": []}, 2),
+    ],
+)
+def test_temproot_gaps_reads_the_options_not_their_spelling(options, expected):
+    gaps = temproot_gaps(options)
+    assert gaps == expected if isinstance(expected, list) else len(gaps) == expected
+
+
+def wires_temproot(pytest_options: Mapping[str, Any]) -> bool:
+    """Whether the table has begun wiring the plugin: either half of it is there.
+
+    A project rendered before the plugin existed has neither half, and `--pull` cannot
+    add them, so failing it would redden every consumer's adoption PR -- the class the
+    upgrade rehearsal in devkit's PR gate refuses. Half a wiring is broken on its own
+    terms: `-p` without the path is a `ModuleNotFoundError` at startup, and the path
+    without `-p` loads nothing.
+    """
+    return len(temproot_gaps(pytest_options)) < 2
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        ({"testpaths": ["tests"]}, False),
+        ({"addopts": "-q", "pythonpath": ["tests"]}, False),
+        ({"addopts": "-p devkit_temproot"}, True),
+        ({"pythonpath": ["scripts/pytest-plugins"]}, True),
+        ({"addopts": "-p devkit_temproot", "pythonpath": ["scripts/pytest-plugins"]}, True),
+    ],
+)
+def test_wires_temproot_is_true_once_either_half_is_there(options, expected):
+    assert wires_temproot(options) is expected
+
+
+def pytest_options(pyproject: Path) -> Mapping[str, Any] | None:
+    """`[tool.pytest.ini_options]` from `pyproject`; None when there is no such table."""
+    import tomllib
+
+    if not pyproject.exists():
+        return None
+    with pyproject.open("rb") as fh:
+        return tomllib.load(fh).get("tool", {}).get("pytest", {}).get("ini_options")
+
+
+def test_pytest_options_is_none_without_the_table(tmp_path):
+    assert pytest_options(tmp_path / "pyproject.toml") is None
+    (tmp_path / "pyproject.toml").write_text("[tool.ruff]\n", encoding="utf-8")
+    assert pytest_options(tmp_path / "pyproject.toml") is None
+
+
+def test_a_project_wiring_the_temp_root_plugin_wires_both_halves():
+    """The plugin is vendored, and does nothing until the project's own `pyproject.toml`
+    loads it -- a file `--pull` never writes. So a project that has not begun wiring it,
+    or keeps its pytest config elsewhere, is out of scope rather than failed: "absent"
+    is no such tier, as for `check-lock-markers.py` above. Once either half is there, the
+    other must be too (`wires_temproot`). devkit and a fresh render carry both halves, so
+    they are held in full here, and devkit's `tests/test_temproot_wiring.py` fails
+    either one that stops loading the plugin at all."""
+    options = pytest_options(REPO_ROOT / "pyproject.toml")
+    wired = options is not None and wires_temproot(options)
+    gaps = temproot_gaps(options) if wired else []
+    assert not gaps, f"[tool.pytest.ini_options] in pyproject.toml -- {'; '.join(gaps)}"
+
+
 # --- the scripts stop.py dispatches to are actually there ---------------------
 
 
@@ -171,6 +275,72 @@ def test_unconditional_lint_tier_has_its_script():
     """
     assert hook.LINT_ALL.exists(), f"{hook.LINT_ALL.relative_to(REPO_ROOT)} is missing"
     assert hook._command_for(hook.CHECK_LINT) is not None
+
+
+# --- the lint runner cannot say clean having run no linter ---------------------
+# Ungated: it reads only the project's own `scripts/lint-all.py`, wired or not.
+
+# What hands a run to the tree's `.venv` when this interpreter lacks a linter: the
+# vendored `toolchain.rerun_in_venv`, which devkit's lint-all template calls, or
+# devkit's own `project_python.re_exec`.
+VENV_RERUNS = frozenset({"rerun_in_venv", "re_exec"})
+
+
+def runs_linters_from_this_interpreter(tree: ast.AST) -> bool:
+    """Whether a list in `tree` opens `[sys.executable, "-m", ...]`: a linter run as a
+    module of whatever interpreter started the script, and skipped where it has none."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.List) or len(node.elts) < 2:
+            continue
+        first, second = node.elts[:2]
+        if (
+            isinstance(first, ast.Attribute)
+            and first.attr == "executable"
+            and isinstance(first.value, ast.Name)
+            and first.value.id == "sys"
+            and isinstance(second, ast.Constant)
+            and second.value == "-m"
+        ):
+            return True
+    return False
+
+
+def hands_itself_to_the_venv(tree: ast.AST) -> bool:
+    """Whether `tree` reaches for one of `VENV_RERUNS`."""
+    return any(isinstance(n, ast.Attribute) and n.attr in VENV_RERUNS for n in ast.walk(tree))
+
+
+def test_the_venv_rerun_checks_read_the_shapes_a_lint_runner_is_written_in():
+    bare = ast.parse('subprocess.run([sys.executable, "-m", "ruff", "check"])')
+    handed = ast.parse('import toolchain\nrerun = toolchain.rerun_in_venv\nrerun(ROOT, "ruff")')
+    assert runs_linters_from_this_interpreter(bare) is True
+    assert runs_linters_from_this_interpreter(ast.parse('run(["ruff", "-m"])')) is False
+    assert hands_itself_to_the_venv(bare) is False
+    assert hands_itself_to_the_venv(handed) is True
+    assert hands_itself_to_the_venv(ast.parse("project_python.re_exec(ROOT, m, argv)")) is True
+
+
+def test_the_lint_runner_reruns_under_the_tree_venv_rather_than_skip_its_linters():
+    """A runner that calls each linter as `sys.executable -m <tool>` skips every one
+    the starting interpreter lacks, then prints `clean`. social-scraper's did exactly
+    that, run with the system Python from a tree whose `.venv` held both (1c984165).
+
+    devkit's lint-all template fixed it in `rerun_in_tree_venv`, but `templates/` is a
+    one-shot copy and every project had edited its runner, so the fix reached none of
+    them. This vendored check is what carries it: it fails a runner that never hands
+    itself to the tree's `.venv`.
+    """
+    runner = REPO_ROOT / "scripts" / "lint-all.py"
+    # No runner, or one that runs no linter as a module of its own interpreter (one that
+    # lints in a container, say), cannot skip a linter this way: it holds as it stands.
+    tree = ast.parse(runner.read_text(encoding="utf-8")) if runner.is_file() else ast.Module()
+    assert not runs_linters_from_this_interpreter(tree) or hands_itself_to_the_venv(tree), (
+        "scripts/lint-all.py runs its linters as `sys.executable -m <tool>` and never "
+        "hands itself to the tree's .venv, so under an interpreter without them it skips "
+        "each one and still says clean. Call the vendored `toolchain.rerun_in_venv` at the "
+        "top of main(), as `rerun_in_tree_venv` in devkit's "
+        "templates/core/scripts/lint-all.py.tmpl does."
+    )
 
 
 def _declared_interface(path: Path) -> str | None:
@@ -584,8 +754,7 @@ VENDORED_POLICY = ".claude/rules/engineering.md"
 # verbatim-only check would pass the moment someone paraphrased, which is precisely how
 # the original drift happened.
 POLICY_CLAUSES = (
-    "gaps are not acceptable",
-    "fail if the changed behavior were reverted",
+    "write the test in the same commit even if the logic didn't change",
     "never lower it merely to make a change pass",
     "raised on three consecutive branches is a defect report",
     "silently work around a bad instruction",
@@ -852,7 +1021,6 @@ def test_skill_script_dependencies_exist():
             )
 
 
-@consumes_harness
 def test_vendored_policy_is_present():
     """The rule every project's CLAUDE.md defers to has to actually be there.
 
@@ -864,7 +1032,6 @@ def test_vendored_policy_is_present():
     )
 
 
-@consumes_harness
 def test_the_guardrail_keeps_the_harness_off_the_sessions_plate():
     """A project session makes the change it was asked for; the harness is the pass's.
 
@@ -892,7 +1059,39 @@ def test_the_guardrail_keeps_the_harness_off_the_sessions_plate():
     )
 
 
-@consumes_harness
+FIXER_FILE = ".claude/fixer.md"
+
+# The project-session instructions a fixer must be told how to read, each with the
+# words that name it in the fixer file's override table.
+FIXER_OVERRIDES = (
+    "the harness is not your job",
+    "never silently work around a refusal",
+    "session-scope.md",
+    "the change the user asked for and nothing else",
+)
+
+
+def test_a_fixer_has_its_own_instructions_and_project_sessions_do_not_load_them():
+    """Fixers and project sessions need different instructions, and the rules are
+    written for project sessions: a guardrail that says report a dead end and stop was
+    read by a fixer as licence to stop at the failure it was sent to fix.
+
+    So a fixer -- declared as one by the first sentence of the fix pass's prompt --
+    reads its own file, kept outside `.claude/rules/` so no project session loads it,
+    and each project-session rule that would steer it wrong points there.
+    """
+    fixer = REPO_ROOT / FIXER_FILE
+    assert fixer.is_file(), f"{FIXER_FILE} is missing -- run `python scripts/sync-devkit.py --pull`"
+    assert not FIXER_FILE.startswith(".claude/rules/"), "a file under rules/ loads everywhere"
+    text = " ".join(fixer.read_text(encoding="utf-8").split()).lower()
+    for clause in FIXER_OVERRIDES:
+        assert clause.lower() in text, f"{FIXER_FILE} no longer answers {clause!r}"
+    for rule in (VENDORED_POLICY, ".claude/rules/session-scope.md"):
+        assert "../fixer.md" in (REPO_ROOT / rule).read_text(encoding="utf-8"), (
+            f"{rule} addresses project sessions and no longer points a fixer at {FIXER_FILE}"
+        )
+
+
 def test_claude_md_defers_to_the_vendored_policy_rather_than_restating_it():
     """A CLAUDE.md that restates vendored policy has forked it.
 
@@ -913,7 +1112,6 @@ def test_claude_md_defers_to_the_vendored_policy_rather_than_restating_it():
             )
 
 
-@consumes_harness
 def test_vendored_skills_are_not_locally_edited():
     """Vendored skills carry no project's default branch, paths, or service names.
 
@@ -924,7 +1122,7 @@ def test_vendored_skills_are_not_locally_edited():
     skills = REPO_ROOT / ".claude" / "skills"
     if not skills.is_dir():
         pytest.skip("no vendored skills")
-    vendored = {"ship"}
+    vendored = {"ship", "go-nuts"}
     for name in sorted(vendored):
         skill = skills / name / "SKILL.md"
         if not skill.is_file():

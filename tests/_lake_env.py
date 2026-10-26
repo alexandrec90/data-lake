@@ -19,6 +19,7 @@ SETTINGS = lake_settings(
     finnhub_key="",
     alpha_vantage_key="",
     fmp_key="",
-    reddit_client_id="",
-    reddit_client_secret="",
+    tiingo_api_key="",
+    fred_api_key="",
+    sec_user_agent="",
 )

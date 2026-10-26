@@ -110,7 +110,9 @@ def test_local_lens_exposes_documented_views_and_pushes_predicates(local_archive
             "EXPLAIN SELECT close FROM bars WHERE symbol = 'XEQT.TO'"
         ).fetchone()[1]
         assert "READ_PARQUET" in plan
-        assert "symbol='XEQT.TO'" in plan
+        # The scan's filter line is spaced differently across DuckDB releases
+        # ("symbol='XEQT.TO'" in 1.x, "symbol = 'XEQT.TO'" in 2.0).
+        assert "symbol='XEQT.TO'" in "".join(plan.split())
     finally:
         connection.close()
 

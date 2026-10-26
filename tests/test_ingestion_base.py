@@ -4,7 +4,9 @@ something weaker or recoverable, and pin that a payload kept whole never carries
 
 import hashlib
 
-from data_lake.ingestion.base import pseudonymize, stable_hash
+import pytest
+
+from data_lake.ingestion.base import AllItemsFailedError, pseudonymize, run_each, stable_hash
 
 
 def test_stable_hash_is_sha256_hex():
@@ -60,3 +62,36 @@ def test_pseudonymize_never_mutates_the_provider_payload():
     payload = {"author": "Jane Byline"}
     pseudonymize(payload, ["author"])
     assert payload == {"author": "Jane Byline"}
+
+
+def _work(item: str) -> int:
+    if item.startswith("bad"):
+        raise RuntimeError(f"{item} exploded")
+    return len(item)
+
+
+def test_run_each_sums_and_tolerates_some_failures(caplog):
+    assert run_each(["ab", "bad1", "abc"], _work, what="thing") == 5
+    assert "thing bad1 failed: bad1 exploded" in caplog.text
+
+
+def test_run_each_raises_when_every_item_failed():
+    with pytest.raises(AllItemsFailedError, match=r"every thing failed \(bad1, bad2\)") as info:
+        run_each(["bad1", "bad2"], _work, what="thing")
+    assert str(info.value.__cause__) == "bad1 exploded"
+
+
+def test_run_each_with_no_items_is_zero():
+    assert run_each([], _work, what="thing") == 0
+
+
+def test_run_each_lets_a_bug_abort_the_batch_at_once():
+    calls = []
+
+    def buggy(item: str) -> int:
+        calls.append(item)
+        raise TypeError("a bug, not a provider failure")
+
+    with pytest.raises(TypeError):
+        run_each(["a", "b"], buggy, what="thing")
+    assert calls == ["a"]

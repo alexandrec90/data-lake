@@ -208,6 +208,22 @@ def test_the_pr_gate_exists_and_carries_the_title_automerge_waits_on():
     )
 
 
+def test_the_pr_gate_can_be_re_run_on_the_default_branch():
+    """A merge by the auto-merge workflow is a push made with `GITHUB_TOKEN`, which raises
+    no `push` event, so nothing gates the new tip. The fix pass re-runs the gate there with
+    `gh workflow run` (`fix_red.regate`), and GitHub refuses that with HTTP 422 for a
+    workflow that has no `workflow_dispatch:` -- ibkr_trader's gate, 2026-09-26, whose
+    main then stayed unread on every pass.
+    """
+    gate = WORKFLOWS_DIR / PR_GATE
+    assert gate.is_file(), f".github/workflows/{PR_GATE} is missing"
+    triggers = _triggers(_read(gate))
+    assert "workflow_dispatch" in triggers, (
+        f"{PR_GATE} declares {sorted(triggers)} and no `workflow_dispatch:`, so a "
+        "default branch whose tip was never gated cannot be re-gated."
+    )
+
+
 def test_dependabot_prs_have_something_that_merges_them():
     assert (WORKFLOWS_DIR / AUTOMERGE).is_file(), (
         f".github/workflows/{AUTOMERGE} is missing -- run "
@@ -238,6 +254,23 @@ def test_the_merge_job_is_gated_by_label_not_by_author():
         "script is where the `automerge`-label check lives (pinned by "
         "test_merge_dependabot_prs.py), so without it every PR whose gate passes "
         "merges itself."
+    )
+
+
+def test_a_gate_on_the_default_branch_reaches_the_merge_job_as_a_sweep():
+    """The default branch's gate runs on `push`, and each completion follows the base
+    moving -- which is what leaves every open PR's `mergeable` undecided at its own gate's
+    completion. The merge job must wake for it and know it is the default branch, or a
+    green PR waits for the hourly pass (devkit #629, 2026-10-12)."""
+    text = _read(WORKFLOWS_DIR / AUTOMERGE)
+    merge_if = re.search(r"merge:\n(?:.*\n)*?    if: >-\n((?:      .*\n)+)", text)
+    assert merge_if and '"push"' in merge_if.group(1), (
+        f"{AUTOMERGE}'s merge job does not admit a `push` gate run, so the default "
+        "branch's own gate completion never sweeps the PRs its move left undecided."
+    )
+    assert "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}" in text, (
+        f"{AUTOMERGE} does not tell merge-dependabot-prs.py the default branch, so it "
+        "reads a completion there as a PR branch with no PR."
     )
 
 
@@ -273,6 +306,144 @@ def test_dependency_update_prs_are_assigned_to_someone():
         "of them. `assignees` is a per-update-entry key, so the unassigned ones open "
         "PRs that reach no dashboard."
     )
+
+
+# Strategies that move the lock without raising a `>=` floor the code never needed. Only
+# the one whose definition forbids touching the manifest: Dependabot's uv updater raised
+# data-lake's `pyarrow>=17` to `pyarrow>=26.0.0` under `increase-if-necessary`, whose
+# documentation says it leaves a floor that already allows the release alone.
+FLOOR_KEEPING = frozenset({"lockfile-only"})
+FLOOR_RAISING_ECOSYSTEMS = frozenset({"uv", "pip"})
+
+
+def _update_entries(text: str) -> list[tuple[str, list[str]]]:
+    """`(ecosystem, the entry's own lines)` for each `- package-ecosystem:` item."""
+    entries: list[tuple[str, list[str]]] = []
+    body: list[str] | None = None
+    depth = 0
+    for line in _code_lines(text):
+        indent = len(line) - len(line.lstrip())
+        if head := re.match(r"\s*-\s*package-ecosystem:\s*['\"]?([\w-]+)", line):
+            body, depth = [], indent
+            entries.append((head.group(1), body))
+        elif body is not None and indent > depth:
+            body.append(line)
+        else:
+            body = None  # a sibling item or a top-level key: the entry has ended
+    return entries
+
+
+def _versioning_strategy(body: list[str]) -> str | None:
+    for line in body:
+        if match := re.match(r"\s*versioning-strategy:\s*['\"]?([\w-]+)", line):
+            return match.group(1)
+    return None
+
+
+def _floor_raisers(text: str) -> list[str]:
+    return [
+        f"{ecosystem} ({_versioning_strategy(body) or 'no versioning-strategy'})"
+        for ecosystem, body in _update_entries(text)
+        if ecosystem in FLOOR_RAISING_ECOSYSTEMS and _versioning_strategy(body) not in FLOOR_KEEPING
+    ]
+
+
+def test_python_dependency_updates_leave_the_declared_floors_alone():
+    """A Python entry names a strategy that moves the lock, not the `>=` floors.
+
+    With none, Dependabot judged a library an app and used `increase`: data-lake's
+    grouped patch bump rewrote `pandas>=2.2` as `pandas>=3.0.6`, and ibkr_trader, whose
+    `alphalens-reloaded` needs `pandas<3`, went red on its own `main` with no PR of its
+    own to show why. A floor says what the code needs; the lock says what was tested.
+
+    `increase-if-necessary` was the answer until it did the same: under it the uv updater
+    rewrote `pyarrow>=17` as `pyarrow>=26.0.0` for a release the floor already allowed,
+    and ibkr_trader's nightly, whose mlflow caps `pyarrow<26`, stopped resolving.
+    """
+    if not DEPENDABOT.is_file():
+        return  # test_dependency_updates_are_configured owns that failure
+    raisers = _floor_raisers(_read(DEPENDABOT))
+    assert not raisers, (
+        f".github/dependabot.yml would raise pyproject floors for: {', '.join(raisers)}. "
+        "Give each Python entry:\n\n"
+        "    versioning-strategy: lockfile-only\n\n"
+        "It bumps uv.lock and never pyproject.toml, so a project that depends on this "
+        "one is not forced up with it. `sync-devkit.py --pull` writes it for you."
+    )
+
+
+def test_update_entries_are_read_per_entry():
+    text = (
+        "version: 2\nupdates:\n"
+        "  - package-ecosystem: github-actions\n    versioning-strategy: increase-if-necessary\n"
+        "  - package-ecosystem: uv\n    directory: /\n    groups:\n      g:\n        patterns: ['*']\n"
+        "  - package-ecosystem: 'pip'\n    versioning-strategy: lockfile-only\n"
+    )
+    assert _floor_raisers(text) == ["uv (no versioning-strategy)"]
+    fixed = text.replace(
+        "    directory: /\n", "    directory: /\n    versioning-strategy: lockfile-only\n"
+    )
+    assert _floor_raisers(fixed) == []
+    # Neither the strategy the uv updater raised a floor under anyway nor `widen`, whose
+    # definition lets it rewrite the manifest too, counts as keeping one.
+    for raising in ("increase-if-necessary", "widen"):
+        assert _floor_raisers(fixed.replace("lockfile-only", raising)) == [
+            f"uv ({raising})",
+            f"pip ({raising})",
+        ]
+    assert _floor_raisers(text.replace("lockfile-only", "increase")) == [
+        "uv (no versioning-strategy)",
+        "pip (increase)",
+    ]
+    # A strategy in a later, non-Python entry does not cover the uv entry above it.
+    assert _floor_raisers(
+        "updates:\n  - package-ecosystem: uv\n  - package-ecosystem: npm\n    versioning-strategy: widen\n"
+    ) == ["uv (no versioning-strategy)"]
+
+
+FROZEN = re.compile(r"\buv\s+(?:sync|run)\b[^\n]*\s--frozen\b|^\s*UV_FROZEN\s*:")
+
+
+def _frozen_lines(text: str) -> list[str]:
+    return [line.strip() for line in _code_lines(text) if FROZEN.search(line)]
+
+
+def test_ci_checks_the_lock_rather_than_trusting_it():
+    """`uv sync --locked`, never `--frozen`, in a workflow or a local action.
+
+    `--frozen` installs `uv.lock` without asking whether it still resolves, so a lock
+    gone stale -- here against a sibling checkout's moved floor -- surfaced in the next
+    bare `uv run`, which relocks, and the gate reported "Ruff lint" red for a failure no
+    linter caused. `--locked` fails the sync step itself and names the lock.
+    """
+    actions = sorted((REPO_ROOT / ".github" / "actions").glob("*/action.y*ml"))
+    offenders = [
+        f"{path.relative_to(REPO_ROOT).as_posix()}: {line}"
+        for path in [*_workflows(), *actions]
+        for line in _frozen_lines(_read(path))
+    ]
+    assert not offenders, (
+        "CI trusts uv.lock without checking it:\n  "
+        + "\n  ".join(offenders)
+        + "\nUse `uv sync --locked` (and drop `--frozen` from `uv run`): it fails at the "
+        "sync when the lock no longer resolves, instead of at whichever step relocks."
+    )
+
+
+def test_the_frozen_scan_reads_commands_not_prose():
+    text = (
+        "# uv sync --frozen would hide a stale lock\n"
+        "      - run: uv sync --locked --extra ml\n"
+        "      - run: uv run --frozen pytest\n"
+        "        run: uv sync --frozen --all-extras\n"
+        "    env:\n      UV_FROZEN: 1\n"
+        "      - run: uv export --frozen > req.txt\n"
+    )
+    assert _frozen_lines(text) == [
+        "- run: uv run --frozen pytest",
+        "run: uv sync --frozen --all-extras",
+        "UV_FROZEN: 1",
+    ]
 
 
 def test_a_failed_scheduled_run_becomes_an_issue():
