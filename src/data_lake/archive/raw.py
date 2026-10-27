@@ -1,13 +1,17 @@
 """Archive/restore the ``raw`` provider payloads of news articles and social posts.
 
-`maintenance.prune_scored_raw` reclaims disk by destroying scored ``raw`` blobs; this module
-is the non-destructive version: the blob is exported to
+This is how ``raw`` leaves Postgres. The blob is exported to
 ``raw/<table>/<YYYY-MM>.parquet`` (month of the row's event timestamp), verified, and only
 then NULLed locally. The row itself — title, body, sentiment, hashed author — always stays
-in Postgres; only the fat provider payload moves. Eligibility mirrors pruning on purpose:
-a row must already be sentiment-scored, so an unscored row never loses its payload.
+in Postgres; only the fat provider payload moves, and ``restore_raw_payloads`` brings it
+back. A row must already be sentiment-scored, so an unscored row never loses its payload.
 
-Privacy (Québec Law 25): payloads contain only what ingestion stored — authors are hashed
+Connectors keep the provider payload whole (see ``ingestion.base.pseudonymize``) precisely
+so a later parser can reprocess it; a consumer-side job that NULLs scored ``raw`` *without*
+archiving it (``ibkr_trader``'s ``maintenance.prune_scored_raw``, written when disk was
+scarce, is one) destroys what the providers will not serve again. Archive instead.
+
+Privacy (Québec Law 25): payloads contain only what ingestion stored — people are hashed
 before they ever reach the DB — but the bucket must still be private; see
 docs/operations/remote-archive.md.
 """
@@ -70,8 +74,9 @@ def archive_raw_payloads(
 ) -> ArchiveResult:
     """Export scored ``raw`` blobs to Parquet, verify, then NULL them locally.
 
-    ``min_age_days`` is the same ``fetched_at`` grace period pruning uses. Uses ``null()``
-    for the SQL NULL (plain None would store JSON 'null' and reclaim nothing).
+    ``min_age_days`` is a ``fetched_at`` grace period: how long a scored payload stays hot in
+    Postgres before it moves. Uses ``null()`` for the SQL NULL (plain None would store JSON
+    'null' and move nothing).
 
     **A backlog is drained ``batch_rows`` at a time, oldest event first, and each batch is
     committed before the next is read** -- so memory is one batch deep however large the
@@ -140,7 +145,7 @@ def _archive_batch(
     """Merge one batch into its month objects, verify each, then NULL the rows it holds."""
     model = table.model
     # The SQL filter can't see JSON 'null' (stored for a plain Python None, which is not
-    # SQL NULL — see maintenance.prune_scored_raw); drop those payload-less rows here.
+    # SQL NULL); drop those payload-less rows here.
     rows = [row for row in batch if row.raw is not None]
     if not rows:
         return

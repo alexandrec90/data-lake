@@ -4,9 +4,11 @@ Free tier: ~60 calls/min, company news keyed by ticker (better than NewsAPI for 
 articles arrive already tagged to a symbol). Docs: https://finnhub.io/docs/api/company-news
 Finnhub also exposes a news-sentiment endpoint worth evaluating later.
 
-Disk note: the ``raw`` JSON column stores a *trimmed* dict, never the full article payload —
-free disk is tight on this box. Re-fetching an overlapping window is idempotent (upsert on
-(source, external_id)).
+The ``raw`` column keeps the **whole** provider item. Finnhub serves roughly one year of
+company news, so anything dropped at ingest is unrecoverable once it ages out, while the
+item costs well under a kilobyte. Finnhub sends no byline today; one that appears is hashed
+like every other person (see ``ingestion.base.pseudonymize``). Re-fetching an overlapping
+window is idempotent (upsert on (source, external_id)).
 """
 
 from datetime import UTC, date, datetime, timedelta
@@ -16,7 +18,7 @@ import httpx
 from sqlalchemy import select
 
 from data_lake.db.models import NewsArticle
-from data_lake.ingestion.base import Connector
+from data_lake.ingestion.base import Connector, pseudonymize
 
 BASE_URL = "https://finnhub.io/api/v1"
 
@@ -38,13 +40,14 @@ def _published_at(item: dict[str, Any]) -> datetime:
     return datetime.fromtimestamp(float(item["datetime"]), tz=UTC)
 
 
-def _trimmed_raw(item: dict[str, Any]) -> dict[str, Any]:
-    """Small fixed field set — never the whole item (drops image URLs etc.)."""
-    return {
-        "source": item.get("source"),
-        "category": item.get("category"),
-        "related": item.get("related"),
-    }
+#: Fields that would name a person. Not in Finnhub's schema today; listed so a future
+#: byline is hashed on arrival rather than stored because the payload is kept whole.
+PERSON_FIELDS = ("author",)
+
+
+def _raw_payload(item: dict[str, Any]) -> dict[str, Any]:
+    """The whole provider item, with any person field hashed."""
+    return pseudonymize(item, PERSON_FIELDS)
 
 
 class FinnhubNewsConnector(Connector):
@@ -102,7 +105,7 @@ class FinnhubNewsConnector(Connector):
                     existing.url = item.get("url")
                     existing.summary = item.get("summary")
                     existing.symbols = _merge_symbol(existing.symbols, finnhub_symbol)
-                    existing.raw = _trimmed_raw(item)
+                    existing.raw = _raw_payload(item)
                     existing.fetched_at = fetched_at
                 else:
                     session.add(
@@ -115,7 +118,7 @@ class FinnhubNewsConnector(Connector):
                             summary=item.get("summary"),
                             symbols=[finnhub_symbol],
                             sentiment=None,  # scored later in signals/
-                            raw=_trimmed_raw(item),
+                            raw=_raw_payload(item),
                             fetched_at=fetched_at,
                         )
                     )

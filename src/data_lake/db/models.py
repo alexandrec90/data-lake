@@ -17,7 +17,9 @@ confused by receiving this?", not "is this the same subject as the tables above 
 Conventions:
 - Timestamps are timezone-aware UTC.
 - External payloads are preserved in a `raw` JSON column for reprocessing, so a parser fix
-  never requires re-fetching.
+  never requires re-fetching — many providers will not serve an item twice. News payloads
+  are kept **whole**, with people hashed on the way in (`ingestion.base.pseudonymize`), and
+  `archive.raw` moves scored payloads out of Postgres without destroying them.
 - Upsert keys: (source, external_id) for text content; (platform, external_id) for scraped
   listings; (instrument, ts, bar_size, source, what_to_show) for bars; (index_code, symbol,
   start_date, source) for index membership spans; (source, external_id) for IPO events,

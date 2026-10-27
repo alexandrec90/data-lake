@@ -24,9 +24,9 @@ resolve it through :func:`resolve_session_factory`.
 import abc
 import hashlib
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from sqlalchemy.orm import Session
 
@@ -37,6 +37,7 @@ __all__ = [
     "AllItemsFailedError",
     "Connector",
     "SessionFactory",
+    "pseudonymize",
     "resolve_session_factory",
     "run_each",
     "stable_hash",
@@ -120,3 +121,20 @@ def run_each(items: Sequence[T], work: Callable[[T], int], *, what: str) -> int:
 def stable_hash(value: str) -> str:
     """sha256 hex digest — used for author pseudonymization and URL-based external ids."""
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def pseudonymize(payload: Mapping[str, Any], person_fields: Iterable[str]) -> dict[str, Any]:
+    """A copy of a provider payload that is safe to keep whole in a ``raw`` column.
+
+    Each top-level field in ``person_fields`` is replaced by ``<field>_hash`` (a
+    :func:`stable_hash` digest, or ``None`` when the provider sent nothing), so the stored
+    payload still says *that* two items share an author without saying *who*. Everything
+    else passes through untouched — this is what lets a connector keep the full record for
+    reprocessing instead of guessing up front which fields will matter.
+    """
+    safe = dict(payload)
+    for name in person_fields:
+        if name in safe:
+            value = safe.pop(name)
+            safe[f"{name}_hash"] = stable_hash(str(value)) if value else None
+    return safe

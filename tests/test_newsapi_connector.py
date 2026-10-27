@@ -66,7 +66,7 @@ def _article(url: str, title: str, published: str = "2026-07-15T12:00:00Z") -> d
         "url": url,
         "urlToImage": "https://img/big.jpg",
         "publishedAt": published,
-        "content": "full body we must not store",
+        "content": "first 200 chars of the body… [+1234 chars]",
     }
 
 
@@ -103,8 +103,31 @@ def test_newsapi_fetch_upserts_articles(monkeypatch):
         assert first.symbols == ["NVDA"]
         # SQLite drops tzinfo on readback (Postgres keeps it); compare the naive instant.
         assert first.published_at.replace(tzinfo=UTC) == datetime(2026, 7, 15, 12, tzinfo=UTC)
-        # raw is trimmed — provider name only; author/image/content never stored
-        assert first.raw == {"source": "Example Wire"}
+        # raw is the whole article (a free key sees ~100 requests/day, so a re-fetch to
+        # recover a dropped field is expensive), except that the byline is a person:
+        # hashed, never stored by name
+        expected = {k: v for k, v in _article("https://news/b", "x").items() if k != "author"}
+        by_url = {a.url: a.raw for a in articles}
+        assert by_url["https://news/b"] == {**expected, "author_hash": stable_hash("Jane Byline")}
+        assert "Jane Byline" not in str(first.raw)
+        assert first.raw["urlToImage"] == "https://img/big.jpg"
+
+
+def test_newsapi_raw_keeps_a_missing_byline_as_null_hash(monkeypatch):
+    session_cm = _make_session_scope()
+    article = dict(_article("https://news/a", "anonymous wire copy"), author=None)
+
+    monkeypatch.setattr(SETTINGS, "newsapi_key", "test-key")
+    monkeypatch.setattr(
+        na.httpx, "get", lambda url, params, headers, timeout: FakeResponse(_payload(article))
+    )
+
+    na.NewsApiConnector(session_factory=session_cm).fetch(query="Nvidia")
+
+    with session_cm() as session:
+        raw = session.scalar(select(NewsArticle)).raw
+        assert raw["author_hash"] is None
+        assert "author" not in raw
 
 
 def test_newsapi_fetch_is_idempotent_on_reingest(monkeypatch):

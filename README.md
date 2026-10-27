@@ -93,7 +93,10 @@ store, which a returned 0 would hide.
 ## Privacy
 
 Social payloads are scraped content held under Québec Law 25: **authors are stored hashed only**
-(`ingestion.base.stable_hash`), never usernames, and the bucket must be private. R2 buckets are
+(`ingestion.base.stable_hash`), never usernames, and the bucket must be private. News connectors
+keep the provider payload whole in `raw`, with person fields such as a byline replaced by a
+`<field>_hash` (`ingestion.base.pseudonymize`). Social posts keep a fixed allowlist of fields
+instead, because a post names its author in too many places to deny them one by one. R2 buckets are
 private by default, but an enabled `r2.dev` managed domain or a custom domain makes objects
 public — and S3 credentials cannot report that, only the Cloudflare REST API or the dashboard can.
 

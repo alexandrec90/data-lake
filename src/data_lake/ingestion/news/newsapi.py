@@ -5,8 +5,10 @@ the first 100 results of a search are accessible — so one request at pageSize=
 is deliberately all this connector does. Docs: https://newsapi.org/docs/endpoints/everything
 
 Articles are keyed by ``stable_hash(url)`` (NewsAPI has no article id). NewsAPI does not tag
-tickers, so pass ``symbol=`` to tag stored rows for downstream signals; the ``raw`` column
-keeps only the provider name — never the full payload (free disk is tight on this box).
+tickers, so pass ``symbol=`` to tag stored rows for downstream signals. The ``raw`` column
+keeps the **whole** article, because at ~100 requests/day, fetching it again to recover a
+field is the expensive path. The one exception is the byline, which names a person: it is
+stored as ``author_hash`` (see ``ingestion.base.pseudonymize``), never by name.
 """
 
 from datetime import UTC, date, datetime
@@ -19,6 +21,7 @@ from data_lake.db.models import NewsArticle
 from data_lake.ingestion.base import (
     Connector,
     SessionFactory,
+    pseudonymize,
     resolve_session_factory,
     stable_hash,
 )
@@ -53,10 +56,14 @@ def _published_at(value: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
-def _trimmed_raw(item: dict[str, Any]) -> dict[str, Any]:
-    """Small fixed field set — never the whole item (drops image URLs, content, author)."""
-    source = item.get("source") or {}
-    return {"source": source.get("name") if isinstance(source, dict) else None}
+#: Fields that name a person. ``author`` is a journalist's byline (sometimes several names,
+#: sometimes a profile URL); hashed so the payload can be kept whole.
+PERSON_FIELDS = ("author",)
+
+
+def _raw_payload(item: dict[str, Any]) -> dict[str, Any]:
+    """The whole provider article, with the byline hashed."""
+    return pseudonymize(item, PERSON_FIELDS)
 
 
 def _merge_symbol(symbols: list | None, symbol: str) -> list:
@@ -132,7 +139,7 @@ class NewsApiConnector(Connector):
                     existing.url = item.get("url")
                     existing.summary = item.get("description")
                     existing.symbols = _merge_symbol(existing.symbols, tag_symbol)
-                    existing.raw = _trimmed_raw(item)
+                    existing.raw = _raw_payload(item)
                     existing.fetched_at = fetched_at
                 else:
                     session.add(
@@ -145,7 +152,7 @@ class NewsApiConnector(Connector):
                             summary=item.get("description"),
                             symbols=[tag_symbol] if tag_symbol else [],
                             sentiment=None,  # scored later in signals/
-                            raw=_trimmed_raw(item),
+                            raw=_raw_payload(item),
                             fetched_at=fetched_at,
                         )
                     )

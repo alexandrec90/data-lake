@@ -163,12 +163,30 @@ Moving between backends is a settings change plus a file copy — same `ObjectSt
 protocol, same keys, same self-describing `_catalog/`. Every archive entry point takes the
 store as an argument, so a consumer can also split datasets across backends in one process.
 
+### Provider payloads are kept whole — do not trim them to save space
+
+The news connectors used to store a handful of `raw` fields "because free disk
+is tight on this box". That box is gone, and the trade was lossy in a way disk cannot buy
+back: Finnhub serves ~1 year of news, NewsAPI ~100 requests/day, so a field dropped at
+ingest is usually gone for good. `raw` now holds the full payload. If Postgres size ever
+matters, `archive_raw_payloads` moves scored payloads to zstd Parquet and
+`restore_raw_payloads` brings them back — never NULL them without archiving.
+
 ## Privacy
 
 Social payloads and rental listings are scraped content held under Québec Law 25.
 **People are stored hashed only** (`ingestion.base.stable_hash`) — never usernames, never
 a listing seller's name, profile URL or phone number — and the archive bucket must be
-private. R2 buckets are private by default, but an enabled `r2.dev` managed
+private.
+
+Keeping payloads whole is what makes this bite. A news payload goes through
+`ingestion.base.pseudonymize`, which swaps each named person field for `<field>_hash`; a
+new news connector declares its `PERSON_FIELDS` even when the provider sends none today
+(`tests/test_raw_payload_privacy.py` holds it to that). Social posts are not kept whole:
+their connector stores a fixed allowlist of fields, because a post names its author in too
+many places to deny them one by one.
+
+R2 buckets are private by default, but an enabled `r2.dev` managed
 domain or a custom domain makes objects public, and S3 credentials cannot report that:
 only the Cloudflare REST API or the dashboard can.
 
