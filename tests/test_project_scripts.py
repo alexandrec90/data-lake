@@ -12,12 +12,17 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIR = REPO_ROOT / "scripts"
+
+
+def subprocess_stdout(text: str) -> SimpleNamespace:
+    """A finished `git` call that printed `text`."""
+    return SimpleNamespace(returncode=0, stdout=text, stderr="")
 
 
 def load_script(name: str) -> ModuleType:
@@ -153,7 +158,7 @@ def test_changed_never_narrows_mypy(monkeypatch):
     ones it was. This package is a graph of Protocols that resolve against each other."""
     script = load_script("lint-all.py")
     calls: list[list[str]] = []
-    monkeypatch.setattr(script, "changed_python_files", lambda: ["src/data_lake/runtime.py"])
+    monkeypatch.setattr(script, "changed_paths", lambda: ["src/data_lake/runtime.py"])
     monkeypatch.setattr(
         script,
         "run_check",
@@ -194,6 +199,91 @@ def test_a_failing_check_names_itself_in_the_artifact(monkeypatch, tmp_path):
     log = artifact.read_text(encoding="utf-8")
     assert "=== mypy ===" in log and "boom" in log
     assert "=== ruff ===" not in log
+
+
+def _in_a_repo_with_the_hook(script, monkeypatch, tmp_path, config="- id: detect-secrets\n"):
+    """`script` rooted at `tmp_path`, whose commit stage runs `config`; returns its calls."""
+    (tmp_path / ".pre-commit-config.yaml").write_text(config, encoding="utf-8")
+    monkeypatch.setattr(script, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(script, "ARTIFACT", tmp_path / "logs" / "lint-errors.log")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        script, "run_check", lambda name, args: (calls.append(args), (name, 0, ""))[1]
+    )
+    return calls
+
+
+def test_secrets_targets_are_every_file_only_where_the_hook_is_declared(monkeypatch, tmp_path):
+    script = load_script("lint-all.py")
+    monkeypatch.setattr(script, "REPO_ROOT", tmp_path)
+    assert script.secrets_targets(["a.md"], skip=False) == [], "no config, nothing to mirror"
+    config = tmp_path / ".pre-commit-config.yaml"
+    config.write_text("- id: ruff\n", encoding="utf-8")
+    assert script.secrets_targets(["a.md"], skip=False) == []
+    config.write_text("      - id: detect-secrets\n        exclude: x\n", encoding="utf-8")
+    assert script.secrets_targets(["a.md", "b.py"], skip=False) == ["a.md", "b.py"]
+    assert script.secrets_targets(["a.md"], skip=True) == []
+    assert script.secrets_targets([], skip=False) == []
+
+
+def test_a_narrowed_run_scans_a_file_no_other_pass_reads(monkeypatch, tmp_path):
+    """This runner passed what the commit then refused, a whole dispatch later: the only
+    check before `/ship` that reads a non-Python file is the one that refused it."""
+    script = load_script("lint-all.py")
+    calls = _in_a_repo_with_the_hook(script, monkeypatch, tmp_path)
+    (tmp_path / "notes.md").write_text("words\n", encoding="utf-8")
+
+    assert script.main(["--paths", "notes.md"]) == 0
+    assert calls == [["pre_commit", "run", "detect-secrets", "--files", "notes.md"]]
+
+
+def test_a_refused_scan_fails_the_run_and_names_the_hook(monkeypatch, tmp_path):
+    script = load_script("lint-all.py")
+    _in_a_repo_with_the_hook(script, monkeypatch, tmp_path)
+    (tmp_path / "notes.md").write_text("words\n", encoding="utf-8")
+    monkeypatch.setattr(script, "run_check", lambda name, _args: (name, 1, "Potential secrets"))
+
+    assert script.main(["--changed", "--paths", "notes.md"]) == 1
+    log = script.ARTIFACT.read_text(encoding="utf-8")
+    assert "=== detect-secrets ===" in log and "Potential secrets" in log
+
+
+def test_no_secrets_skips_the_scan_and_a_whole_run_leaves_it_to_ci(monkeypatch, tmp_path):
+    script = load_script("lint-all.py")
+    calls = _in_a_repo_with_the_hook(script, monkeypatch, tmp_path)
+    (tmp_path / "notes.md").write_text("words\n", encoding="utf-8")
+
+    assert script.main(["--paths", "notes.md", "--no-secrets"]) == 0
+    assert calls == []
+    assert script.main([]) == 0
+    assert all(call[0] != "pre_commit" for call in calls)
+
+
+def test_a_python_path_still_runs_the_python_checks_beside_the_scan(monkeypatch, tmp_path):
+    script = load_script("lint-all.py")
+    calls = _in_a_repo_with_the_hook(script, monkeypatch, tmp_path)
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+
+    assert script.main(["--paths", "a.py"]) == 0
+    assert [call[0] for call in calls] == ["ruff", "ruff", "mypy", "pre_commit"]
+
+
+def test_a_deleted_path_is_dropped_rather_than_handed_to_ruff(monkeypatch, tmp_path):
+    script = load_script("lint-all.py")
+    monkeypatch.setattr(script, "REPO_ROOT", tmp_path)
+    (tmp_path / "kept.py").write_text("x = 1\n", encoding="utf-8")
+    assert script.explicit_paths(["kept.py", "gone.py"]) == ["kept.py"]
+
+
+def test_changed_paths_lists_every_type_and_python_targets_narrows_it(monkeypatch, tmp_path):
+    script = load_script("lint-all.py")
+    monkeypatch.setattr(script, "REPO_ROOT", tmp_path)
+    for name in ("a.py", "b.md"):
+        (tmp_path / name).write_text("x\n", encoding="utf-8")
+    listed = subprocess_stdout("a.py\nb.md\ngone.py\n")
+    monkeypatch.setattr(script.subprocess, "run", lambda *_a, **_k: listed)
+    assert script.changed_paths() == ["a.py", "b.md"]
+    assert script.python_targets(["a.py", "b.md", "scripts/hooks/c.py"]) == ["a.py"]
 
 
 # --- notify-wrap ------------------------------------------------------------
