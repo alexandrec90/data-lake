@@ -74,4 +74,3 @@ src/data_lake/ingestion/social/google_trends.py::throttle
 src/data_lake/settings.py::ArchiveSettings
 src/data_lake/settings.py::IngestionSettings
 src/data_lake/settings.py::LakeSettings
-src/data_lake/testing.py::FakeLakeSettings

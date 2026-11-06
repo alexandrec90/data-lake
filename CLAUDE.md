@@ -209,6 +209,7 @@ python scripts/run-tests.py            # the suite, failures -> logs/test-failur
 python scripts/run-tests.py --changed  # pytest's last-failed subset
 python scripts/lint-all.py             # ruff + format + mypy -> logs/lint-errors.log
 python scripts/lint-all.py --changed   # ruff over the diff; mypy stays full-scope
+python scripts/e2e.py                  # the local tier, against the real pool
 ```
 
 These are the **contract entrypoints** the shared workspace tasks dispatch to through
@@ -224,8 +225,13 @@ uv run ruff check src tests && uv run ruff format --check src tests
 uv run mypy src
 ```
 
-## The two test trees
+## The test tiers
 
+- **`tests/test_e2e_pool.py`** — the one exception to the next item, marked `local`, so
+  `addopts` deselects it and only `scripts/e2e.py` runs it (the contract is
+  `.claude/rules/local-e2e.md`). It uses the real SeaweedFS pool, so it needs a pool PC's
+  keys. Writes stay under `_e2e/<run>/` and are deleted; a PC being off changes what the
+  round trip asserts rather than failing it, because a fixer cannot switch one on.
 - **`tests/`** — this package's own. **No network, no real bucket, no database**:
   provider clients are faked, storage is a temp directory, and the session is in-memory
   SQLite injected per call. `tests/_lake_env.py` holds the one settings object the suite

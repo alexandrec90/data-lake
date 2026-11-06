@@ -10,6 +10,7 @@ are the ones a plausible edit would break silently.
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -40,7 +41,7 @@ def load_script(name: str) -> ModuleType:
 # --- the contract itself ----------------------------------------------------
 
 
-@pytest.mark.parametrize("name", ["run-tests.py", "lint-all.py"])
+@pytest.mark.parametrize("name", ["run-tests.py", "lint-all.py", "e2e.py"])
 def test_the_contract_entrypoints_exist(name):
     """devkit addresses these BY PATH with the checkout as cwd, so a rename turns a
     one-click workspace task into a missing-script error."""
@@ -106,6 +107,167 @@ def test_no_tests_collected_is_not_a_failure():
     "no tests ran" — which no source edit can resolve."""
     script = load_script("run-tests.py")
     assert script.PYTEST_NO_TESTS_COLLECTED == 5
+
+
+# --- e2e --------------------------------------------------------------------
+
+
+JUNIT_ROW = '<testcase classname="tests.test_x" name="test_{name}">{body}</testcase>'
+
+
+def junit(*rows: str) -> str:
+    return f'<testsuites><testsuite name="pytest">{"".join(rows)}</testsuite></testsuites>'
+
+
+def passed(name: str = "ok") -> str:
+    return JUNIT_ROW.format(name=name, body="")
+
+
+def ended(tag: str, name: str, message: str) -> str:
+    return JUNIT_ROW.format(name=name, body=f'<{tag} message="{message}">detail</{tag}>')
+
+
+@pytest.fixture
+def e2e(monkeypatch, tmp_path) -> ModuleType:
+    """The script, reporting into a temp tree rather than this checkout's `logs/`."""
+    script = load_script("e2e.py")
+    monkeypatch.setattr(script, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(script, "REPORT", tmp_path / "logs" / "e2e-junit.xml")
+    return script
+
+
+def run_e2e(script, report: str | None, code: int = 0, env=None, argv=()) -> tuple[int, list]:
+    """`main` over a fake pytest that writes `report`; `(exit code, argvs it was given)`."""
+    seen = []
+
+    def runner(cmd, **kwargs):
+        seen.append(cmd)
+        if report is not None:
+            script.REPORT.write_text(report, encoding="utf-8")
+        return SimpleNamespace(returncode=code, stdout="pytest said\n", stderr="")
+
+    return script.main(list(argv), runner=runner, env=env or {}), seen
+
+
+def test_the_tier_is_deselected_by_default_and_selected_by_its_own_run():
+    """The default run must stay the no-network suite CLAUDE.md promises, and the tier's
+    `-m` must really replace the one in `addopts`: pytest is the only witness to both."""
+    for module in ("pyarrow", "duckdb", "botocore.exceptions"):
+        pytest.importorskip(module)
+    target = "tests/test_e2e_pool.py"
+    base = [
+        sys.executable,
+        "-m",
+        "pytest",
+        target,
+        "--collect-only",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+    ]
+    default = subprocess.run(base, cwd=REPO_ROOT, capture_output=True, text=True, check=False)
+    assert default.returncode == 5, default.stdout + default.stderr
+    tier = subprocess.run(
+        [*base, "-m", "local"], cwd=REPO_ROOT, capture_output=True, text=True, check=False
+    )
+    assert tier.returncode == 0, tier.stdout + tier.stderr
+    assert "test_bars_round_trip_through_the_pool_or_stay_put" in tier.stdout
+
+
+def test_the_tier_installs_both_extras_and_leaves_the_lock_alone():
+    """Without the extras `importorskip` drops the whole tier, and the nightly job refuses
+    a checkout with a tracked edit, which a rewritten `uv.lock` would be."""
+    argv = load_script("e2e.py").pytest_argv(Path("report.xml"))
+    assert argv[:7] == ["uv", "run", "--all-extras", "--frozen", "python", "-m", "pytest"]
+    assert argv[argv.index("-m", 7) + 1] == "local"
+    assert "--junitxml=report.xml" in argv
+
+
+def test_named_tests_replace_the_tree_but_stay_in_the_tier():
+    argv = load_script("e2e.py").pytest_argv(Path("r.xml"), ["tests/test_x.py::test_y"])
+    assert "tests/test_x.py::test_y" in argv and "tests" not in argv
+    assert argv[argv.index("-m", 7) + 1] == "local"
+
+
+@pytest.mark.parametrize(
+    ("classname", "name", "ident"),
+    [
+        ("tests.test_x", "test_y", "tests/test_x.py::test_y"),
+        ("tests.test_x.TestZ", "test_y", "tests/test_x.py::TestZ::test_y"),
+        ("", "tests.test_x", "tests.test_x"),
+    ],
+)
+def test_ids_read_as_pytests_summary_reads_them(classname, name, ident):
+    """The id is what the fix pass groups by; a collection error has no classname."""
+    assert load_script("e2e.py").pytest_id(classname, name) == ident
+
+
+def test_an_unreadable_report_is_no_cases(e2e, tmp_path):
+    assert e2e.cases(tmp_path / "absent.xml") == []
+    broken = tmp_path / "broken.xml"
+    broken.write_text("<testsuites><oops", encoding="utf-8")
+    assert e2e.cases(broken) == []
+
+
+def test_a_green_run_exits_zero_and_prints_no_failure(e2e, capsys):
+    code, _ = run_e2e(e2e, junit(passed()))
+    assert code == 0
+    assert "FAILED" not in capsys.readouterr().out
+
+
+def test_a_failure_exits_with_pytests_code_and_names_the_test(e2e, capsys):
+    code, _ = run_e2e(e2e, junit(passed(), ended("failure", "bad", "boom")), code=1)
+    assert code == 1
+    assert "FAILED tests/test_x.py::test_bad - boom" in capsys.readouterr().out
+
+
+def test_a_fixture_error_is_printed_as_failed(e2e, capsys):
+    """pytest's own line says `ERROR`, and the signature is read from `FAILED` lines, so
+    a pool that stopped answering would be signed by an exit code alone."""
+    run_e2e(e2e, junit(ended("error", "down", "connection refused")), code=1)
+    assert "FAILED tests/test_x.py::test_down - connection refused" in capsys.readouterr().out
+
+
+def test_a_skip_is_listed_by_hand_and_fails_under_the_scheduler(e2e, capsys):
+    report = junit(passed(), ended("skipped", "away", "no pool"))
+    assert run_e2e(e2e, report)[0] == 0
+    assert "SKIPPED tests/test_x.py::test_away - skipped: no pool" in capsys.readouterr().out
+
+    assert run_e2e(e2e, report, env={e2e.ENV_FLAG: "1"})[0] == 1
+    assert "FAILED tests/test_x.py::test_away - skipped: no pool" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "report",
+    [junit(), junit(ended("skipped", "away", "no pool")), None],
+    ids=["no cases", "every case skipped", "no report written"],
+)
+def test_a_run_that_executed_nothing_is_red_even_by_hand(e2e, capsys, report):
+    """A green from zero tests is a skip reported as a pass."""
+    assert run_e2e(e2e, report, code=0)[0] == 1
+    assert "not a pass" in capsys.readouterr().out
+
+
+def test_pytests_own_failure_code_survives_a_run_that_executed_nothing(e2e):
+    """A usage error or an interrupted run exits 2 or 4, which says more than a bare 1."""
+    assert e2e.verdict(4, [], strict=False)[0] == 4
+    skipped = e2e.Case("tests/test_x.py::test_y", e2e.SKIPPED, "no pool")
+    assert e2e.verdict(2, [skipped], strict=True)[0] == 2
+
+
+def test_a_stale_report_cannot_answer_for_this_run(e2e):
+    """Left in place, last night's green would read as tonight's for a pytest that died
+    before it wrote one."""
+    e2e.REPORT.parent.mkdir(parents=True)
+    e2e.REPORT.write_text(junit(passed()), encoding="utf-8")
+    assert run_e2e(e2e, None, code=2)[0] == 2
+
+
+def test_output_that_a_legacy_console_cannot_encode_still_prints(e2e, capsys):
+    """A by-hand run on cp1252 must not die printing the traceback it exists to show."""
+    assert e2e._printable("caf\N{LATIN SMALL LETTER E WITH ACUTE}") == "caf\\xe9"
+    assert run_e2e(e2e, junit(ended("failure", "bad", "\N{RIGHTWARDS ARROW}")), code=1)[0] == 1
+    assert "FAILED tests/test_x.py::test_bad - \\u2192" in capsys.readouterr().out
 
 
 def test_third_party_frames_are_stripped_from_the_artifact():

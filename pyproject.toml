@@ -101,9 +101,14 @@ mypy_path = "src"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-addopts = "-p devkit_temproot"
+# `local` is deselected here so the suite stays what CLAUDE.md says it is, no network and
+# no real bucket; `scripts/e2e.py` selects it, and its later `-m` replaces this one.
+addopts = '-m "not local" -p devkit_temproot'
 pythonpath = ["scripts/pytest-plugins"]
 testpaths = ["tests"]
+markers = [
+  "local: needs this workstation (the SeaweedFS pool), not a runner; run nightly by scripts/e2e.py",
+]
 
 # Same ratchet rule as the consumer repo: raise it as coverage grows, never lower it to make a
 # change pass. Set to 91 on 2026-07-30 against a measured 92% at extraction.
