@@ -37,3 +37,9 @@ enabled = false
 # No frontend: this is an installable library, not an application.
 [frontend]
 enabled = false
+
+# The Windows scheduled tasks this project owns, by their scheduler names. Devkit's fix
+# pass judges them beside its own jobs and files a failure here. The pool's task is
+# registered by `scripts/storage-node.py` (its `TASK_NAME`): rename one, rename both.
+[schedule]
+tasks = ["SeaweedFS data-lake pool"]
