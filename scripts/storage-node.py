@@ -121,6 +121,16 @@ LOG_FILE = (_HERE.parent if _HERE.name == "scripts" else _HERE) / "logs" / "stor
 # Where the consumer checkouts sit: beside this one. The supervisor's copy has no checkout.
 CONSUMER_ROOT = _HERE.parent.parent if _HERE.name == "scripts" else None
 TASK_NAME = "SeaweedFS data-lake pool"
+# The System log's "the attempt to restart/shutdown computer failed" (User32, 1073). A
+# shutdown ends the windowless supervisor (exit 0x40010004) before an application vetoes
+# it, and the machine then stays up with `weed` orphaned and nothing watching it: on
+# 2026-11-22 a shutdown aborted at 09:15 left the pool unsupervised for the day
+# (68357ee3). The logon trigger cannot fire again without a logon, so this one does.
+SHUTDOWN_ABORTED_QUERY = (
+    "<QueryList><Query Id='0' Path='System'><Select Path='System'>"
+    "*[System[Provider[@Name='User32'] and EventID=1073]]"
+    "</Select></Query></QueryList>"
+)
 
 TAILNET = "100.64.0.0/10"
 MASTER_PORT = 9333
@@ -388,14 +398,20 @@ def firewall_script(weed: Path) -> str:
 
 
 def task_script(pythonw: Path, script: Path) -> str:
-    """PowerShell registering the logon task that starts the supervisor, hidden."""
+    """PowerShell registering the task that starts the supervisor, hidden: at logon, and
+    again whenever a shutdown that already ended it is called off."""
     return "; ".join(
         [
             f"$a = New-ScheduledTaskAction -Execute '{pythonw}' -Argument '\"{script}\" run'",
             '$t = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\\$env:USERNAME"',
+            # New-ScheduledTaskTrigger has no event trigger; the CIM class is the cmdlet's.
+            "$e = Get-CimClass -ClassName MSFT_TaskEventTrigger"
+            " -Namespace Root/Microsoft/Windows/TaskScheduler | New-CimInstance -ClientOnly",
+            "$e.Enabled = $true",
+            f'$e.Subscription = "{SHUTDOWN_ABORTED_QUERY}"',
             "$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries "
             "-DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew",
-            f"Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $a -Trigger $t "
+            f"Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $a -Trigger @($t, $e) "
             "-Settings $s -Force | Out-Null",
         ]
     )
@@ -688,7 +704,14 @@ def _check_superseded(home: Path, node: Node, record: bool) -> Node:
 
 
 def run(home: Path = HOME) -> None:
-    """Keep weed running: restart it whenever it exits, until the task is stopped."""
+    """Keep weed running: restart it whenever it exits, until the task is stopped.
+
+    A weed already running is an orphan -- the task starts one supervisor at a time
+    (`IgnoreNew`), so a live one means the last supervisor was ended without its child,
+    as a shutdown that was then called off does -- and it holds the ports the new weed
+    needs, so it is ended first.
+    """
+    _end_orphans()
     now = time.monotonic()
     next_backup = now + 3600
     next_check = now + SUPERSEDE_CHECK_EVERY_S
@@ -716,6 +739,11 @@ def run(home: Path = HOME) -> None:
 
 def stop() -> None:
     subprocess.run(["schtasks", "/End", "/TN", TASK_NAME], capture_output=True)
+    _end_orphans()
+
+
+def _end_orphans() -> None:
+    """End every weed on this PC; none running is the usual case, not an error."""
     subprocess.run(["taskkill", "/F", "/IM", "weed.exe"], capture_output=True)
 
 

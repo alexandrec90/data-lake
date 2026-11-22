@@ -27,6 +27,18 @@ PRIMARY = sn.Node(role="primary", ip="100.76.121.58", primary="100.76.121.58")
 VOLUME = sn.Node(role="volume", ip="100.100.229.119", primary="100.76.121.58")
 
 
+_REAL_END_ORPHANS = sn._end_orphans
+
+
+@pytest.fixture(autouse=True)
+def orphans_ended(monkeypatch) -> list[bool]:
+    """Stub the `taskkill` of every weed on this PC, which `run` and `stop` issue: a
+    test of either would otherwise end the pool this machine is running."""
+    ended: list[bool] = []
+    monkeypatch.setattr(sn, "_end_orphans", lambda: ended.append(True))
+    return ended
+
+
 def _flag(args: list[str], name: str) -> str:
     [value] = [a.split("=", 1)[1] for a in args if a.startswith(f"-{name}=")]
     return value
@@ -198,6 +210,17 @@ def test_logon_task_runs_the_copied_supervisor_hidden_and_once():
     assert "-ExecutionTimeLimit 0" in task
 
 
+def test_the_task_restarts_the_supervisor_when_a_shutdown_is_called_off():
+    """68357ee3: an aborted shutdown ends the supervisor and leaves the machine up, so
+    the logon trigger alone never starts it again."""
+    task = sn.task_script(Path("C:/py/pythonw.exe"), Path("C:/seaweed/storage-node.py"))
+    assert "MSFT_TaskEventTrigger" in task
+    assert "-Trigger @($t, $e)" in task
+    assert "Provider[@Name='User32'] and EventID=1073" in sn.SHUTDOWN_ABORTED_QUERY
+    assert sn.SHUTDOWN_ABORTED_QUERY in task
+    assert '"' not in sn.SHUTDOWN_ABORTED_QUERY, "it is spliced into a double-quoted string"
+
+
 # --- status -----------------------------------------------------------------------
 
 
@@ -315,14 +338,38 @@ def test_run_restarts_weed_whenever_it_exits(tmp_path, monkeypatch):
     assert started[0] == [str(sn._weed(home)), *sn.weed_args(VOLUME, home)]
 
 
-def test_stop_ends_the_task_and_every_weed(monkeypatch):
+def test_stop_ends_the_task_and_every_weed(monkeypatch, orphans_ended):
     calls = _Calls()
     monkeypatch.setattr(sn.subprocess, "run", calls)
     sn.stop()
-    assert calls.argv == [
-        ["schtasks", "/End", "/TN", sn.TASK_NAME],
-        ["taskkill", "/F", "/IM", "weed.exe"],
-    ]
+    assert calls.argv == [["schtasks", "/End", "/TN", sn.TASK_NAME]]
+    assert orphans_ended == [True]
+
+
+def test_ending_orphans_ends_every_weed(monkeypatch):
+    calls = _Calls()
+    monkeypatch.setattr(sn.subprocess, "run", calls)
+    _REAL_END_ORPHANS()
+    assert calls.argv == [["taskkill", "/F", "/IM", "weed.exe"]]
+
+
+def test_run_ends_an_orphaned_weed_before_starting_its_own(tmp_path, monkeypatch, orphans_ended):
+    """68357ee3: a shutdown called off after it ended the supervisor leaves weed holding
+    the pool's ports, and a new supervisor's weed then could not bind them."""
+    home = _home(tmp_path, VOLUME)
+    seen: list[bool] = []
+
+    class _Stop(Exception):
+        pass
+
+    def popen(args, **kwargs):
+        seen.append(bool(orphans_ended))
+        raise _Stop
+
+    monkeypatch.setattr(sn.subprocess, "Popen", popen)
+    with pytest.raises(_Stop):
+        sn.run(home)
+    assert seen == [True]
 
 
 def test_status_asks_the_named_primary_and_prints_the_topology(monkeypatch, capsys):
@@ -874,15 +921,18 @@ def test_demote_rewrites_the_node_and_restarts_the_supervisor(tmp_path, monkeypa
     assert restarts == [home]
 
 
-def test_restart_supervisor_ends_the_running_one_before_starting_again(tmp_path, monkeypatch):
+def test_restart_supervisor_ends_the_running_one_before_starting_again(
+    tmp_path, monkeypatch, orphans_ended
+):
     """The task ignores a start while one runs, so without the end nothing would switch."""
     calls = _Calls()
     monkeypatch.setattr(sn.subprocess, "run", calls)
+    monkeypatch.setattr(sn, "_end_orphans", lambda: calls.argv.append(["<end every weed>"]))
     sn._restart_supervisor(tmp_path)
     assert (tmp_path / "storage-node.py").is_file()
     assert calls.argv == [
         ["schtasks", "/End", "/TN", sn.TASK_NAME],
-        ["taskkill", "/F", "/IM", "weed.exe"],
+        ["<end every weed>"],
         ["schtasks", "/Run", "/TN", sn.TASK_NAME],
     ]
 
