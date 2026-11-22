@@ -311,6 +311,44 @@ def test_install_of_a_volume_node_mints_no_credentials(tmp_path, monkeypatch):
     assert not (tmp_path / "s3.json").exists()
 
 
+DENIED = (
+    "Register-ScheduledTask : Access is denied.\n"
+    "    + FullyQualifiedErrorId : HRESULT 0x80070005,Register-ScheduledTask\n"
+)
+
+
+def test_task_denied_hint_names_the_elevated_unregister():
+    hint = sn.task_denied_hint(DENIED)
+    assert hint is not None
+    assert f"Unregister-ScheduledTask -TaskName '{sn.TASK_NAME}'" in hint
+    assert "elevated" in hint
+    assert sn.task_denied_hint("HRESULT 0x80070005") is not None
+
+
+def test_task_denied_hint_ignores_any_other_failure():
+    assert sn.task_denied_hint("") is None
+    assert sn.task_denied_hint("The term 'New-CimInstance' is not recognized") is None
+
+
+def test_install_over_an_elevated_task_says_how_to_clear_it(tmp_path, monkeypatch):
+    calls = _Calls(returncode=1, stderr=DENIED)
+    monkeypatch.setattr(sn, "_tailscale_ip", lambda: VOLUME.ip)
+    monkeypatch.setattr(sn, "_download", lambda home: home / "weed.exe")
+    monkeypatch.setattr(sn.subprocess, "run", calls)
+    with pytest.raises(RuntimeError, match="Unregister-ScheduledTask"):
+        sn.install("volume", VOLUME.primary, tmp_path)
+    # The task was never replaced, so nothing may be started under the old one.
+    assert not any(argv[0] == "schtasks" for argv in calls.argv)
+
+
+def test_install_reports_another_registration_failure_with_its_stderr(tmp_path, monkeypatch):
+    monkeypatch.setattr(sn, "_tailscale_ip", lambda: VOLUME.ip)
+    monkeypatch.setattr(sn, "_download", lambda home: home / "weed.exe")
+    monkeypatch.setattr(sn.subprocess, "run", _Calls(returncode=1, stderr="boom\n"))
+    with pytest.raises(RuntimeError, match="exited 1: boom"):
+        sn.install("volume", VOLUME.primary, tmp_path)
+
+
 def test_run_restarts_weed_whenever_it_exits(tmp_path, monkeypatch):
     home = _home(tmp_path, VOLUME)
     started: list[list[str]] = []
