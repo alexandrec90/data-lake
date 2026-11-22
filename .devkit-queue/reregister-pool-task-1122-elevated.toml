@@ -1,0 +1,40 @@
+# Re-queued 2026-11-22: on DESKTOP-ML5F3PJ the static checkout was on main with
+# SHUTDOWN_ABORTED_QUERY, but `install` failed with "Register-ScheduledTask : Access is
+# denied." The existing task file (C:\Windows\System32\Tasks\SeaweedFS data-lake pool)
+# was registered from an elevated shell: Administrators own it and the user may only read
+# it, so no unelevated install can replace or delete it. Fresh registrations of the same
+# shape, both triggers included, succeed unelevated. `install` now names the elevated
+# step instead of dying on a raw PowerShell error.
+when = "merged"
+on = "every-machine"
+agent = """
+Re-register this PC's SeaweedFS pool task from data-lake's merged
+`scripts/storage-node.py`, so it carries the new restart trigger and runs the new
+supervisor.
+
+First: if `%LOCALAPPDATA%\\seaweedfs\\node.json` does not exist, this PC is not a pool
+node -- there is nothing to do, and that is finished. If
+`Get-ScheduledTask -TaskName 'SeaweedFS data-lake pool'` already shows two triggers, a
+logon one and an event one, with the task Running, it is finished too. Otherwise confirm
+the static checkout is on main and its `scripts/storage-node.py` contains
+`task_denied_hint`; if it does not, it has not been fast-forwarded yet, so queue a fresh
+task with this same text and stop.
+
+Read `role` and `primary` from node.json and run, from the static checkout,
+`python scripts/storage-node.py install --role <role>` plus `--primary <primary>` when the
+role is `volume`. Install keeps the existing weed download, the S3 keys and a one-node
+primary's replication; it re-copies the supervisor, re-registers the task (unelevated)
+and starts it.
+
+If install fails saying the task "was registered from an elevated shell", the old task is
+Administrators-owned and only an elevated shell can remove it -- an admin right only a
+person has. Write `logs/fix-blocked.md` naming that blocker and the one command to run in
+an elevated PowerShell, `Unregister-ScheduledTask -TaskName 'SeaweedFS data-lake pool'
+-Confirm:$false`, followed by the same install unelevated, and stop. Do not register the
+task under another name: two tasks would start two supervisors over one data directory.
+
+Finished is `Get-ScheduledTask -TaskName 'SeaweedFS data-lake pool'` showing two
+triggers, a logon one and an event one, with the task Running and exactly one
+`weed.exe ... volume` (or `server` on the primary) process whose parent is the
+supervisor's pythonw.
+"""

@@ -417,6 +417,23 @@ def task_script(pythonw: Path, script: Path) -> str:
     )
 
 
+def task_denied_hint(stderr: str) -> str | None:
+    """What to do when Register-ScheduledTask was refused, or None for another failure.
+
+    A task first registered from an elevated shell is owned by Administrators, and its
+    user may only read it: an unelevated `install` can neither replace nor delete it, so
+    every re-install fails the same way until the old task is removed once, elevated.
+    """
+    if "Access is denied" not in stderr and "0x80070005" not in stderr:
+        return None
+    return (
+        f"the scheduled task '{TASK_NAME}' was registered from an elevated shell, so this "
+        "unelevated install cannot replace it. Once, in an elevated PowerShell (Run as "
+        f"administrator): Unregister-ScheduledTask -TaskName '{TASK_NAME}' -Confirm:$false"
+        " -- then re-run this install unelevated"
+    )
+
+
 def _data_nodes(payload: dict) -> Iterator[dict]:
     topology = payload.get("Topology", {})
     for dc in topology.get("DataCenters") or []:
@@ -554,6 +571,18 @@ def _restart_supervisor(home: Path) -> None:
     subprocess.run(["schtasks", "/Run", "/TN", TASK_NAME], check=True, capture_output=True)
 
 
+def _register_task(pythonw: Path, script: Path) -> None:
+    argv = ["powershell", "-NoProfile", "-Command", task_script(pythonw, script)]
+    out = subprocess.run(argv, capture_output=True, text=True)
+    if out.returncode == 0:
+        return
+    hint = task_denied_hint(out.stderr or "")
+    if hint:
+        raise RuntimeError(hint)
+    detail = (out.stderr or out.stdout or "").strip()
+    raise RuntimeError(f"Register-ScheduledTask exited {out.returncode}: {detail}")
+
+
 def install(role: str, primary: str | None, home: Path = HOME) -> Node:
     ip = _tailscale_ip()
     prior = _read_node(home) if (home / "node.json").exists() else None
@@ -570,9 +599,7 @@ def install(role: str, primary: str | None, home: Path = HOME) -> Node:
         _write_json(home / "s3.json", s3_identities(*new_credentials()))
     script = _deploy_script(home)
     pythonw = Path(sys.base_prefix) / "pythonw.exe"
-    subprocess.run(
-        ["powershell", "-NoProfile", "-Command", task_script(pythonw, script)], check=True
-    )
+    _register_task(pythonw, script)
     subprocess.run(["schtasks", "/Run", "/TN", TASK_NAME], check=True, capture_output=True)
     print(f"{role} node on {ip}: weed {VERSION} at {weed}, logon task '{TASK_NAME}' started")
     print(f"one admin step remains on this PC -- run: python {Path(__file__)} firewall")
