@@ -1,0 +1,29 @@
+# Re-queued 2026-11-22: on DESKTOP-ML5F3PJ the static checkout was still on 76774d3,
+# one commit behind origin/main, so its storage-node.py lacked SHUTDOWN_ABORTED_QUERY.
+# The pool's scheduled task gained a second trigger -- a called-off shutdown restarts the
+# supervisor (68357ee3) -- and its supervisor now ends an orphaned weed before starting.
+# Neither reaches a PC until that PC re-registers the task from the merged script.
+when = "merged"
+on = "every-machine"
+agent = """
+Re-register this PC's SeaweedFS pool task from data-lake's merged
+`scripts/storage-node.py`, so it carries the new restart trigger and runs the new
+supervisor.
+
+First: if `%LOCALAPPDATA%\\seaweedfs\\node.json` does not exist, this PC is not a pool
+node -- there is nothing to do, and that is finished. Otherwise confirm the static
+checkout is on main and its `scripts/storage-node.py` contains `SHUTDOWN_ABORTED_QUERY`;
+if it does not, it has not been fast-forwarded yet, so queue a fresh task with this same
+text and stop.
+
+Read `role` and `primary` from node.json and run, from the static checkout,
+`python scripts/storage-node.py install --role <role>` plus `--primary <primary>` when the
+role is `volume`. Install keeps the existing weed download, the S3 keys and a one-node
+primary's replication; it re-copies the supervisor, re-registers the task (unelevated)
+and starts it.
+
+Finished is `Get-ScheduledTask -TaskName 'SeaweedFS data-lake pool'` showing two
+triggers, a logon one and an event one, with the task Running and exactly one
+`weed.exe ... volume` (or `server` on the primary) process whose parent is the
+supervisor's pythonw.
+"""
