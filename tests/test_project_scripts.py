@@ -183,6 +183,16 @@ def test_the_tier_installs_both_extras_and_leaves_the_lock_alone():
     assert "--junitxml=report.xml" in argv
 
 
+def test_a_tree_with_no_venv_runs_without_the_sessions_no_sync(tmp_path):
+    """A devkit session's `UV_NO_SYNC` reached a run in a tree with no `.venv`: `uv run`
+    made an empty one, installed nothing, and the run ended `No module named pytest`."""
+    script = load_script("e2e.py")
+    session = {script.NO_SYNC: "1", "KEPT": "x"}
+    assert script.run_env(session, tmp_path) == {"KEPT": "x", "PYTHONUTF8": "1"}
+    (tmp_path / ".venv").mkdir()
+    assert script.run_env(session, tmp_path)[script.NO_SYNC] == "1", "a borrowed .venv stays"
+
+
 def test_named_tests_replace_the_tree_but_stay_in_the_tier():
     argv = load_script("e2e.py").pytest_argv(Path("r.xml"), ["tests/test_x.py::test_y"])
     assert "tests/test_x.py::test_y" in argv and "tests" not in argv

@@ -47,6 +47,8 @@ REPORT = REPO_ROOT / "logs" / "e2e-junit.xml"
 # Spelled as devkit's `e2e-pass.ENV_FLAG` spells it.
 ENV_FLAG = "DEVKIT_E2E"
 MARKER = "local"
+# uv's switch for "run in the environment as it stands".
+NO_SYNC = "UV_NO_SYNC"
 
 PASSED = "passed"
 FAILED = "failed"
@@ -145,6 +147,20 @@ def pytest_argv(report: Path, named: Sequence[str] = ()) -> list[str]:
     ]
 
 
+def run_env(env: Mapping[str, str], root: Path) -> dict[str, str]:
+    """The environment pytest runs in. Pure but for one `exists`.
+
+    `UV_NO_SYNC` is dropped where `root` has no `.venv`. A session whose tree borrows its
+    checkout's `.venv` carries it so `uv run` leaves that venv alone, and it reaches a run
+    such a session starts in any other tree: there `uv run` made an empty `.venv` and
+    installed nothing into it. A tree that has a `.venv`, borrowed or its own, keeps it.
+    """
+    out = {**env, "PYTHONUTF8": "1"}
+    if not (root / ".venv").exists():
+        out.pop(NO_SYNC, None)
+    return out
+
+
 def _printable(text: str) -> str:
     """ASCII, so a by-hand run on a cp1252 console cannot die printing a traceback."""
     return text.encode("ascii", "backslashreplace").decode("ascii")
@@ -163,7 +179,7 @@ def main(
     done = runner(
         pytest_argv(REPORT, named),
         cwd=REPO_ROOT,
-        env={**env, "PYTHONUTF8": "1"},
+        env=run_env(env, REPO_ROOT),
         capture_output=True,
         encoding="utf-8",
         errors="replace",
