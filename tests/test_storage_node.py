@@ -28,6 +28,7 @@ VOLUME = sn.Node(role="volume", ip="100.100.229.119", primary="100.76.121.58")
 
 
 _REAL_END_ORPHANS = sn._end_orphans
+_REAL_END_SUPERVISORS = sn._end_supervisors
 
 
 @pytest.fixture(autouse=True)
@@ -36,6 +37,8 @@ def orphans_ended(monkeypatch) -> list[bool]:
     test of either would otherwise end the pool this machine is running."""
     ended: list[bool] = []
     monkeypatch.setattr(sn, "_end_orphans", lambda: ended.append(True))
+    # The same for the supervisors: `stop` ends the one this PC's pool runs under.
+    monkeypatch.setattr(sn, "_end_supervisors", lambda home: None)
     return ended
 
 
@@ -339,6 +342,42 @@ def test_install_over_an_elevated_task_says_how_to_clear_it(tmp_path, monkeypatc
         sn.install("volume", VOLUME.primary, tmp_path)
     # The task was never replaced, so nothing may be started under the old one.
     assert not any(argv[0] == "schtasks" for argv in calls.argv)
+
+
+def test_install_ends_every_old_supervisor_and_weed_before_starting_the_new_one(
+    tmp_path, monkeypatch
+):
+    """2026-11-22: a task unregistered by hand left its supervisor running, and install
+    started a second one over the same data directory -- two weed volume servers."""
+    calls = _Calls()
+    monkeypatch.setattr(sn, "_tailscale_ip", lambda: VOLUME.ip)
+    monkeypatch.setattr(sn, "_download", lambda home: home / "weed.exe")
+    monkeypatch.setattr(sn.subprocess, "run", calls)
+    monkeypatch.setattr(sn, "_end_orphans", lambda: calls.argv.append(["<end every weed>"]))
+    monkeypatch.setattr(
+        sn, "_end_supervisors", lambda home: calls.argv.append(["<end supervisors>", home])
+    )
+    sn.install("volume", VOLUME.primary, tmp_path)
+    assert "Register-ScheduledTask" in calls.argv[0][-1]
+    assert calls.argv[1:] == [
+        ["schtasks", "/End", "/TN", sn.TASK_NAME],
+        ["<end supervisors>", tmp_path],
+        ["<end every weed>"],
+        ["schtasks", "/Run", "/TN", sn.TASK_NAME],
+    ]
+
+
+def test_ending_supervisors_matches_only_the_deployed_script_under_pythonw(tmp_path, monkeypatch):
+    calls = _Calls()
+    monkeypatch.setattr(sn.subprocess, "run", calls)
+    home = tmp_path / "it's here"
+    _REAL_END_SUPERVISORS(home)
+    [argv] = calls.argv
+    assert argv[:3] == ["powershell", "-NoProfile", "-Command"]
+    assert "Name='pythonw.exe'" in argv[3]
+    assert "Stop-Process" in argv[3]
+    # A quote in the path is doubled, so the PowerShell string stays one string.
+    assert f"'*{str(home / sn.SCRIPT_NAME).replace(chr(39), chr(39) * 2)}* run*'" in argv[3]
 
 
 def test_install_reports_another_registration_failure_with_its_stderr(tmp_path, monkeypatch):

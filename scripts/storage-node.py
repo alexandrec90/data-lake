@@ -152,6 +152,8 @@ META_BACKUP_EVERY_S = 24 * 3600
 META_KEEP = 7
 # How often a primary looks for a peer that was promoted over it while it was away.
 SUPERSEDE_CHECK_EVERY_S = 300
+# The supervisor's copy of this script, in the node's home: what the task runs.
+SCRIPT_NAME = "storage-node.py"
 
 ENDPOINT_KEY = "ARCHIVE_S3_ENDPOINT_URL"
 # Only an endpoint shaped like the pool's is repointed: a consumer on R2 is left alone.
@@ -554,7 +556,7 @@ def _write_node(home: Path, node: Node) -> None:
 
 def _deploy_script(home: Path) -> Path:
     """Copy this script to where the logon task runs it from."""
-    script = home / "storage-node.py"
+    script = home / SCRIPT_NAME
     if Path(__file__).resolve() != script.resolve():
         shutil.copyfile(Path(__file__), script)
     return script
@@ -567,7 +569,7 @@ def _restart_supervisor(home: Path) -> None:
     ended first -- `install` alone would leave the old role running until the next logon.
     """
     _deploy_script(home)
-    stop()
+    stop(home)
     subprocess.run(["schtasks", "/Run", "/TN", TASK_NAME], check=True, capture_output=True)
 
 
@@ -600,6 +602,9 @@ def install(role: str, primary: str | None, home: Path = HOME) -> Node:
     script = _deploy_script(home)
     pythonw = Path(sys.base_prefix) / "pythonw.exe"
     _register_task(pythonw, script)
+    # Re-registering leaves the old instance running, and the task ignores a start while
+    # one runs, so the old supervisor has to go first -- registered or orphaned.
+    stop(home)
     subprocess.run(["schtasks", "/Run", "/TN", TASK_NAME], check=True, capture_output=True)
     print(f"{role} node on {ip}: weed {VERSION} at {weed}, logon task '{TASK_NAME}' started")
     print(f"one admin step remains on this PC -- run: python {Path(__file__)} firewall")
@@ -764,8 +769,28 @@ def run(home: Path = HOME) -> None:
         time.sleep(RESTART_DELAY_S)
 
 
-def stop() -> None:
+def stop(home: Path = HOME) -> None:
     subprocess.run(["schtasks", "/End", "/TN", TASK_NAME], capture_output=True)
+    _end_supervisors(home)
+    _end_orphans()
+
+
+def _end_supervisors(home: Path) -> None:
+    """End every supervisor running `home`'s deployed script, whatever task started it.
+
+    `schtasks /End` reaches only the instance of the task registered now. A task removed
+    by hand, the elevated step `task_denied_hint` names, leaves its supervisor orphaned,
+    and 2026-11-22 the install after it ran a second one: two weed volume servers over one
+    data directory. Only `pythonw.exe` is matched, so a CLI run of this script, a console
+    `python`, never ends itself.
+    """
+    pattern = f"*{home / SCRIPT_NAME}* run*".replace("'", "''")
+    command = (
+        "Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" | "
+        f"Where-Object {{ $_.CommandLine -like '{pattern}' }} | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+    )
+    subprocess.run(["powershell", "-NoProfile", "-Command", command], capture_output=True)
     _end_orphans()
 
 
