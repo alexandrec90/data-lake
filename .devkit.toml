@@ -40,9 +40,10 @@ enabled = false
 
 # The Windows scheduled tasks this project owns, by their scheduler names. Devkit's fix
 # pass judges them beside its own jobs and files a failure here. The pool's task is
-# registered by `scripts/storage-node.py` (its `TASK_NAME`): rename one, rename both.
+# registered by `scripts/storage-node.py` (its `TASK_NAME`), and Syncthing's by
+# `scripts/archive-sync.py` (its own): rename one, rename both.
 [schedule]
-tasks = ["SeaweedFS data-lake pool"]
+tasks = ["SeaweedFS data-lake pool", "Syncthing pool"]
 
 # How a finished session's work reaches the default branch: `direct`, by the owner's
 # decision (2026-11-23). A PR from Claude Code's built-in `/ship` merges as it opens,
