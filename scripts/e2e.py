@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""The local end-to-end tier: every test that needs this workstation, not a runner.
+"""The end-to-end tiers: the tests no ordinary run reaches, on a runner or on a pool PC.
 
-The contract `.claude/rules/local-e2e.md` states, which devkit's nightly `devkit-local-e2e`
-job runs in this checkout: exit 0 green, anything else red, each failure printed as a
-`FAILED <id>` line. It runs the tests marked `local`, which `addopts` deselects from every
-other run, because they reach the real SeaweedFS pool through credentials only a pool PC
-holds.
+The contract `.claude/rules/local-e2e.md` states: exit 0 green, anything else red, each
+failure printed as a `FAILED <id>` line. Two markers, both deselected by `addopts`:
 
-**A skip is a failure under the scheduler** (`DEVKIT_E2E` set): the checkout is the one
-the tests were written for, so nothing has a reason left to skip. By hand a skip is listed
-and does not fail the run by itself.
+- with no flag it runs the tests marked `local`, the ones that need this workstation:
+  they read the user's archive on the real SeaweedFS pool, through keys only a pool PC
+  holds. devkit's nightly `devkit-local-e2e` job runs this in the checkout.
+- `--ci` runs the tests marked `ci_e2e` instead: SeaweedFS's own behaviour, against a
+  one-node pool the tests start from the pinned `weed` release. The `E2E` job in
+  `.github/workflows/pr-gate.yml` runs it on the default branch, on `ubuntu-latest`.
+
+**A skip is a failure under a scheduler** (`DEVKIT_E2E` set, as both jobs set it): the
+environment is the one the tests were written for, so nothing has a reason left to skip.
+By hand a skip is listed and does not fail the run by itself.
 
 **A run that executed nothing is red**, whoever ran it, a PC outside the pool included: a
 green from zero tests is a skip reported as a pass.
@@ -27,8 +31,9 @@ Stdlib only, for `.claude/rules/task-scripts.md`'s reason: the caller may be the
 Python, not this project's. The junit report stays in `logs/e2e-junit.xml`.
 
 Usage:
-    python scripts/e2e.py                                   # the whole tier
+    python scripts/e2e.py                                   # the whole local tier
     python scripts/e2e.py tests/test_e2e_pool.py::test_x    # those alone, still in the tier
+    python scripts/e2e.py --ci                              # the runner's tier instead
 """
 
 from __future__ import annotations
@@ -47,6 +52,9 @@ REPORT = REPO_ROOT / "logs" / "e2e-junit.xml"
 # Spelled as devkit's `e2e-pass.ENV_FLAG` spells it.
 ENV_FLAG = "DEVKIT_E2E"
 MARKER = "local"
+# What `--ci` selects instead: the tests a hosted runner can run.
+CI_FLAG = "--ci"
+CI_MARKER = "ci_e2e"
 # uv's switch for "run in the environment as it stands".
 NO_SYNC = "UV_NO_SYNC"
 
@@ -104,7 +112,15 @@ def _first_line(message: str) -> str:
     return message.strip().splitlines()[0] if message.strip() else "no reason given"
 
 
-def verdict(code: int, found: Sequence[Case], strict: bool) -> tuple[int, list[str]]:
+def selection(args: Sequence[str]) -> tuple[str, list[str]]:
+    """`(marker, test ids)` for the command line: `--ci` anywhere picks the runner's tier."""
+    named = [arg for arg in args if arg != CI_FLAG]
+    return (CI_MARKER if len(named) != len(args) else MARKER), named
+
+
+def verdict(
+    code: int, found: Sequence[Case], strict: bool, marker: str = MARKER
+) -> tuple[int, list[str]]:
     """`(exit code, lines to print)` for pytest's `code` and the cases it reported. Pure.
 
     pytest printed its own `FAILED` lines, which `failed` here repeats: its report does
@@ -116,7 +132,7 @@ def verdict(code: int, found: Sequence[Case], strict: bool) -> tuple[int, list[s
     word = "FAILED" if strict else "SKIPPED"
     lines += [f"{word} {c.ident} - skipped: {_first_line(c.message)}" for c in skips]
     if not ran:
-        lines.append(f"e2e: no {MARKER} test executed, which is not a pass")
+        lines.append(f"e2e: no {marker} test executed, which is not a pass")
         return (code or 1), lines
     if strict and skips:
         lines.append(f"e2e: {len(skips)} test(s) skipped under the scheduled run")
@@ -124,8 +140,9 @@ def verdict(code: int, found: Sequence[Case], strict: bool) -> tuple[int, list[s
     return code, lines
 
 
-def pytest_argv(report: Path, named: Sequence[str] = ()) -> list[str]:
-    """The argv to run. Pure. `-m` comes after `addopts`, so it replaces their `not local`."""
+def pytest_argv(report: Path, named: Sequence[str] = (), marker: str = MARKER) -> list[str]:
+    """The argv to run. Pure. `-m` comes after `addopts`, so it replaces their
+    `not local and not ci_e2e`."""
     return [
         "uv",
         "run",
@@ -136,7 +153,7 @@ def pytest_argv(report: Path, named: Sequence[str] = ()) -> list[str]:
         "pytest",
         *(named or ["tests"]),
         "-m",
-        MARKER,
+        marker,
         "--tb=short",
         "-q",
         "-rfE",
@@ -171,13 +188,13 @@ def main(
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     env: Mapping[str, str] = os.environ,
 ) -> int:
-    named = sys.argv[1:] if argv is None else argv
+    marker, named = selection(sys.argv[1:] if argv is None else argv)
     REPORT.parent.mkdir(parents=True, exist_ok=True)
     REPORT.unlink(missing_ok=True)
     # Captured and re-printed rather than inherited: a window-less child that captures
     # nothing writes to its hidden console, not to the pipe the pass reads.
     done = runner(
-        pytest_argv(REPORT, named),
+        pytest_argv(REPORT, named, marker),
         cwd=REPO_ROOT,
         env=run_env(env, REPO_ROOT),
         capture_output=True,
@@ -188,7 +205,7 @@ def main(
     )
     print(_printable(done.stdout or ""), end="", flush=True)
     print(_printable(done.stderr or ""), end="", file=sys.stderr, flush=True)
-    code, lines = verdict(done.returncode, cases(REPORT), bool(env.get(ENV_FLAG)))
+    code, lines = verdict(done.returncode, cases(REPORT), bool(env.get(ENV_FLAG)), marker)
     for line in lines:
         print(_printable(line), flush=True)
     print(f"e2e: report in {REPORT.relative_to(REPO_ROOT).as_posix()}", flush=True)

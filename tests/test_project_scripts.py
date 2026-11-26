@@ -149,12 +149,18 @@ def run_e2e(script, report: str | None, code: int = 0, env=None, argv=()) -> tup
     return script.main(list(argv), runner=runner, env=env or {}), seen
 
 
-def test_the_tier_is_deselected_by_default_and_selected_by_its_own_run():
+@pytest.mark.parametrize(
+    ("target", "marker", "member"),
+    [
+        ("tests/test_e2e_pool.py", "local", "test_the_social_export_loads_into_a_consumers_table"),
+        ("tests/test_e2e_seaweedfs.py", "ci_e2e", "test_bars_round_trip_through_the_pool"),
+    ],
+)
+def test_each_tier_is_deselected_by_default_and_selected_by_its_own_run(target, marker, member):
     """The default run must stay the no-network suite CLAUDE.md promises, and the tier's
     `-m` must really replace the one in `addopts`: pytest is the only witness to both."""
     for module in ("pyarrow", "duckdb", "botocore.exceptions"):
         pytest.importorskip(module)
-    target = "tests/test_e2e_pool.py"
     base = [
         sys.executable,
         "-m",
@@ -168,10 +174,38 @@ def test_the_tier_is_deselected_by_default_and_selected_by_its_own_run():
     default = subprocess.run(base, cwd=REPO_ROOT, capture_output=True, text=True, check=False)
     assert default.returncode == 5, default.stdout + default.stderr
     tier = subprocess.run(
-        [*base, "-m", "local"], cwd=REPO_ROOT, capture_output=True, text=True, check=False
+        [*base, "-m", marker], cwd=REPO_ROOT, capture_output=True, text=True, check=False
     )
     assert tier.returncode == 0, tier.stdout + tier.stderr
-    assert "test_bars_round_trip_through_the_pool_or_stay_put" in tier.stdout
+    assert member in tier.stdout
+
+
+def test_the_ci_flag_selects_the_runner_s_tier_and_is_not_passed_to_pytest(e2e):
+    assert e2e.selection([]) == ("local", [])
+    assert e2e.selection(["tests/test_x.py::test_y"]) == ("local", ["tests/test_x.py::test_y"])
+    assert e2e.selection(["--ci", "tests/a.py"]) == ("ci_e2e", ["tests/a.py"])
+    assert e2e.selection(["tests/a.py", "--ci"]) == ("ci_e2e", ["tests/a.py"])
+    _, seen = run_e2e(e2e, junit(passed()), argv=["--ci"])
+    argv = seen[0]
+    assert argv[argv.index("-m", 7) + 1] == "ci_e2e"
+    assert "--ci" not in argv
+    assert "tests" in argv
+
+
+def test_an_empty_ci_run_names_the_tier_it_selected(e2e, capsys):
+    assert run_e2e(e2e, junit(), argv=["--ci"])[0] == 1
+    assert "e2e: no ci_e2e test executed, which is not a pass" in capsys.readouterr().out
+
+
+def test_the_e2e_job_runs_the_weed_release_storage_node_pins():
+    """`tests/test_e2e_seaweedfs.py` speaks for the pool only while the job runs the pool's
+    own build: the job reads `VERSION` out of `storage-node.py`, and runs `--ci`."""
+    gate = (REPO_ROOT / ".github" / "workflows" / "pr-gate.yml").read_text(encoding="utf-8")
+    assert "scripts/storage-node.py" in gate
+    assert "seaweedfs/seaweedfs/releases/download/" in gate
+    assert "scripts/e2e.py --ci" in gate
+    assert load_script("storage-node.py").ASSET.endswith("_large_disk.zip")
+    assert "linux_amd64_large_disk.tar.gz" in gate
 
 
 def test_the_tier_installs_both_extras_and_leaves_the_lock_alone():

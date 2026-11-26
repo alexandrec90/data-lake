@@ -85,3 +85,51 @@ jobs:
         env:
           DEVKIT_DIR: ${{ github.workspace }}/.devkit-src
         run: python scripts/sync-devkit.py --check
+
+  e2e:
+    name: E2E
+    # The default branch only: PRs merge without waiting for a gate, so a PR run of this
+    # would decide nothing. After the drift job, whatever it said, so a push run does not
+    # take one more runner at once. A burst of merges collapses to the newest commit; the
+    # older run's conclusion is then `cancelled`, which the fix trigger reads as no verdict
+    # rather than a red. A red here is a red `PR Gate` on the default branch, which is what
+    # the fix pass reads.
+    needs: devkit-drift
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-e2e-${{ github.ref }}
+      cancel-in-progress: true
+    env:
+      # What devkit's scheduler sets: under it a skip in the tier is a failure.
+      DEVKIT_E2E: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Install project toolchain
+        run: |
+          python -m pip install uv
+          uv sync --all-extras --all-groups
+      - name: Install the weed release storage-node.py pins
+        # From GitHub's release, as `storage-node.py install` fetches it, rather than an
+        # image from Docker Hub, whose anonymous quota is per shared runner IP. The version
+        # is read out of the script, so the pool and this job cannot drift apart; the
+        # large-disk build, as every pool node runs. `tests/test_e2e_seaweedfs.py` starts it.
+        run: |
+          version="$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' scripts/storage-node.py)"
+          test -n "$version"
+          curl -sSfL "https://github.com/seaweedfs/seaweedfs/releases/download/${version}/linux_amd64_large_disk.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/weed" version
+          echo "WEED=$RUNNER_TEMP/weed" >> "$GITHUB_ENV"
+      - name: End-to-end tier
+        run: uv run python scripts/e2e.py --ci
+      - name: Upload e2e artifact
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-failures
+          path: logs/e2e-junit.xml
+          if-no-files-found: ignore
