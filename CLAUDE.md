@@ -210,6 +210,7 @@ python scripts/run-tests.py --changed  # pytest's last-failed subset
 python scripts/lint-all.py             # ruff + format + mypy -> logs/lint-errors.log
 python scripts/lint-all.py --changed   # ruff over the diff; mypy stays full-scope
 python scripts/e2e.py                  # the local tier, against the real pool
+python scripts/e2e.py --ci             # the CI tier: a one-node pool it starts ($WEED)
 ```
 
 These are the **contract entrypoints** the shared workspace tasks dispatch to through
@@ -227,11 +228,16 @@ uv run mypy src
 
 ## The test tiers
 
-- **`tests/test_e2e_pool.py`** — the one exception to the next item, marked `local`, so
-  `addopts` deselects it and only `scripts/e2e.py` runs it (the contract is
-  `.claude/rules/local-e2e.md`). It uses the real SeaweedFS pool, so it needs a pool PC's
-  keys. Writes stay under `_e2e/<run>/` and are deleted; a PC being off changes what the
-  round trip asserts rather than failing it, because a fixer cannot switch one on.
+- **`tests/test_e2e_seaweedfs.py`** — an exception to the next item, marked `ci_e2e`, so
+  `addopts` deselects it and only `scripts/e2e.py --ci` runs it, in the PR Gate's `E2E`
+  job on the default branch (the contract is `.claude/rules/local-e2e.md`). It starts a
+  one-node SeaweedFS of its own on loopback from the `weed` release `storage-node.py`
+  pins, which the job downloads, so a `VERSION` bump is tested before a PC runs it. The
+  missing-key, master-status and archive round-trip tests live here.
+- **`tests/test_e2e_pool.py`** — the other exception, marked `local`, so only
+  `scripts/e2e.py` runs it, nightly on this PC. It reads the user's real archive on the
+  pool, so it needs a pool PC's keys, and it writes nothing. The copies it asserts are
+  capped at the PCs that are on, because a fixer cannot switch one on.
 - **`tests/`** — this package's own. **No network, no real bucket, no database**:
   provider clients are faked, storage is a temp directory, and the session is in-memory
   SQLite injected per call. `tests/_lake_env.py` holds the one settings object the suite
