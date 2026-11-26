@@ -1,6 +1,0 @@
-# The `Syncthing pool` task was made by hand on DESKTOP-ML5F3PJ, running an uncommitted
-# launcher on a repeating trigger. This re-registers it from scripts/archive-sync.py.
-# That PC alone: the laptop's autostart is its owner's decision.
-when = "merged"
-on = "desktop-ml5f3pj"
-run = "python scripts/archive-sync.py install"
